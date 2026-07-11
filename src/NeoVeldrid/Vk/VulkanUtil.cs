@@ -10,7 +10,6 @@ internal unsafe static class VulkanUtil
     private static Lazy<bool> s_isVulkanLoaded = new Lazy<bool>(TryLoadVulkan);
     private static readonly Lazy<string[]> s_instanceExtensions = new Lazy<string[]>(EnumerateInstanceExtensions);
 
-    [Conditional("DEBUG")]
     public static void CheckResult(Result result)
     {
         if (result != Result.Success)

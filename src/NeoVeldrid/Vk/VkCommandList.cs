@@ -14,6 +14,8 @@ namespace NeoVeldrid.Vk;
 
 internal unsafe class VkCommandList : CommandList
 {
+    private const int RetainedStagingBufferCapacity = 4;
+
     private readonly VkGraphicsDevice _gd;
     private CommandPool _pool;
     private CommandBuffer _cb;
@@ -45,14 +47,16 @@ internal unsafe class VkCommandList : CommandList
     private string _name;
 
     private readonly object _commandBufferListLock = new object();
-    private readonly Queue<CommandBuffer> _availableCommandBuffers = new Queue<CommandBuffer>();
-    private readonly List<CommandBuffer> _submittedCommandBuffers = new List<CommandBuffer>();
+    private readonly Queue<CommandBuffer> _availableCommandBuffers;
+    private readonly List<CommandBuffer> _submittedCommandBuffers;
 
     private StagingResourceInfo _currentStagingInfo;
     private readonly object _stagingLock = new object();
-    private readonly Dictionary<CommandBuffer, StagingResourceInfo> _submittedStagingInfos = new Dictionary<CommandBuffer, StagingResourceInfo>();
-    private readonly List<StagingResourceInfo> _availableStagingInfos = new List<StagingResourceInfo>();
-    private readonly List<VkBuffer> _availableStagingBuffers = new List<VkBuffer>();
+    private readonly Dictionary<CommandBuffer, StagingResourceInfo> _submittedStagingInfos;
+    private readonly List<StagingResourceInfo> _availableStagingInfos;
+    private readonly List<VkBuffer> _availableStagingBuffers;
+    private readonly int _maximumInFlightSubmissionCount;
+    private readonly int _initialTrackedResourceCapacityPerSubmission;
 
     public CommandPool CommandPool => _pool;
     public CommandBuffer CommandBuffer => _cb;
@@ -65,6 +69,29 @@ internal unsafe class VkCommandList : CommandList
         : base(ref description, gd.Features, gd.UniformBufferMinOffsetAlignment, gd.StructuredBufferMinOffsetAlignment)
     {
         _gd = gd;
+        _maximumInFlightSubmissionCount = ResolveCapacity(
+            description.MaximumInFlightSubmissionCount,
+            nameof(description.MaximumInFlightSubmissionCount));
+        _initialTrackedResourceCapacityPerSubmission = ResolveCapacity(
+            description.InitialTrackedResourceCapacityPerSubmission,
+            nameof(description.InitialTrackedResourceCapacityPerSubmission));
+        _availableCommandBuffers =
+            new Queue<CommandBuffer>(_maximumInFlightSubmissionCount);
+        _submittedCommandBuffers =
+            new List<CommandBuffer>(_maximumInFlightSubmissionCount);
+        _submittedStagingInfos = new Dictionary<CommandBuffer, StagingResourceInfo>(
+            _maximumInFlightSubmissionCount,
+            CommandBufferHandleComparer.Instance);
+        _availableStagingInfos =
+            new List<StagingResourceInfo>(_maximumInFlightSubmissionCount);
+        _availableStagingBuffers =
+            new List<VkBuffer>(RetainedStagingBufferCapacity);
+        for (int i = 0; i < _maximumInFlightSubmissionCount; i++)
+        {
+            _availableStagingInfos.Add(new StagingResourceInfo(
+                _initialTrackedResourceCapacityPerSubmission));
+        }
+
         CommandPoolCreateInfo poolCI = new CommandPoolCreateInfo
         {
             SType = StructureType.CommandPoolCreateInfo,
@@ -76,6 +103,14 @@ internal unsafe class VkCommandList : CommandList
 
         _cb = GetNextCommandBuffer();
         RefCount = new ResourceRefCount(DisposeCore);
+    }
+
+    private static int ResolveCapacity(uint value, string parameterName)
+    {
+        if (value > int.MaxValue)
+            throw new ArgumentOutOfRangeException(parameterName);
+
+        return (int)value;
     }
 
     private CommandBuffer GetNextCommandBuffer()
@@ -155,14 +190,18 @@ internal unsafe class VkCommandList : CommandList
         if (_commandBufferEnded)
         {
             _commandBufferEnded = false;
-            _cb = GetNextCommandBuffer();
             if (_currentStagingInfo != null)
             {
                 RecycleStagingInfo(_currentStagingInfo);
             }
-        }
 
-        _currentStagingInfo = GetStagingResourceInfo();
+            _currentStagingInfo = GetStagingResourceInfo();
+            _cb = GetNextCommandBuffer();
+        }
+        else
+        {
+            _currentStagingInfo = GetStagingResourceInfo();
+        }
 
         CommandBufferBeginInfo beginInfo = new CommandBufferBeginInfo
         {
@@ -474,8 +513,12 @@ internal unsafe class VkCommandList : CommandList
             _currentFramebuffer.TransitionToFinalLayout(_cb);
         }
 
-        _gd.Vk.EndCommandBuffer(_cb);
-        _submittedCommandBuffers.Add(_cb);
+        Result result = _gd.Vk.EndCommandBuffer(_cb);
+        CheckResult(result);
+        lock (_commandBufferListLock)
+        {
+            _submittedCommandBuffers.Add(_cb);
+        }
     }
 
     private protected override void SetFramebufferCore(Framebuffer fb)
@@ -709,7 +752,11 @@ internal unsafe class VkCommandList : CommandList
         if (index == 0 || _gd.Features.MultipleViewports)
         {
             Rect2D scissor = new Rect2D(new Offset2D((int)x, (int)y), new Extent2D((uint)width, (uint)height));
-            if (!scissor.Equals(_scissorRects[index]))
+            Rect2D current = _scissorRects[index];
+            if (scissor.Offset.X != current.Offset.X ||
+                scissor.Offset.Y != current.Offset.Y ||
+                scissor.Extent.Width != current.Extent.Width ||
+                scissor.Extent.Height != current.Extent.Height)
             {
                 _scissorRects[index] = scissor;
                 _gd.Vk.CmdSetScissor(_cb, index, 1, in scissor);
@@ -1340,8 +1387,17 @@ internal unsafe class VkCommandList : CommandList
 
     private class StagingResourceInfo
     {
-        public List<VkBuffer> BuffersUsed { get; } = new List<VkBuffer>();
-        public HashSet<ResourceRefCount> Resources { get; } = new HashSet<ResourceRefCount>();
+        public List<VkBuffer> BuffersUsed { get; }
+        public HashSet<ResourceRefCount> Resources { get; }
+
+        public StagingResourceInfo(int initialTrackedResourceCapacity)
+        {
+            BuffersUsed = new List<VkBuffer>(RetainedStagingBufferCapacity);
+            Resources = new HashSet<ResourceRefCount>(
+                initialTrackedResourceCapacity,
+                ReferenceEqualityComparer.Instance);
+        }
+
         public void Clear()
         {
             BuffersUsed.Clear();
@@ -1351,20 +1407,40 @@ internal unsafe class VkCommandList : CommandList
 
     private StagingResourceInfo GetStagingResourceInfo()
     {
+        if (TryTakeAvailableStagingResourceInfo() is { } available)
+            return available;
+
+        // Submission polling normally runs after Begin. Poll once here so a
+        // completed record is reclaimed before deciding that the pool reached
+        // its bound.
+        _gd.ReclaimCompletedSubmissions();
+        if (TryTakeAvailableStagingResourceInfo() is { } reclaimed)
+            return reclaimed;
+
+        if (_maximumInFlightSubmissionCount == 0)
+            return new StagingResourceInfo(_initialTrackedResourceCapacityPerSubmission);
+
+        // All bounded records are in flight. Wait for this command list's
+        // oldest submission rather than draining unrelated queues or growing
+        // managed state and input latency without bound. Do not wait while
+        // holding _stagingLock: completion recycles under the same lock.
+        _gd.WaitForOldestSubmissionCompletion(this);
+
+        return TryTakeAvailableStagingResourceInfo() ??
+            throw new NeoVeldridException(
+                "The Vulkan command-list staging pool remained exhausted after its oldest submission completed.");
+    }
+
+    private StagingResourceInfo TryTakeAvailableStagingResourceInfo()
+    {
         lock (_stagingLock)
         {
-            StagingResourceInfo ret;
             int availableCount = _availableStagingInfos.Count;
-            if (availableCount > 0)
-            {
-                ret = _availableStagingInfos[availableCount - 1];
-                _availableStagingInfos.RemoveAt(availableCount - 1);
-            }
-            else
-            {
-                ret = new StagingResourceInfo();
-            }
+            if (availableCount == 0)
+                return null;
 
+            StagingResourceInfo ret = _availableStagingInfos[availableCount - 1];
+            _availableStagingInfos.RemoveAt(availableCount - 1);
             return ret;
         }
     }

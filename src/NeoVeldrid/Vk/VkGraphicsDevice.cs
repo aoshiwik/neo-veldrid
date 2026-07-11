@@ -76,13 +76,6 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
     private readonly List<VkTexture> _availableStagingTextures = new List<VkTexture>();
     private readonly List<VkBuffer> _availableStagingBuffers = new List<VkBuffer>();
 
-    private readonly Dictionary<CommandBuffer, VkTexture> _submittedStagingTextures
-        = new Dictionary<CommandBuffer, VkTexture>();
-    private readonly Dictionary<CommandBuffer, VkBuffer> _submittedStagingBuffers
-        = new Dictionary<CommandBuffer, VkBuffer>();
-    private readonly Dictionary<CommandBuffer, SharedCommandPool> _submittedSharedCommandPools
-        = new Dictionary<CommandBuffer, SharedCommandPool>();
-
     public override string DeviceName => _deviceName;
 
     public override string VendorName => _vendorName;
@@ -131,7 +124,8 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
 
     private readonly object _submittedFencesLock = new object();
     private readonly ConcurrentQueue<VkFenceHandle> _availableSubmissionFences = new ConcurrentQueue<VkFenceHandle>();
-    private readonly List<FenceSubmissionInfo> _submittedFences = new List<FenceSubmissionInfo>();
+    private readonly List<FenceSubmissionInfo> _submittedFences =
+        new List<FenceSubmissionInfo>(SharedCommandPoolCount * 2);
     private readonly VkSwapchain _mainSwapchain;
 
     private readonly List<FixedUtf8String> _surfaceExtensions = new List<FixedUtf8String>();
@@ -231,7 +225,10 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
         VkSemaphore* waitSemaphoresPtr,
         uint signalSemaphoreCount,
         VkSemaphore* signalSemaphoresPtr,
-        Fence fence)
+        Fence fence,
+        SharedCommandPool sharedCommandPool = null,
+        VkTexture stagingTexture = null,
+        VkBuffer stagingBuffer = null)
     {
         CheckSubmittedFences();
 
@@ -270,11 +267,20 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
                 result = _vk.QueueSubmit(_graphicsQueue, 0, (SubmitInfo*)null, submissionFence);
                 CheckResult(result);
             }
-        }
 
-        lock (_submittedFencesLock)
-        {
-            _submittedFences.Add(new FenceSubmissionInfo(submissionFence, vkCL, vkCB));
+            // Preserve the graphics-queue order assumed by completion polling.
+            // Appending after releasing _graphicsQueueLock lets concurrent
+            // submitters reorder this retained list.
+            lock (_submittedFencesLock)
+            {
+                _submittedFences.Add(new FenceSubmissionInfo(
+                    submissionFence,
+                    vkCL,
+                    vkCB,
+                    sharedCommandPool,
+                    stagingTexture,
+                    stagingBuffer));
+            }
         }
     }
 
@@ -282,20 +288,61 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
     {
         lock (_submittedFencesLock)
         {
+            CheckSubmittedFencesNoLock();
+        }
+    }
+
+    private void CheckSubmittedFencesNoLock()
+    {
+        for (int i = 0; i < _submittedFences.Count; i++)
+        {
+            FenceSubmissionInfo fsi = _submittedFences[i];
+            Result status = _vk.GetFenceStatus(_device, fsi.Fence);
+            if (status == Result.Success)
+            {
+                CompleteFenceSubmission(fsi);
+                _submittedFences.RemoveAt(i);
+                i -= 1;
+            }
+            else if (status == Result.NotReady)
+            {
+                break; // Submissions are in order; later submissions cannot complete if this one hasn't.
+            }
+            else
+            {
+                CheckResult(status);
+            }
+        }
+    }
+
+    internal void ReclaimCompletedSubmissions()
+        => CheckSubmittedFences();
+
+    internal void WaitForOldestSubmissionCompletion(VkCommandList commandList)
+    {
+        ArgumentNullException.ThrowIfNull(commandList);
+        lock (_submittedFencesLock)
+        {
+            int submissionIndex = -1;
             for (int i = 0; i < _submittedFences.Count; i++)
             {
-                FenceSubmissionInfo fsi = _submittedFences[i];
-                if (_vk.GetFenceStatus(_device, fsi.Fence) == Result.Success)
+                if (ReferenceEquals(_submittedFences[i].CommandList, commandList))
                 {
-                    CompleteFenceSubmission(fsi);
-                    _submittedFences.RemoveAt(i);
-                    i -= 1;
-                }
-                else
-                {
-                    break; // Submissions are in order; later submissions cannot complete if this one hasn't.
+                    submissionIndex = i;
+                    break;
                 }
             }
+
+            if (submissionIndex < 0)
+            {
+                throw new NeoVeldridException(
+                    "A bounded Vulkan command-list pool was exhausted without a tracked in-flight submission.");
+            }
+
+            VkFenceHandle fence = _submittedFences[submissionIndex].Fence;
+            Result result = _vk.WaitForFences(_device, 1, &fence, true, ulong.MaxValue);
+            CheckResult(result);
+            CheckSubmittedFencesNoLock();
         }
     }
 
@@ -307,39 +354,42 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
         Result resetResult = _vk.ResetFences(_device, 1, &fence);
         CheckResult(resetResult);
         ReturnSubmissionFence(fence);
-        lock (_stagingResourcesLock)
+
+        if (fsi.StagingTexture != null)
         {
-            if (_submittedStagingTextures.TryGetValue(completedCB, out VkTexture stagingTex))
+            lock (_stagingResourcesLock)
             {
-                _submittedStagingTextures.Remove(completedCB);
-                _availableStagingTextures.Add(stagingTex);
+                _availableStagingTextures.Add(fsi.StagingTexture);
             }
-            if (_submittedStagingBuffers.TryGetValue(completedCB, out VkBuffer stagingBuffer))
+        }
+
+        if (fsi.StagingBuffer != null)
+        {
+            if (fsi.StagingBuffer.SizeInBytes <= MaxStagingBufferSize)
             {
-                _submittedStagingBuffers.Remove(completedCB);
-                if (stagingBuffer.SizeInBytes <= MaxStagingBufferSize)
+                lock (_stagingResourcesLock)
                 {
-                    _availableStagingBuffers.Add(stagingBuffer);
-                }
-                else
-                {
-                    stagingBuffer.Dispose();
+                    _availableStagingBuffers.Add(fsi.StagingBuffer);
                 }
             }
-            if (_submittedSharedCommandPools.TryGetValue(completedCB, out SharedCommandPool sharedPool))
+            else
             {
-                _submittedSharedCommandPools.Remove(completedCB);
+                fsi.StagingBuffer.Dispose();
+            }
+        }
+
+        if (fsi.SharedCommandPool != null)
+        {
+            if (fsi.SharedCommandPool.IsCached)
+            {
                 lock (_graphicsCommandPoolLock)
                 {
-                    if (sharedPool.IsCached)
-                    {
-                        _sharedGraphicsCommandPools.Push(sharedPool);
-                    }
-                    else
-                    {
-                        sharedPool.Destroy();
-                    }
+                    _sharedGraphicsCommandPools.Push(fsi.SharedCommandPool);
                 }
+            }
+            else
+            {
+                fsi.SharedCommandPool.Destroy();
             }
         }
     }
@@ -1114,13 +1164,11 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
         _descriptorPoolManager.DestroyAll();
         _vk.DestroyCommandPool(_device, _graphicsCommandPool, null);
 
-        Debug.Assert(_submittedStagingTextures.Count == 0);
         foreach (VkTexture tex in _availableStagingTextures)
         {
             tex.Dispose();
         }
 
-        Debug.Assert(_submittedStagingBuffers.Count == 0);
         foreach (VkBuffer buffer in _availableStagingBuffers)
         {
             buffer.Dispose();
@@ -1145,10 +1193,12 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
 
     private protected override void WaitForIdleCore()
     {
+        Result result;
         lock (_graphicsQueueLock)
         {
-            _vk.QueueWaitIdle(_graphicsQueue);
+            result = _vk.QueueWaitIdle(_graphicsQueue);
         }
+        CheckResult(result);
 
         CheckSubmittedFences();
         FlushValidationErrors();
@@ -1277,11 +1327,7 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
             };
             _vk.CmdCopyBuffer(cb, copySrcVkBuffer.DeviceBuffer, vkBuffer.DeviceBuffer, 1, in copyRegion);
 
-            pool.EndAndSubmit(cb);
-            lock (_stagingResourcesLock)
-            {
-                _submittedStagingBuffers.Add(cb, copySrcVkBuffer);
-            }
+            pool.EndAndSubmit(cb, copySrcVkBuffer);
         }
     }
 
@@ -1369,11 +1415,7 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
                 stagingTex, 0, 0, 0, 0, 0,
                 texture, x, y, z, mipLevel, arrayLayer,
                 width, height, depth, 1);
-            lock (_stagingResourcesLock)
-            {
-                _submittedStagingTextures.Add(cb, stagingTex);
-            }
-            pool.EndAndSubmit(cb);
+            pool.EndAndSubmit(cb, stagingTex);
         }
     }
 
@@ -1618,14 +1660,32 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
         }
 
         public void EndAndSubmit(CommandBuffer cb)
+            => EndAndSubmitCore(cb, null, null);
+
+        public void EndAndSubmit(CommandBuffer cb, VkTexture stagingTexture)
+            => EndAndSubmitCore(cb, stagingTexture, null);
+
+        public void EndAndSubmit(CommandBuffer cb, VkBuffer stagingBuffer)
+            => EndAndSubmitCore(cb, null, stagingBuffer);
+
+        private void EndAndSubmitCore(
+            CommandBuffer cb,
+            VkTexture stagingTexture,
+            VkBuffer stagingBuffer)
         {
             Result result = _gd._vk.EndCommandBuffer(cb);
             CheckResult(result);
-            _gd.SubmitCommandBuffer(null, cb, 0, null, 0, null, null);
-            lock (_gd._stagingResourcesLock)
-            {
-                _gd._submittedSharedCommandPools.Add(cb, this);
-            }
+            _gd.SubmitCommandBuffer(
+                null,
+                cb,
+                0,
+                null,
+                0,
+                null,
+                null,
+                this,
+                stagingTexture,
+                stagingBuffer);
         }
 
         internal void Destroy()
@@ -1634,16 +1694,29 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
         }
     }
 
-    private struct FenceSubmissionInfo
+    private readonly struct FenceSubmissionInfo
     {
-        public VkFenceHandle Fence;
-        public VkCommandList CommandList;
-        public CommandBuffer CommandBuffer;
-        public FenceSubmissionInfo(VkFenceHandle fence, VkCommandList commandList, CommandBuffer commandBuffer)
+        public VkFenceHandle Fence { get; }
+        public VkCommandList CommandList { get; }
+        public CommandBuffer CommandBuffer { get; }
+        public SharedCommandPool SharedCommandPool { get; }
+        public VkTexture StagingTexture { get; }
+        public VkBuffer StagingBuffer { get; }
+
+        public FenceSubmissionInfo(
+            VkFenceHandle fence,
+            VkCommandList commandList,
+            CommandBuffer commandBuffer,
+            SharedCommandPool sharedCommandPool,
+            VkTexture stagingTexture,
+            VkBuffer stagingBuffer)
         {
             Fence = fence;
             CommandList = commandList;
             CommandBuffer = commandBuffer;
+            SharedCommandPool = sharedCommandPool;
+            StagingTexture = stagingTexture;
+            StagingBuffer = stagingBuffer;
         }
     }
 }
