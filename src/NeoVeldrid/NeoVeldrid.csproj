@@ -2,16 +2,6 @@
 
     <PropertyGroup>
         <IsPackable>true</IsPackable>
-        <!--
-          This branch carries TAW's Vulkan allocation and bounded-submission
-          fixes on top of NeoVeldrid 1.2.0. Keep the CLR assembly identity
-          compatible with the published 1.2.0 extension assemblies while
-          exposing an accurate project/package version to NuGet restore.
-        -->
-        <Version>1.2.1-taw.1</Version>
-        <AssemblyVersion>1.0.0.0</AssemblyVersion>
-        <FileVersion>1.2.1.0</FileVersion>
-        <RepositoryUrl>https://github.com/aoshiwik/neo-veldrid.git</RepositoryUrl>
         <Description>A low-level, hardware-accelerated graphics and compute library for .NET, with backends for Vulkan, Direct3D 11, and OpenGL. NeoVeldrid can be used to create high-performance 2D and 3D games, simulations, tools, and other graphical applications.</Description>
         <PackageTags>3D Graphics Direct3D DirectX Vulkan OpenGL Core Game</PackageTags>
     </PropertyGroup>
