@@ -109,7 +109,9 @@ void main()
             RgbaFloat expectedFillValue = new RgbaFloat(new System.Numerics.Vector4(FillValue * (depth + 1)));
             int notFilledCount = CountTexelsNotFilledAtDepth(GD, computeTargetTexture, expectedFillValue, depth);
 
-            Assert.Equal(0, notFilledCount);
+            Assert.True(
+                notFilledCount == 0,
+                $"Depth {depth}: {notFilledCount} of {computeTargetTexture.Width * computeTargetTexture.Height} texels differed.");
         }
     }
 
@@ -245,7 +247,9 @@ void main()
     public void ComputeCubemapGeneration()
     {
         Skip.IfNot(GD.Features.ComputeShader);
+#if TEST_D3D11
         Skip.If(GD.GetD3D11Info(out _), "D3D11 doesn't support Storage Cubemaps");
+#endif
 
         const int TexSize = 32;
         const uint MipLevels = 1;
@@ -310,7 +314,9 @@ void main()
     public void ComputeCubemapBindSingleTextureMipLevelOutput()
     {
         Skip.IfNot(GD.Features.ComputeShader);
+#if TEST_D3D11
         Skip.If(GD.GetD3D11Info(out _), "D3D11 doesn't support Storage Cubemaps");
+#endif
 
         const int TexSize = 128;
         const uint MipLevels = 7;

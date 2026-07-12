@@ -544,7 +544,9 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
         out PixelFormatProperties properties)
     {
         if (type == TextureType.Texture1D && !_features.Texture1D
-            || !OpenGLFormats.IsFormatSupported(_extensions, format, _backendType))
+            || !OpenGLFormats.IsFormatSupported(_extensions, format, _backendType)
+            || (usage & TextureUsage.Staging) != 0
+                && IsCompressedStagingReadbackUnsupported(format))
         {
             properties = default(PixelFormatProperties);
             return false;
@@ -569,6 +571,14 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
 
     protected override MappedResource MapCore(MappableResource resource, MapMode mode, uint subresource)
     {
+        if (mode != MapMode.Write
+            && resource is OpenGLTexture texture
+            && IsCompressedStagingReadbackUnsupported(texture.Format))
+        {
+            throw new NeoVeldridException(
+                "Reading compressed textures through staging resources is not supported by the OpenGL ES backend.");
+        }
+
         MappedResourceCacheKey key = new MappedResourceCacheKey(resource, subresource);
         lock (_mappedResourceLock)
         {
@@ -587,6 +597,10 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
 
         return _executionThread.Map(resource, mode, subresource);
     }
+
+    // OpenGL ES has no equivalent of the desktop glGetCompressedTexImage API.
+    private bool IsCompressedStagingReadbackUnsupported(PixelFormat format)
+        => _backendType == GraphicsBackend.OpenGLES && FormatHelpers.IsCompressedFormat(format);
 
     protected override void UnmapCore(MappableResource resource, uint subresource)
     {

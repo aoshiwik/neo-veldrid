@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Numerics;
 using System.Runtime.CompilerServices;
+using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
@@ -75,14 +76,13 @@ public unsafe class Sdl2Window
 
                 Task.Factory.StartNew(WindowOwnerRoutine, wp, TaskCreationOptions.LongRunning);
                 mre.WaitOne();
+                wp.CreationException?.Throw();
             }
         }
         else
         {
             _window = _sdl.CreateWindow(title, x, y, width, height, (uint)flags);
-            WindowID = _sdl.GetWindowID(_window);
-            Sdl2WindowRegistry.RegisterWindow(this);
-            PostWindowCreated(flags);
+            CompleteWindowCreation(flags);
         }
     }
 
@@ -102,14 +102,13 @@ public unsafe class Sdl2Window
 
                 Task.Factory.StartNew(WindowOwnerRoutine, wp, TaskCreationOptions.LongRunning);
                 mre.WaitOne();
+                wp.CreationException?.Throw();
             }
         }
         else
         {
             _window = _sdl.CreateWindowFrom((void*)windowHandle);
-            WindowID = _sdl.GetWindowID(_window);
-            Sdl2WindowRegistry.RegisterWindow(this);
-            PostWindowCreated(0);
+            CompleteWindowCreation(0);
         }
     }
 
@@ -314,6 +313,11 @@ public unsafe class Sdl2Window
 
     public void Close()
     {
+        if (!_exists)
+        {
+            return;
+        }
+
         if (_threadedProcessing)
         {
             _shouldClose = true;
@@ -344,11 +348,20 @@ public unsafe class Sdl2Window
     private void WindowOwnerRoutine(object state)
     {
         WindowParams wp = (WindowParams)state;
-        _window = wp.Create();
-        WindowID = _sdl.GetWindowID(_window);
-        Sdl2WindowRegistry.RegisterWindow(this);
-        PostWindowCreated(wp.WindowFlags);
-        wp.ResetEvent.Set();
+        try
+        {
+            _window = wp.Create();
+            CompleteWindowCreation(wp.WindowFlags);
+        }
+        catch (Exception ex)
+        {
+            wp.CreationException = ExceptionDispatchInfo.Capture(ex);
+            return;
+        }
+        finally
+        {
+            wp.ResetEvent.Set();
+        }
 
         double previousPollTimeMs = 0;
         Stopwatch sw = new Stopwatch();
@@ -372,6 +385,36 @@ public unsafe class Sdl2Window
                 previousPollTimeMs = currentTimeMs;
                 ProcessEvents(null);
             }
+        }
+    }
+
+    private void CompleteWindowCreation(SDL_WindowFlags flags)
+    {
+        if (_window == null)
+        {
+            string error = _sdl.GetErrorS();
+            throw new InvalidOperationException("SDL window creation failed: " + error);
+        }
+
+        bool registered = false;
+        try
+        {
+            WindowID = _sdl.GetWindowID(_window);
+            Sdl2WindowRegistry.RegisterWindow(this);
+            registered = true;
+            PostWindowCreated(flags);
+        }
+        catch
+        {
+            if (registered)
+            {
+                Sdl2WindowRegistry.RemoveWindow(this);
+            }
+
+            _sdl.DestroyWindow(_window);
+            _window = null;
+            WindowID = 0;
+            throw;
         }
     }
 
@@ -1024,6 +1067,7 @@ public unsafe class Sdl2Window
         public IntPtr WindowHandle { get; set; }
 
         public ManualResetEvent ResetEvent { get; set; }
+        public ExceptionDispatchInfo CreationException { get; set; }
 
         public Silk.NET.SDL.Window* Create()
         {

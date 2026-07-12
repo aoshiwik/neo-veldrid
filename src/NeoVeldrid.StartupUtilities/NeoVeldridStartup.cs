@@ -45,7 +45,15 @@ public static unsafe class NeoVeldridStartup
 #endif
 
         window = CreateWindow(ref windowCI);
-        gd = CreateGraphicsDevice(window, deviceOptions, preferredBackend);
+        try
+        {
+            gd = CreateGraphicsDevice(window, deviceOptions, preferredBackend);
+        }
+        catch
+        {
+            window.Close();
+            throw;
+        }
     }
 
     public static Sdl2Window CreateWindow(WindowCreateInfo windowCI) => CreateWindow(ref windowCI);
@@ -239,8 +247,13 @@ public static unsafe class NeoVeldridStartup
         }
 
         GLcontextFlag contextFlags = options.Debug
-            ? GLcontextFlag.DebugFlag | GLcontextFlag.ForwardCompatibleFlag
-            : GLcontextFlag.ForwardCompatibleFlag;
+            ? GLcontextFlag.DebugFlag
+            : 0;
+
+        if (backend == GraphicsBackend.OpenGL)
+        {
+            contextFlags |= GLcontextFlag.ForwardCompatibleFlag;
+        }
 
         sdl.GLSetAttribute(GLattr.ContextFlags, (int)contextFlags);
 

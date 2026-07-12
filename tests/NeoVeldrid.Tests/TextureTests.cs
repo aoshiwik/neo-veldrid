@@ -666,7 +666,7 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
         }
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(PixelFormat.BC1_Rgb_UNorm, 8, 0, 0, 64, 64)]
     [InlineData(PixelFormat.BC1_Rgb_UNorm, 8, 8, 4, 16, 16)]
     [InlineData(PixelFormat.BC1_Rgb_UNorm_SRgb, 8, 0, 0, 64, 64)]
@@ -697,13 +697,13 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
     [InlineData(PixelFormat.BC7_UNorm_SRgb, 16, 8, 4, 16, 16)]
     public unsafe void Copy_Compressed_Texture(PixelFormat format, uint blockSizeInBytes, uint srcX, uint srcY, uint copyWidth, uint copyHeight)
     {
-        if (!GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Sampled))
-        {
-            return;
-        }
+        Skip.IfNot(
+            GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Sampled)
+                && GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Staging),
+            $"{format} does not support compressed staging readback on {GD.BackendType}.");
 
         Texture copySrc = RF.CreateTexture(TextureDescription.Texture2D(
-            64, 64, 1, 1, format, TextureUsage.Staging));
+            64, 64, 1, 1, format, TextureUsage.Sampled));
         Texture copyDst = RF.CreateTexture(TextureDescription.Texture2D(
             copyWidth, copyHeight, 1, 1, format, TextureUsage.Staging));
 
@@ -743,16 +743,38 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
         GD.Unmap(copyDst);
     }
 
-    // [InlineData(true)]
+    [InlineData(true)]
     [InlineData(false)]
-    [Theory]
+    [SkippableTheory]
     public unsafe void Copy_Compressed_Array(bool separateLayerCopies)
     {
         PixelFormat format = PixelFormat.BC3_UNorm;
-        if (!GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Sampled))
-        {
-            return;
-        }
+        Skip.IfNot(
+            GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Sampled),
+            $"{format} sampling is not supported on {GD.BackendType}.");
+
+        bool supportsCompressedStaging = GD.GetPixelFormatSupport(
+            format,
+            TextureType.Texture2D,
+            TextureUsage.Staging);
+
+        // OpenGL ES has no core API for downloading raw compressed texture blocks. When
+        // compressed staging is unavailable, reinterpret each 128-bit BC3 block as one
+        // R32_G32_B32_A32_UInt texel with CopyImageSubData, then map that uncompressed
+        // texture through the normal staging path.
+        const PixelFormat rawBlockFormat = PixelFormat.R32_G32_B32_A32_UInt;
+        bool hasCoreCopyImage = false;
+#if TEST_OPENGLES
+        hasCoreCopyImage = GD.BackendType == GraphicsBackend.OpenGLES
+            && GraphicsApiVersion.TryParseGLVersion(GD.GetOpenGLInfo().Version, out GraphicsApiVersion apiVersion)
+            && (apiVersion.Major > 3 || apiVersion.Major == 3 && apiVersion.Minor >= 2);
+#endif
+        bool useCompatibleRawReadback = !supportsCompressedStaging
+            && hasCoreCopyImage
+            && GD.GetPixelFormatSupport(rawBlockFormat, TextureType.Texture2D, TextureUsage.Staging);
+        Skip.IfNot(
+            supportsCompressedStaging || useCompatibleRawReadback,
+            $"Exact compressed copy readback is not supported on {GD.BackendType}.");
 
         TextureDescription texDesc = TextureDescription.Texture2D(
             16, 16,
@@ -761,8 +783,15 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
             TextureUsage.Sampled);
 
         Texture copySrc = RF.CreateTexture(texDesc);
-        texDesc.Usage = TextureUsage.Staging;
+        texDesc.Usage = supportsCompressedStaging ? TextureUsage.Staging : TextureUsage.Sampled;
         Texture copyDst = RF.CreateTexture(texDesc);
+        Texture readback = useCompatibleRawReadback
+            ? RF.CreateTexture(TextureDescription.Texture2D(
+                16, 16,
+                1, copySrc.ArrayLayers,
+                rawBlockFormat,
+                TextureUsage.Staging))
+            : copyDst;
 
         for (uint layer = 0; layer < copySrc.ArrayLayers; layer++)
         {
@@ -789,14 +818,24 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
         {
             copyCL.CopyTexture(copySrc, 0, 0, 0, 0, 0, copyDst, 0, 0, 0, 0, 0, 16, 16, 1, copySrc.ArrayLayers);
         }
+
+        if (useCompatibleRawReadback)
+        {
+            // Keep the verification copy single-layer so the theory parameter continues to
+            // isolate the behavior of the compressed-to-compressed copy above.
+            for (uint layer = 0; layer < copyDst.ArrayLayers; layer++)
+            {
+                copyCL.CopyTexture(copyDst, 0, 0, 0, 0, layer, readback, 0, 0, 0, 0, layer, 16, 16, 1, 1);
+            }
+        }
         copyCL.End();
         Fence fence = RF.CreateFence(false);
         GD.SubmitCommands(copyCL, fence);
         GD.WaitForFence(fence);
 
-        for (uint layer = 0; layer < copyDst.ArrayLayers; layer++)
+        for (uint layer = 0; layer < readback.ArrayLayers; layer++)
         {
-            MappedResource map = GD.Map(copyDst, MapMode.Read, layer);
+            MappedResource map = GD.Map(readback, MapMode.Read, layer);
             byte* basePtr = (byte*)map.Data;
 
             int index = 0;
@@ -812,7 +851,7 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
                 }
             }
 
-            GD.Unmap(copyDst, layer);
+            GD.Unmap(readback, layer);
         }
     }
 
@@ -1161,7 +1200,7 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
     public unsafe void Update_NonMultipleOfFourWithCompressedTexture_2D()
     {
         Texture tex2D = RF.CreateTexture(TextureDescription.Texture2D(
-            2, 2, 1, 1, PixelFormat.BC1_Rgb_UNorm, TextureUsage.Staging));
+            2, 2, 1, 1, PixelFormat.BC1_Rgb_UNorm, TextureUsage.Sampled));
 
         byte[] data = new byte[16];
 
@@ -1430,8 +1469,33 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
     [Fact]
     public void CopyTexture_SmallCompressed()
     {
-        Texture src = RF.CreateTexture(TextureDescription.Texture2D(16, 16, 4, 1, PixelFormat.BC3_UNorm, TextureUsage.Staging));
+        Texture src = RF.CreateTexture(TextureDescription.Texture2D(16, 16, 4, 1, PixelFormat.BC3_UNorm, TextureUsage.Sampled));
         Texture dst = RF.CreateTexture(TextureDescription.Texture2D(16, 16, 4, 1, PixelFormat.BC3_UNorm, TextureUsage.Sampled));
+
+        CommandList cl = RF.CreateCommandList();
+        cl.Begin();
+        cl.CopyTexture(
+            src, 0, 0, 0, 3, 0,
+            dst, 0, 0, 0, 3, 0,
+            4, 4, 1, 1);
+        cl.End();
+        GD.SubmitCommands(cl);
+        GD.WaitForIdle();
+    }
+
+    [SkippableFact]
+    public void CopyTexture_SmallCompressed_ToStaging()
+    {
+        const PixelFormat format = PixelFormat.BC3_UNorm;
+        Skip.IfNot(
+            GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Sampled)
+                && GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Staging),
+            $"{format} does not support compressed staging readback on {GD.BackendType}.");
+
+        Texture src = RF.CreateTexture(TextureDescription.Texture2D(
+            16, 16, 4, 1, format, TextureUsage.Sampled));
+        Texture dst = RF.CreateTexture(TextureDescription.Texture2D(
+            16, 16, 4, 1, format, TextureUsage.Staging));
 
         CommandList cl = RF.CreateCommandList();
         cl.Begin();
@@ -1552,5 +1616,25 @@ public class OpenGLTextureTests : TextureTestBase<OpenGLDeviceCreator> { }
 #endif
 #if TEST_OPENGLES
 [Trait("Backend", "OpenGLES")]
-public class OpenGLESTextureTests : TextureTestBase<OpenGLESDeviceCreator> { }
+public class OpenGLESTextureTests : TextureTestBase<OpenGLESDeviceCreator>
+{
+    [Fact]
+    public void CompressedStagingReadback_IsReportedUnsupported()
+    {
+        const PixelFormat format = PixelFormat.BC3_UNorm;
+        Assert.False(GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Staging));
+
+        if (!GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Sampled))
+        {
+            return;
+        }
+
+        Texture texture = RF.CreateTexture(TextureDescription.Texture2D(
+            16, 16, 1, 1, format, TextureUsage.Staging));
+        NeoVeldridException exception = Assert.Throws<NeoVeldridException>(
+            () => GD.Map(texture, MapMode.Read));
+
+        Assert.Contains("not supported by the OpenGL ES backend", exception.Message);
+    }
+}
 #endif

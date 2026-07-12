@@ -11,16 +11,39 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        os: [windows-latest, ubuntu-24.04, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v5
         with:
           dotnet-version: '10.0.x'
+
+      # Hosted Linux runners do not expose a physical GPU or display. Mesa's
+      # llvmpipe/lavapipe drivers plus Xvfb provide deterministic software
+      # implementations for the Vulkan, OpenGL, and OpenGL ES test backends.
+      - name: Install software graphics stack (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            libegl1 \
+            libgl1-mesa-dri \
+            libgles2 \
+            mesa-vulkan-drivers \
+            vulkan-tools \
+            vulkan-validationlayers \
+            xauth \
+            xvfb
+
+          LVP_ICD=$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' -print -quit)
+          test -n "$LVP_ICD"
+          echo "VK_DRIVER_FILES=$LVP_ICD" >> "$GITHUB_ENV"
+          echo "VK_ICD_FILENAMES=$LVP_ICD" >> "$GITHUB_ENV"
 
       # Silk.NET's library loader can't resolve NuGet-packaged native libraries
       # under `dotnet test` on Linux (DependencyContext.Default points to the test
@@ -36,7 +59,131 @@ jobs:
         run: dotnet build NeoVeldrid.slnx -c Release
 
       - name: Run SPIRV tests
-        run: dotnet test tests/NeoVeldrid.SPIRV.Tests/NeoVeldrid.SPIRV.Tests.csproj -c Release
+        run: dotnet test tests/NeoVeldrid.SPIRV.Tests/NeoVeldrid.SPIRV.Tests.csproj -c Release --no-build
+
+      - name: Verify Vulkan software driver (Linux)
+        if: runner.os == 'Linux'
+        env:
+          GALLIUM_DRIVER: llvmpipe
+          LIBGL_ALWAYS_SOFTWARE: 'true'
+        run: >-
+          xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24"
+          vulkaninfo --summary
+
+      # xunit.runner.json serializes collections because SDL window creation and
+      # graphics-device initialization are process-global operations.
+      - name: Run Vulkan GPU tests with Mesa software drivers (Linux)
+        if: ${{ runner.os == 'Linux' && !cancelled() }}
+        env:
+          GALLIUM_DRIVER: llvmpipe
+          LIBGL_ALWAYS_SOFTWARE: 'true'
+          SDL_VIDEODRIVER: x11
+        run: >-
+          xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24"
+          dotnet test tests/NeoVeldrid.Tests/NeoVeldrid.Tests.csproj -c Release --no-build
+          --filter "Backend=Vulkan"
+
+      - name: Run OpenGL GPU tests with Mesa software drivers (Linux)
+        if: ${{ runner.os == 'Linux' && !cancelled() }}
+        env:
+          GALLIUM_DRIVER: llvmpipe
+          LIBGL_ALWAYS_SOFTWARE: 'true'
+          SDL_VIDEODRIVER: x11
+          SDL_VIDEO_X11_FORCE_EGL: '1'
+        run: >-
+          xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24"
+          dotnet test tests/NeoVeldrid.Tests/NeoVeldrid.Tests.csproj -c Release --no-build
+          --filter "Backend=OpenGL"
+
+      - name: Run OpenGL ES GPU tests with Mesa software drivers (Linux)
+        if: ${{ runner.os == 'Linux' && !cancelled() }}
+        env:
+          GALLIUM_DRIVER: llvmpipe
+          LIBGL_ALWAYS_SOFTWARE: 'true'
+          SDL_VIDEODRIVER: x11
+          SDL_VIDEO_X11_FORCE_EGL: '1'
+        run: >-
+          xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24"
+          dotnet test tests/NeoVeldrid.Tests/NeoVeldrid.Tests.csproj -c Release --no-build
+          --filter "Backend=OpenGLES"
+
+      # ImageTint exercises bounded submissions, texture upload and sampling,
+      # uniform buffers, graphics pipelines, staging readback, and PNG output.
+      # Each backend is checked against a CPU reference; hashes identify the
+      # outputs, and artifacts make the result inspectable.
+      - name: Render cross-backend visual smoke images (Linux)
+        if: ${{ runner.os == 'Linux' && !cancelled() }}
+        env:
+          GALLIUM_DRIVER: llvmpipe
+          LIBGL_ALWAYS_SOFTWARE: 'true'
+          SDL_VIDEODRIVER: x11
+        run: |
+          mkdir -p artifacts/visual
+
+          NEOVELDRID_BACKEND=vulkan \
+            xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" \
+            dotnet artifacts/bin/ImageTint/release/ImageTint.dll \
+            samples/assets/sponza/spnza_bricks_a_diff.png \
+            artifacts/visual/image-tint-vulkan.png \
+            --verify
+
+          # Keep this invocation on SDL's default GLX path so CI covers both
+          # hosted OpenGL transports; the full test suite uses EGL for sRGB.
+          NEOVELDRID_BACKEND=opengl \
+            xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" \
+            dotnet artifacts/bin/ImageTint/release/ImageTint.dll \
+            samples/assets/sponza/spnza_bricks_a_diff.png \
+            artifacts/visual/image-tint-opengl.png \
+            --verify
+
+          SDL_VIDEO_X11_FORCE_EGL=1 NEOVELDRID_BACKEND=opengles \
+            xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" \
+            dotnet artifacts/bin/ImageTint/release/ImageTint.dll \
+            samples/assets/sponza/spnza_bricks_a_diff.png \
+            artifacts/visual/image-tint-opengles.png \
+            --verify
+
+          sha256sum artifacts/visual/image-tint-*.png
+          image_count=$(find artifacts/visual -name 'image-tint-*.png' -type f | wc -l)
+          test "$image_count" -eq 3
+
+      - name: Publish Vulkan visual smoke image
+        if: ${{ runner.os == 'Linux' && !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          path: artifacts/visual/image-tint-vulkan.png
+          archive: false
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Publish OpenGL visual smoke image
+        if: ${{ runner.os == 'Linux' && !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          path: artifacts/visual/image-tint-opengl.png
+          archive: false
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Publish OpenGL ES visual smoke image
+        if: ${{ runner.os == 'Linux' && !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          path: artifacts/visual/image-tint-opengles.png
+          archive: false
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Run non-GPU tests
         run: dotnet test tests/NeoVeldrid.Tests/NeoVeldrid.Tests.csproj -c Release -p:ExcludeGPU=true
+
+      - name: Build without D3D11
+        if: runner.os == 'Windows'
+        run: dotnet build tests/NeoVeldrid.Tests/NeoVeldrid.Tests.csproj -c Release -p:ExcludeD3D11=true
+
+      - name: Build without Vulkan
+        run: dotnet build tests/NeoVeldrid.Tests/NeoVeldrid.Tests.csproj -c Release -p:ExcludeVulkan=true
+
+      - name: Build without OpenGL
+        if: runner.os == 'Windows' || runner.os == 'Linux'
+        run: dotnet build tests/NeoVeldrid.Tests/NeoVeldrid.Tests.csproj -c Release -p:ExcludeOpenGL=true
