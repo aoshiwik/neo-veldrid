@@ -109,7 +109,9 @@ void main()
             RgbaFloat expectedFillValue = new RgbaFloat(new System.Numerics.Vector4(FillValue * (depth + 1)));
             int notFilledCount = CountTexelsNotFilledAtDepth(GD, computeTargetTexture, expectedFillValue, depth);
 
-            Assert.Equal(0, notFilledCount);
+            Assert.True(
+                notFilledCount == 0,
+                $"Depth {depth}: {notFilledCount} of {computeTargetTexture.Width * computeTargetTexture.Height} texels differed.");
         }
     }
 

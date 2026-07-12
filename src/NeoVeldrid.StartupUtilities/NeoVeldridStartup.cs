@@ -45,7 +45,15 @@ public static unsafe class NeoVeldridStartup
 #endif
 
         window = CreateWindow(ref windowCI);
-        gd = CreateGraphicsDevice(window, deviceOptions, preferredBackend);
+        try
+        {
+            gd = CreateGraphicsDevice(window, deviceOptions, preferredBackend);
+        }
+        catch
+        {
+            window.Close();
+            throw;
+        }
     }
 
     public static Sdl2Window CreateWindow(WindowCreateInfo windowCI) => CreateWindow(ref windowCI);
