@@ -886,6 +886,11 @@ internal unsafe class VkCommandList : CommandList
         bool sourceIsStaging = (source.Usage & TextureUsage.Staging) == TextureUsage.Staging;
         bool destIsStaging = (destination.Usage & TextureUsage.Staging) == TextureUsage.Staging;
 
+        ClampCompressedCopyExtentToMipEdges(
+            source, srcX, srcY, srcMipLevel, !sourceIsStaging,
+            destination, dstX, dstY, dstMipLevel, !destIsStaging,
+            ref width, ref height);
+
         if (!sourceIsStaging && !destIsStaging)
         {
             ImageSubresourceLayers srcSubresource = new ImageSubresourceLayers
@@ -982,7 +987,7 @@ internal unsafe class VkCommandList : CommandList
                 BaseArrayLayer = dstBaseArrayLayer
             };
 
-            Util.GetMipDimensions(srcVkTexture, srcMipLevel, out uint mipWidth, out uint mipHeight, out uint mipDepth);
+            Util.GetMipDimensions(srcVkTexture, srcMipLevel, out uint mipWidth, out uint mipHeight, out _);
             uint blockSize = FormatHelpers.IsCompressedFormat(srcVkTexture.Format) ? 4u : 1u;
             uint bufferRowLength = Math.Max(mipWidth, blockSize);
             uint bufferImageHeight = Math.Max(mipHeight, blockSize);
@@ -994,9 +999,6 @@ internal unsafe class VkCommandList : CommandList
             uint rowPitch = FormatHelpers.GetRowPitch(bufferRowLength, srcVkTexture.Format);
             uint depthPitch = FormatHelpers.GetDepthPitch(rowPitch, bufferImageHeight, srcVkTexture.Format);
 
-            uint copyWidth = Math.Min(width, mipWidth);
-            uint copyheight = Math.Min(height, mipHeight);
-
             BufferImageCopy regions = new BufferImageCopy
             {
                 BufferOffset = srcLayout.Offset
@@ -1005,7 +1007,7 @@ internal unsafe class VkCommandList : CommandList
                     + (compressedX * blockSizeInBytes),
                 BufferRowLength = bufferRowLength,
                 BufferImageHeight = bufferImageHeight,
-                ImageExtent = new Extent3D { Width = copyWidth, Height = copyheight, Depth = depth },
+                ImageExtent = new Extent3D { Width = width, Height = height, Depth = depth },
                 ImageOffset = new Offset3D { X = (int)dstX, Y = (int)dstY, Z = (int)dstZ },
                 ImageSubresource = dstSubresource
             };
@@ -1162,6 +1164,43 @@ internal unsafe class VkCommandList : CommandList
                 }
 
             }
+        }
+    }
+
+    private static void ClampCompressedCopyExtentToMipEdges(
+        Texture source,
+        uint srcX,
+        uint srcY,
+        uint srcMipLevel,
+        bool sourceIsImage,
+        Texture destination,
+        uint dstX,
+        uint dstY,
+        uint dstMipLevel,
+        bool destinationIsImage,
+        ref uint width,
+        ref uint height)
+    {
+        if (!FormatHelpers.IsCompressedFormat(source.Format)
+            && !FormatHelpers.IsCompressedFormat(destination.Format))
+        {
+            return;
+        }
+
+        // NeoVeldrid permits a full compressed block at a sub-block-sized mip edge.
+        // Vulkan requires the command extent itself to stop at the actual mip boundary.
+        if (sourceIsImage)
+        {
+            Util.GetMipDimensions(source, srcMipLevel, out uint srcWidth, out uint srcHeight, out _);
+            width = Math.Min(width, srcWidth - srcX);
+            height = Math.Min(height, srcHeight - srcY);
+        }
+
+        if (destinationIsImage)
+        {
+            Util.GetMipDimensions(destination, dstMipLevel, out uint dstWidth, out uint dstHeight, out _);
+            width = Math.Min(width, dstWidth - dstX);
+            height = Math.Min(height, dstHeight - dstY);
         }
     }
 

@@ -1483,6 +1483,31 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
         GD.WaitForIdle();
     }
 
+    [SkippableFact]
+    public void CopyTexture_SmallCompressed_ToStaging()
+    {
+        const PixelFormat format = PixelFormat.BC3_UNorm;
+        Skip.IfNot(
+            GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Sampled)
+                && GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Staging),
+            $"{format} does not support compressed staging readback on {GD.BackendType}.");
+
+        Texture src = RF.CreateTexture(TextureDescription.Texture2D(
+            16, 16, 4, 1, format, TextureUsage.Sampled));
+        Texture dst = RF.CreateTexture(TextureDescription.Texture2D(
+            16, 16, 4, 1, format, TextureUsage.Staging));
+
+        CommandList cl = RF.CreateCommandList();
+        cl.Begin();
+        cl.CopyTexture(
+            src, 0, 0, 0, 3, 0,
+            dst, 0, 0, 0, 3, 0,
+            4, 4, 1, 1);
+        cl.End();
+        GD.SubmitCommands(cl);
+        GD.WaitForIdle();
+    }
+
     [Theory]
     [InlineData(PixelFormat.BC1_Rgb_UNorm)]
     [InlineData(PixelFormat.BC1_Rgb_UNorm_SRgb)]
