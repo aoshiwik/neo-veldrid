@@ -247,8 +247,13 @@ public static unsafe class NeoVeldridStartup
         }
 
         GLcontextFlag contextFlags = options.Debug
-            ? GLcontextFlag.DebugFlag | GLcontextFlag.ForwardCompatibleFlag
-            : GLcontextFlag.ForwardCompatibleFlag;
+            ? GLcontextFlag.DebugFlag
+            : 0;
+
+        if (backend == GraphicsBackend.OpenGL)
+        {
+            contextFlags |= GLcontextFlag.ForwardCompatibleFlag;
+        }
 
         sdl.GLSetAttribute(GLattr.ContextFlags, (int)contextFlags);
 

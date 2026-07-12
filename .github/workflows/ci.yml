@@ -89,6 +89,7 @@ jobs:
           GALLIUM_DRIVER: llvmpipe
           LIBGL_ALWAYS_SOFTWARE: 'true'
           SDL_VIDEODRIVER: x11
+          SDL_VIDEO_X11_FORCE_EGL: '1'
         run: >-
           xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24"
           dotnet test tests/NeoVeldrid.Tests/NeoVeldrid.Tests.csproj -c Release --no-build
@@ -126,6 +127,8 @@ jobs:
             artifacts/visual/image-tint-vulkan.png \
             --verify
 
+          # Keep this invocation on SDL's default GLX path so CI covers both
+          # hosted OpenGL transports; the full test suite uses EGL for sRGB.
           NEOVELDRID_BACKEND=opengl \
             xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" \
             dotnet artifacts/bin/ImageTint/release/ImageTint.dll \
