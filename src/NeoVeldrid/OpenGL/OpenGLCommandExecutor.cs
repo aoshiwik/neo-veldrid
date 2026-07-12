@@ -1529,20 +1529,27 @@ internal unsafe class OpenGLCommandExecutor
 
         if (_extensions.CopyImage && depth == 1)
         {
-            // glCopyImageSubData does not work properly when depth > 1, so use the awful roundabout copy.
+            // Some drivers do not copy compressed array textures correctly when a single
+            // glCopyImageSubData call spans multiple depth slices. Split compressed copies
+            // while retaining the batched fast path for uncompressed arrays.
             uint srcZOrLayer = Math.Max(srcBaseArrayLayer, srcZ);
             uint dstZOrLayer = Math.Max(dstBaseArrayLayer, dstZ);
-            uint depthOrLayerCount = Math.Max(depth, layerCount);
             // Copy width and height are allowed to be a full compressed block size, even if the mip level only contains a
             // region smaller than the block size.
             Util.GetMipDimensions(source, srcMipLevel, out uint mipWidth, out uint mipHeight, out _);
             width = Math.Min(width, mipWidth);
             height = Math.Min(height, mipHeight);
-            _gl.CopyImageSubData(
-                srcGLTexture.Texture, (CopyImageSubDataTarget)srcGLTexture.TextureTarget, (int)srcMipLevel, (int)srcX, (int)srcY, (int)srcZOrLayer,
-                dstGLTexture.Texture, (CopyImageSubDataTarget)dstGLTexture.TextureTarget, (int)dstMipLevel, (int)dstX, (int)dstY, (int)dstZOrLayer,
-                width, height, depthOrLayerCount);
-            CheckLastError();
+            bool isCompressed = FormatHelpers.IsCompressedFormat(source.Format)
+                || FormatHelpers.IsCompressedFormat(destination.Format);
+            uint layersPerCopy = isCompressed ? 1 : layerCount;
+            for (uint layer = 0; layer < layerCount; layer += layersPerCopy)
+            {
+                _gl.CopyImageSubData(
+                    srcGLTexture.Texture, (CopyImageSubDataTarget)srcGLTexture.TextureTarget, (int)srcMipLevel, (int)srcX, (int)srcY, (int)(srcZOrLayer + layer),
+                    dstGLTexture.Texture, (CopyImageSubDataTarget)dstGLTexture.TextureTarget, (int)dstMipLevel, (int)dstX, (int)dstY, (int)(dstZOrLayer + layer),
+                    width, height, layersPerCopy);
+                CheckLastError();
+            }
         }
         else
         {
