@@ -101,6 +101,8 @@ CI builds and runs the SPIR-V and non-GPU suites on Windows, Linux, and macOS. I
 
 The Linux job runs the complete Vulkan, OpenGL, and OpenGL ES test sets in isolated processes with Mesa software drivers under Xvfb, then publishes the cross-backend visual smoke images. The OpenGL test suite uses SDL's EGL path because Xvfb's GLX transport does not expose the sRGB-capable visual required by the swapchain regression tests; the OpenGL visual smoke invocation remains on the default GLX path so both transports are exercised. OpenGL ES also uses EGL because Xvfb does not provide the required GLX ES profile. Hosted Windows and macOS runners are build and non-GPU gates only because they do not provide a stable graphics device/display contract. Before a release or a backend-specific change, run the commands above on real Windows hardware and run Vulkan through MoltenVK on macOS. The macOS Vulkan suite is compiled in CI but is not currently executed there.
 
+OpenGL ES reports block-compressed staging textures as unsupported because ES has no portable API for downloading raw compressed blocks. The compressed-array copy regression still verifies exact BC3 block data on ES 3.2 by reinterpreting each block as an integer texel through core `CopyImageSubData`, then using the ordinary uncompressed staging path.
+
 ### Vulkan debug callback note
 
 Upstream's Vulkan debug callback throws a managed exception from an `[UnmanagedCallersOnly]` native callback, which is undefined behavior and crashes the test process. Our fix stores the error and throws from managed code after the Vulkan call returns. This allows all Vulkan tests to run to completion instead of aborting mid-suite.
