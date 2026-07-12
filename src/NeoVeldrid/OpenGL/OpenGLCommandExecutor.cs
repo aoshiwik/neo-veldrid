@@ -1529,9 +1529,9 @@ internal unsafe class OpenGLCommandExecutor
 
         if (_extensions.CopyImage && depth == 1)
         {
-            // Some drivers do not copy compressed array textures correctly when a single
+            // Some OpenGL ES drivers do not copy compressed array textures correctly when a single
             // glCopyImageSubData call spans multiple depth slices. Split compressed copies
-            // while retaining the batched fast path for uncompressed arrays.
+            // on that backend while retaining the batched fast path everywhere else.
             uint srcZOrLayer = Math.Max(srcBaseArrayLayer, srcZ);
             uint dstZOrLayer = Math.Max(dstBaseArrayLayer, dstZ);
             // Copy width and height are allowed to be a full compressed block size, even if the mip level only contains a
@@ -1539,9 +1539,10 @@ internal unsafe class OpenGLCommandExecutor
             Util.GetMipDimensions(source, srcMipLevel, out uint mipWidth, out uint mipHeight, out _);
             width = Math.Min(width, mipWidth);
             height = Math.Min(height, mipHeight);
-            bool isCompressed = FormatHelpers.IsCompressedFormat(source.Format)
-                || FormatHelpers.IsCompressedFormat(destination.Format);
-            uint layersPerCopy = isCompressed ? 1 : layerCount;
+            bool requiresSingleLayerCopies = _backend == GraphicsBackend.OpenGLES
+                && (FormatHelpers.IsCompressedFormat(source.Format)
+                    || FormatHelpers.IsCompressedFormat(destination.Format));
+            uint layersPerCopy = requiresSingleLayerCopies ? 1 : layerCount;
             for (uint layer = 0; layer < layerCount; layer += layersPerCopy)
             {
                 _gl.CopyImageSubData(
