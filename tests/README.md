@@ -89,11 +89,17 @@ dotnet test tests/NeoVeldrid.Tests/NeoVeldrid.Tests.csproj -c Release --filter "
 
 These tests warm the measured path before using `GC.GetAllocatedBytesForCurrentThread`; allocation-sensitive assertions apply only to managed allocations on the recording or submission thread.
 
+### Visual smoke artifacts
+
+The render tests validate GPU output by copying textures to staging resources and asserting decoded pixels. CI also runs the headless `ImageTint` sample through Vulkan, OpenGL, and OpenGL ES. It validates the rendered pixels against the CPU tint calculation, verifies that all three backends produce byte-identical canonical PNG output, then publishes each PNG as a directly viewable workflow artifact.
+
+`ImageTint` exercises texture upload and sampling, uniform buffers, a graphics pipeline, repeated bounded command-list submissions with independent render targets and captures, staging readback, and image encoding. CI validates every bounded submission. The artifact complements the exact pixel tests with an image reviewers can inspect; it is not a replacement for those assertions or a broad golden-image suite.
+
 ### Continuous integration coverage
 
 CI builds and runs the SPIR-V and non-GPU suites on Windows, Linux, and macOS. It also compiles the test project without Vulkan on all three platforms, without OpenGL on Windows and Linux, and without D3D11 on Windows.
 
-The Linux job runs the complete Vulkan, OpenGL, and OpenGL ES test set serially with Mesa software drivers under Xvfb. Hosted Windows and macOS runners are build and non-GPU gates only because they do not provide a stable graphics device/display contract. Before a release or a backend-specific change, run the commands above on real Windows hardware and run Vulkan through MoltenVK on macOS. The macOS Vulkan suite is compiled in CI but is not currently executed there.
+The Linux job runs the complete Vulkan, OpenGL, and OpenGL ES test set serially with Mesa software drivers under Xvfb, then publishes the cross-backend visual smoke images. Hosted Windows and macOS runners are build and non-GPU gates only because they do not provide a stable graphics device/display contract. Before a release or a backend-specific change, run the commands above on real Windows hardware and run Vulkan through MoltenVK on macOS. The macOS Vulkan suite is compiled in CI but is not currently executed there.
 
 ### Vulkan debug callback note
 

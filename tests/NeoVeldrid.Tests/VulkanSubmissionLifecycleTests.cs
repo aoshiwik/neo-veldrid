@@ -334,7 +334,6 @@ public class VulkanSubmissionLifecycleTests : GraphicsDeviceTestBase<VulkanDevic
             commandList.ClearColorTarget(0, RgbaFloat.Blue);
             commandList.SetPipeline(secondPassPipeline);
             commandList.SetScissorRect(0, scissorX, 0, width / 2, height);
-            commandList.SetScissorRect(0, scissorX, 0, width / 2, height);
             commandList.SetGraphicsResourceSet(0, secondPassSet);
             commandList.Draw(4);
             commandList.CopyTexture(output, captures[submissionIndex]);

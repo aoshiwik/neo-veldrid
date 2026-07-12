@@ -83,6 +83,60 @@ jobs:
           dotnet test tests/NeoVeldrid.Tests/NeoVeldrid.Tests.csproj -c Release --no-build
           --filter "Backend=Vulkan|Backend=OpenGL|Backend=OpenGLES"
 
+      # ImageTint exercises bounded submissions, texture upload and sampling,
+      # uniform buffers, graphics pipelines, staging readback, and PNG output.
+      # Each backend is checked against a CPU reference; exact hashes prove
+      # cross-backend agreement, and artifacts make the result inspectable.
+      - name: Render cross-backend visual smoke images (Linux)
+        if: ${{ runner.os == 'Linux' && !cancelled() }}
+        env:
+          GALLIUM_DRIVER: llvmpipe
+          LIBGL_ALWAYS_SOFTWARE: 'true'
+          SDL_VIDEODRIVER: x11
+        run: |
+          mkdir -p artifacts/visual
+          for backend in vulkan opengl opengles; do
+            NEOVELDRID_BACKEND="$backend" \
+              xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" \
+              dotnet artifacts/bin/ImageTint/release/ImageTint.dll \
+              samples/assets/sponza/spnza_bricks_a_diff.png \
+              "artifacts/visual/image-tint-$backend.png" \
+              --verify
+          done
+
+          sha256sum artifacts/visual/image-tint-*.png
+          image_count=$(find artifacts/visual -name 'image-tint-*.png' -type f | wc -l)
+          test "$image_count" -eq 3
+          unique_hash_count=$(sha256sum artifacts/visual/image-tint-*.png | awk '{print $1}' | sort -u | wc -l)
+          test "$unique_hash_count" -eq 1
+
+      - name: Publish Vulkan visual smoke image
+        if: ${{ runner.os == 'Linux' && !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          path: artifacts/visual/image-tint-vulkan.png
+          archive: false
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Publish OpenGL visual smoke image
+        if: ${{ runner.os == 'Linux' && !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          path: artifacts/visual/image-tint-opengl.png
+          archive: false
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Publish OpenGL ES visual smoke image
+        if: ${{ runner.os == 'Linux' && !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          path: artifacts/visual/image-tint-opengles.png
+          archive: false
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Run non-GPU tests
         run: dotnet test tests/NeoVeldrid.Tests/NeoVeldrid.Tests.csproj -c Release -p:ExcludeGPU=true
 

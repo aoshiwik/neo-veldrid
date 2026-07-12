@@ -16,6 +16,6 @@ void main()
 {
     vec2 texCoords = fsin_uv;
     vec4 inputColor = texture(sampler2D(Input, Sampler), texCoords);
-    vec4 tintedColor = vec4(inputColor.xyz * RGBTintColor, inputColor.z);
-    fsout_color =  tintedColor;
+    vec4 tintedColor = vec4(inputColor.xyz * RGBTintColor, inputColor.w);
+    fsout_color = mix(inputColor, tintedColor, TintFactor);
 }
