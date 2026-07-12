@@ -7,6 +7,7 @@ namespace NeoVeldrid.Tests;
 
 public static class TestUtils
 {
+#if TEST_VULKAN
     public static GraphicsDevice CreateVulkanDevice()
     {
         return GraphicsDevice.CreateVulkan(new GraphicsDeviceOptions(true));
@@ -25,6 +26,7 @@ public static class TestUtils
 
         NeoVeldridStartup.CreateWindowAndGraphicsDevice(wci, options, GraphicsBackend.Vulkan, out window, out gd);
     }
+#endif
 
 #if TEST_D3D11
     public static GraphicsDevice CreateD3D11Device()
@@ -47,6 +49,7 @@ public static class TestUtils
     }
 #endif
 
+#if TEST_OPENGL
     internal static void CreateOpenGLDevice(out Sdl2Window window, out GraphicsDevice gd)
     {
         WindowCreateInfo wci = new WindowCreateInfo
@@ -60,7 +63,9 @@ public static class TestUtils
 
         NeoVeldridStartup.CreateWindowAndGraphicsDevice(wci, options, GraphicsBackend.OpenGL, out window, out gd);
     }
+#endif
 
+#if TEST_OPENGLES
     internal static void CreateOpenGLESDevice(out Sdl2Window window, out GraphicsDevice gd)
     {
         WindowCreateInfo wci = new WindowCreateInfo
@@ -74,6 +79,7 @@ public static class TestUtils
 
         NeoVeldridStartup.CreateWindowAndGraphicsDevice(wci, options, GraphicsBackend.OpenGLES, out window, out gd);
     }
+#endif
 
 }
 
@@ -165,6 +171,7 @@ public interface GraphicsDeviceCreator
     void CreateGraphicsDevice(out Sdl2Window window, out GraphicsDevice gd);
 }
 
+#if TEST_VULKAN
 public class VulkanDeviceCreator : GraphicsDeviceCreator
 {
     public void CreateGraphicsDevice(out Sdl2Window window, out GraphicsDevice gd)
@@ -181,6 +188,7 @@ public class VulkanDeviceCreatorWithMainSwapchain : GraphicsDeviceCreator
         TestUtils.CreateVulkanDeviceWithSwapchain(out window, out gd);
     }
 }
+#endif
 
 #if TEST_D3D11
 public class D3D11DeviceCreator : GraphicsDeviceCreator
@@ -201,6 +209,7 @@ public class D3D11DeviceCreatorWithMainSwapchain : GraphicsDeviceCreator
 }
 #endif
 
+#if TEST_OPENGL
 public class OpenGLDeviceCreator : GraphicsDeviceCreator
 {
     public void CreateGraphicsDevice(out Sdl2Window window, out GraphicsDevice gd)
@@ -208,7 +217,9 @@ public class OpenGLDeviceCreator : GraphicsDeviceCreator
         TestUtils.CreateOpenGLDevice(out window, out gd);
     }
 }
+#endif
 
+#if TEST_OPENGLES
 public class OpenGLESDeviceCreator : GraphicsDeviceCreator
 {
     public void CreateGraphicsDevice(out Sdl2Window window, out GraphicsDevice gd)
@@ -216,3 +227,4 @@ public class OpenGLESDeviceCreator : GraphicsDeviceCreator
         TestUtils.CreateOpenGLESDevice(out window, out gd);
     }
 }
+#endif

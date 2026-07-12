@@ -35,6 +35,10 @@
         <PackageReference Include="Silk.NET.MoltenVK.Native" Condition="'$(ExcludeVulkan)' != 'true'" />
     </ItemGroup>
 
+    <ItemGroup>
+        <InternalsVisibleTo Include="NeoVeldrid.Tests" />
+    </ItemGroup>
+
     <!-- Exclude backends by compile removal -->
     <ItemGroup>
         <Compile Remove="D3D11/**/*" Condition="'$(ExcludeD3D11)' == 'true'" />

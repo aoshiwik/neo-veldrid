@@ -19,6 +19,11 @@ namespace NeoVeldrid.Vk;
 
 internal unsafe class VkGraphicsDevice : GraphicsDevice
 {
+    internal interface ISubmissionFenceWaitObserver
+    {
+        void BeforeWait();
+    }
+
     private const uint VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR = 0x00000001;
     private static readonly FixedUtf8String s_name = "NeoVeldrid-VkGraphicsDevice";
     private static readonly Lazy<bool> s_isSupported = new Lazy<bool>(CheckIsSupported, isThreadSafe: true);
@@ -126,6 +131,7 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
     private readonly ConcurrentQueue<VkFenceHandle> _availableSubmissionFences = new ConcurrentQueue<VkFenceHandle>();
     private readonly List<FenceSubmissionInfo> _submittedFences =
         new List<FenceSubmissionInfo>(SharedCommandPoolCount * 2);
+    internal ISubmissionFenceWaitObserver SubmissionFenceWaitObserver { get; set; }
     private readonly VkSwapchain _mainSwapchain;
 
     private readonly List<FixedUtf8String> _surfaceExtensions = new List<FixedUtf8String>();
@@ -297,6 +303,15 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
         for (int i = 0; i < _submittedFences.Count; i++)
         {
             FenceSubmissionInfo fsi = _submittedFences[i];
+            if (fsi.CompletionClaimed)
+            {
+                // The owning waiter is the only thread allowed to observe,
+                // reset, and recycle this fence until it detaches the record.
+                // Queue submissions are ordered, so there is no useful work
+                // to poll beyond an in-flight claimed submission.
+                break;
+            }
+
             Result status = _vk.GetFenceStatus(_device, fsi.Fence);
             if (status == Result.Success)
             {
@@ -321,29 +336,105 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
     internal void WaitForOldestSubmissionCompletion(VkCommandList commandList)
     {
         ArgumentNullException.ThrowIfNull(commandList);
-        lock (_submittedFencesLock)
+
+        FenceSubmissionInfo claimedSubmission = default;
+        bool claimAcquired = false;
+        bool submissionDetached = false;
+        try
         {
-            int submissionIndex = -1;
-            for (int i = 0; i < _submittedFences.Count; i++)
+            lock (_submittedFencesLock)
             {
-                if (ReferenceEquals(_submittedFences[i].CommandList, commandList))
+                int submissionIndex = FindOldestSubmissionIndexNoLock(commandList);
+                if (submissionIndex < 0)
                 {
-                    submissionIndex = i;
-                    break;
+                    // Completion can win the race between the caller's last
+                    // available-record probe and this lock acquisition. The
+                    // completion path publishes the recycled record before
+                    // removing its fence entry, so the caller's mandatory
+                    // post-wait probe will now observe it. If it does not, the
+                    // caller still reports the exhausted-pool invariant.
+                    return;
                 }
+
+                claimedSubmission = _submittedFences[submissionIndex];
+                if (claimedSubmission.CompletionClaimed)
+                {
+                    throw new NeoVeldridException(
+                        "The oldest in-flight Vulkan command-list submission already has a completion waiter.");
+                }
+
+                claimedSubmission.CompletionClaimed = true;
+                _submittedFences[submissionIndex] = claimedSubmission;
+                claimAcquired = true;
             }
 
-            if (submissionIndex < 0)
-            {
-                throw new NeoVeldridException(
-                    "A bounded Vulkan command-list pool was exhausted without a tracked in-flight submission.");
-            }
-
-            VkFenceHandle fence = _submittedFences[submissionIndex].Fence;
+            // Waiting can take arbitrarily long. The claim keeps polling from
+            // resetting or recycling this fence without blocking unrelated
+            // command-list submissions on the global tracking lock.
+            VkFenceHandle fence = claimedSubmission.Fence;
+            SubmissionFenceWaitObserver?.BeforeWait();
             Result result = _vk.WaitForFences(_device, 1, &fence, true, ulong.MaxValue);
             CheckResult(result);
-            CheckSubmittedFencesNoLock();
+
+            lock (_submittedFencesLock)
+            {
+                int submissionIndex = FindSubmissionIndexNoLock(fence);
+                if (submissionIndex < 0 || !_submittedFences[submissionIndex].CompletionClaimed)
+                {
+                    throw new NeoVeldridException(
+                        "A claimed Vulkan submission was no longer tracked after its fence completed.");
+                }
+
+                claimedSubmission = _submittedFences[submissionIndex];
+                // Publish the recycled command-buffer and staging records
+                // before removing the only tracked submission. Otherwise a
+                // concurrent Begin can observe an exhausted bounded pool with
+                // neither an available record nor an in-flight fence to wait
+                // for. This critical section is short; the unbounded native
+                // fence wait remains outside the registry lock.
+                CompleteFenceSubmission(claimedSubmission);
+                _submittedFences.RemoveAt(submissionIndex);
+                submissionDetached = true;
+            }
         }
+        finally
+        {
+            if (claimAcquired && !submissionDetached)
+            {
+                lock (_submittedFencesLock)
+                {
+                    int submissionIndex = FindSubmissionIndexNoLock(claimedSubmission.Fence);
+                    if (submissionIndex >= 0)
+                    {
+                        FenceSubmissionInfo submission = _submittedFences[submissionIndex];
+                        submission.CompletionClaimed = false;
+                        _submittedFences[submissionIndex] = submission;
+                    }
+                }
+            }
+        }
+    }
+
+    private int FindOldestSubmissionIndexNoLock(VkCommandList commandList)
+    {
+        for (int i = 0; i < _submittedFences.Count; i++)
+        {
+            if (ReferenceEquals(_submittedFences[i].CommandList, commandList))
+                return i;
+        }
+
+        return -1;
+    }
+
+    private int FindSubmissionIndexNoLock(VkFenceHandle fence)
+    {
+        for (int i = 0; i < _submittedFences.Count; i++)
+        {
+            if (_submittedFences[i].Fence.Handle == fence.Handle)
+                return i;
+        }
+
+        return -1;
     }
 
     private void CompleteFenceSubmission(FenceSubmissionInfo fsi)
@@ -1694,7 +1785,7 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
         }
     }
 
-    private readonly struct FenceSubmissionInfo
+    private struct FenceSubmissionInfo
     {
         public VkFenceHandle Fence { get; }
         public VkCommandList CommandList { get; }
@@ -1702,6 +1793,7 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
         public SharedCommandPool SharedCommandPool { get; }
         public VkTexture StagingTexture { get; }
         public VkBuffer StagingBuffer { get; }
+        public bool CompletionClaimed { get; set; }
 
         public FenceSubmissionInfo(
             VkFenceHandle fence,
@@ -1717,6 +1809,7 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
             SharedCommandPool = sharedCommandPool;
             StagingTexture = stagingTexture;
             StagingBuffer = stagingBuffer;
+            CompletionClaimed = false;
         }
     }
 }
