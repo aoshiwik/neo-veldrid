@@ -179,7 +179,10 @@ public unsafe class AnimatedMesh : SampleApplication
             _indexCount * 4, BufferUsage.IndexBuffer));
         GraphicsDevice.UpdateBuffer(_indexBuffer, 0, indices.ToArray());
 
-        _cl = factory.CreateCommandList();
+        _cl = factory.CreateCommandList(new CommandListDescription
+        {
+            MaximumInFlightSubmissionCount = 2,
+        });
         _camera.Position = new Vector3(110, -87, -532);
         _camera.Yaw = 0.45f;
         _camera.Pitch = -0.55f;

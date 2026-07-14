@@ -1,3 +1,4 @@
+using System.Diagnostics.CodeAnalysis;
 using Xunit;
 
 namespace NeoVeldrid.Tests;
@@ -40,6 +41,8 @@ public sealed class CommandListSubmissionDiagnosticsTests
             nameof(CommandList.SubmissionDiagnosticsEnabled));
         var capture = typeof(CommandList).GetMethod(
             nameof(CommandList.CaptureLastSubmissionDiagnostics));
+        var tryGetMetrics = typeof(CommandList).GetMethod(
+            nameof(CommandList.TryGetLastSubmissionMetrics));
 
         Assert.NotNull(enable);
         Assert.Equal(typeof(void), enable.ReturnType);
@@ -48,6 +51,20 @@ public sealed class CommandListSubmissionDiagnosticsTests
         Assert.Equal(typeof(bool), enabled.PropertyType);
         Assert.NotNull(capture);
         Assert.Equal(typeof(CommandListSubmissionSnapshot), capture.ReturnType);
+        Assert.Single(capture.ReturnParameter.GetCustomAttributes(
+            typeof(MaybeNullAttribute),
+            inherit: false));
+        Assert.NotNull(tryGetMetrics);
+        Assert.Equal(typeof(bool), tryGetMetrics.ReturnType);
+        Assert.Collection(
+            tryGetMetrics.GetParameters(),
+            parameter =>
+            {
+                Assert.True(parameter.IsOut);
+                Assert.Equal(
+                    typeof(CommandListSubmissionMetrics).MakeByRefType(),
+                    parameter.ParameterType);
+            });
         Assert.Null(typeof(CommandList).GetProperty("SubmissionDiagnostics"));
     }
 

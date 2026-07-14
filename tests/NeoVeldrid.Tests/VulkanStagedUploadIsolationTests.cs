@@ -18,6 +18,7 @@ public sealed class VulkanStagedUploadIsolationTests
     [Fact]
     public void BoundedSubmissionsPreserveEveryStagedUpdatePayload()
     {
+        VkGraphicsDevice graphicsDevice = Assert.IsType<VkGraphicsDevice>(GD);
         int payloadSize = SumRegionSizes();
         DeviceBuffer shared = RF.CreateBuffer(new BufferDescription(
             checked((uint)payloadSize),
@@ -42,12 +43,40 @@ public sealed class VulkanStagedUploadIsolationTests
         });
         commandList.EnableSubmissionDiagnostics(initialBufferAccessCapacity: RegionCount + 1);
         uint uploadAlignment = GetPrivateUInt32Constant("BufferCopyAlignment");
+        GD.WaitForIdle();
+        using var reclamationGate =
+            new VulkanAutomaticSubmissionReclamationGate(graphicsDevice);
+        var retainedSlots = new HashSet<uint>();
+        var retainedUploadPages = new HashSet<long>();
+        uint oldestRetainedSlot = uint.MaxValue;
+        long oldestRetainedUploadPage = 0;
+        uint? alreadyBegunSubmissionSlot = null;
 
         for (int submissionIndex = 0;
              submissionIndex < captures.Length;
              submissionIndex++)
         {
-            commandList.Begin();
+            uint submissionSlot;
+            if (alreadyBegunSubmissionSlot.HasValue)
+            {
+                submissionSlot = alreadyBegunSubmissionSlot.GetValueOrDefault();
+                alreadyBegunSubmissionSlot = null;
+            }
+            else
+            {
+                commandList.Begin();
+                submissionSlot = commandList.RecordingSubmissionSlot;
+            }
+
+            if (submissionIndex < BoundedSubmissionCapacity)
+            {
+                Assert.True(
+                    retainedSlots.Add(submissionSlot),
+                    $"Submission slot {submissionSlot} was reused before automatic reclamation was released.");
+                if (submissionIndex == 0)
+                    oldestRetainedSlot = submissionSlot;
+            }
+
             uint destinationOffset = 0;
             for (int regionIndex = 0; regionIndex < RegionCount; regionIndex++)
             {
@@ -75,8 +104,59 @@ public sealed class VulkanStagedUploadIsolationTests
             AssertSubmissionEvidence(
                 snapshot,
                 shared,
+                captures[submissionIndex],
                 payloadSize,
                 uploadAlignment);
+
+            if (submissionIndex < BoundedSubmissionCapacity)
+            {
+                long uploadPageIdentity =
+                    snapshot.BufferAccesses[0].PrimaryResourceIdentity;
+                Assert.True(
+                    retainedUploadPages.Add(uploadPageIdentity),
+                    $"Upload page {uploadPageIdentity} was reused while all bounded submissions were retained.");
+                if (submissionIndex == 0)
+                    oldestRetainedUploadPage = uploadPageIdentity;
+            }
+            else if (submissionIndex == BoundedSubmissionCapacity)
+            {
+                Assert.Equal(
+                    oldestRetainedUploadPage,
+                    snapshot.BufferAccesses[0].PrimaryResourceIdentity);
+            }
+
+            if (submissionIndex == BoundedSubmissionCapacity - 1)
+            {
+                Assert.Equal(BoundedSubmissionCapacity, retainedSlots.Count);
+                Assert.Equal(
+                    BoundedSubmissionCapacity,
+                    retainedUploadPages.Count);
+                Assert.Equal(
+                    BoundedSubmissionCapacity,
+                    graphicsDevice
+                        .CaptureSubmissionResourcePoolSnapshot()
+                        .TrackedSubmissionCount);
+
+                VulkanSubmissionWraparoundObservation wraparound =
+                    VulkanSubmissionWraparoundProbe.BeginAfterCapacityReached(
+                        graphicsDevice,
+                        commandList,
+                        reclamationGate);
+                Assert.True(
+                    wraparound.WaitWasObserved,
+                    "The capacity-plus-one Begin did not enter the bounded fence-wait path.");
+                Assert.False(
+                    wraparound.BeginCompletedWhilePaused,
+                    "The capacity-plus-one Begin reused a retained upload owner before completion.");
+                Assert.Equal(
+                    BoundedSubmissionCapacity,
+                    wraparound.TrackedSubmissionCountWhilePaused);
+                Assert.Equal(
+                    oldestRetainedSlot,
+                    wraparound.RecordingSubmissionSlot);
+                alreadyBegunSubmissionSlot =
+                    wraparound.RecordingSubmissionSlot;
+            }
         }
 
         GD.WaitForIdle();
@@ -337,6 +417,7 @@ public sealed class VulkanStagedUploadIsolationTests
     private static void AssertSubmissionEvidence(
         CommandListSubmissionSnapshot snapshot,
         DeviceBuffer shared,
+        DeviceBuffer capture,
         int payloadSize,
         uint uploadAlignment)
     {
@@ -397,11 +478,22 @@ public sealed class VulkanStagedUploadIsolationTests
 
         CommandListBufferAccess finalCopy =
             snapshot.BufferAccesses[RegionCount * 2];
+        long expectedSharedIdentity =
+            CommandListDiagnosticResourceIdentity.Get(shared);
+        long expectedCaptureIdentity =
+            CommandListDiagnosticResourceIdentity.Get(capture);
+        Assert.Equal(expectedSharedIdentity, sharedIdentity);
+        Assert.NotEqual(0L, uploadPageIdentity);
+        Assert.NotEqual(expectedSharedIdentity, uploadPageIdentity);
+        Assert.NotEqual(expectedCaptureIdentity, uploadPageIdentity);
+        Assert.NotEqual(expectedSharedIdentity, expectedCaptureIdentity);
         Assert.Equal(
             CommandListBufferAccessKind.CopySourceAndDestination,
             finalCopy.Kind);
-        Assert.Equal(sharedIdentity, finalCopy.PrimaryResourceIdentity);
+        Assert.Equal(expectedSharedIdentity, finalCopy.PrimaryResourceIdentity);
         Assert.True(finalCopy.HasSecondaryResource);
+        Assert.Equal(expectedCaptureIdentity, finalCopy.SecondaryResourceIdentity);
+        Assert.Equal(capture.Name, finalCopy.SecondaryResourceName);
         Assert.Equal(0UL, finalCopy.PrimaryOffsetInBytes);
         Assert.Equal(0UL, finalCopy.SecondaryOffsetInBytes);
         Assert.Equal(checked((ulong)payloadSize), finalCopy.SizeInBytes);

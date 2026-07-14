@@ -1,5 +1,6 @@
 using System;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
@@ -27,7 +28,7 @@ public abstract class CommandList : DeviceResource, IDisposable
     private readonly uint _uniformBufferAlignment;
     private readonly uint _structuredBufferAlignment;
     private uint _recordingSubmissionSlot;
-    private bool _recordingSubmissionSlotActive;
+    private bool _isRecording;
     private CommandListSubmissionDiagnostics _submissionDiagnostics;
 
     private protected Framebuffer _framebuffer;
@@ -71,7 +72,7 @@ public abstract class CommandList : DeviceResource, IDisposable
                     "This command list does not expose backend-owned stable recording slots.");
             }
 
-            if (!_recordingSubmissionSlotActive)
+            if (!_isRecording)
             {
                 throw new NeoVeldridException(
                     "A recording submission slot is available only between Begin and End.");
@@ -100,7 +101,7 @@ public abstract class CommandList : DeviceResource, IDisposable
     public void Begin()
     {
         BeginCore();
-        _recordingSubmissionSlotActive = true;
+        _isRecording = true;
         _submissionDiagnostics?.BeginRecording();
     }
 
@@ -141,7 +142,7 @@ public abstract class CommandList : DeviceResource, IDisposable
         }
         finally
         {
-            _recordingSubmissionSlotActive = false;
+            _isRecording = false;
             _submissionDiagnostics?.EndRecording();
         }
     }
@@ -152,7 +153,9 @@ public abstract class CommandList : DeviceResource, IDisposable
     /// Enables reusable command submission diagnostics for this command list.
     /// Diagnostics are disabled by default. Enabling allocates the recorder and
     /// its two reusable buffer-access stores; normal recording remains free of
-    /// diagnostic collection allocations.
+    /// diagnostic collection allocations. Diagnostics configuration cannot be
+    /// changed between <see cref="Begin"/> and <see cref="End"/>; enable before
+    /// beginning the first recording that should be measured.
     /// </summary>
     /// <param name="initialBufferAccessCapacity">
     /// Initial capacity for each reusable buffer-access store.
@@ -160,28 +163,71 @@ public abstract class CommandList : DeviceResource, IDisposable
     public void EnableSubmissionDiagnostics(
         int initialBufferAccessCapacity = 64)
     {
+        EnsureSubmissionDiagnosticsConfigurationMayChange();
         _submissionDiagnostics ??= new CommandListSubmissionDiagnostics(
             initialBufferAccessCapacity);
     }
 
     /// <summary>
     /// Stops collecting diagnostics for future recordings.
-    /// Existing snapshots remain independent and valid.
+    /// Existing snapshots remain independent and valid. Disabling discards the
+    /// command list's retained metrics and must occur outside an active recording.
     /// </summary>
     public void DisableSubmissionDiagnostics()
     {
+        EnsureSubmissionDiagnosticsConfigurationMayChange();
         _submissionDiagnostics = null;
     }
 
+    /// <summary>
+    /// Gets whether submission diagnostics are currently enabled.
+    /// </summary>
     public bool SubmissionDiagnosticsEnabled => _submissionDiagnostics is not null;
+
+    /// <summary>
+    /// Attempts to read the allocation-free metrics for the latest diagnosed
+    /// recording that reached a successful graphics-device submission.
+    /// </summary>
+    /// <param name="metrics">
+    /// Receives the latest metrics when this method returns true; otherwise,
+    /// receives the default value.
+    /// </param>
+    /// <returns>
+    /// True when diagnostics are enabled and a diagnosed submission has
+    /// completed successfully; otherwise, false.
+    /// </returns>
+    public bool TryGetLastSubmissionMetrics(
+        out CommandListSubmissionMetrics metrics)
+    {
+        CommandListSubmissionDiagnostics diagnostics = _submissionDiagnostics;
+        if (diagnostics is null)
+        {
+            metrics = default;
+            return false;
+        }
+
+        return diagnostics.TryGetLastSubmissionMetrics(out metrics);
+    }
 
     /// <summary>
     /// Freezes the latest command recording that reached a successful graphics-device
     /// submission. Returns null when diagnostics are disabled or no diagnosed
-    /// submission has completed.
+    /// submission has completed. This operation allocates a stable snapshot;
+    /// use <see cref="TryGetLastSubmissionMetrics"/>
+    /// when only allocation-free aggregate metrics are required.
     /// </summary>
+    [return: MaybeNull]
     public CommandListSubmissionSnapshot CaptureLastSubmissionDiagnostics() =>
         _submissionDiagnostics?.CaptureLastSubmission();
+
+    private void EnsureSubmissionDiagnosticsConfigurationMayChange()
+    {
+        if (_isRecording)
+        {
+            throw new InvalidOperationException(
+                "Submission diagnostics can only be enabled or disabled outside an active command-list recording.");
+        }
+    }
 
     internal CommandListSubmissionDiagnostics SubmissionDiagnostics =>
         _submissionDiagnostics;

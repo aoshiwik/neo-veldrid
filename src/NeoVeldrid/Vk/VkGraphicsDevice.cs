@@ -37,6 +37,11 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
         void BeforeWait();
     }
 
+    internal interface IAutomaticSubmissionReclamationGate
+    {
+        bool IsReclamationAllowed { get; }
+    }
+
     private const uint VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR = 0x00000001;
     private static readonly FixedUtf8String s_name = "NeoVeldrid-VkGraphicsDevice";
     private static readonly Lazy<bool> s_isSupported = new Lazy<bool>(CheckIsSupported, isThreadSafe: true);
@@ -148,6 +153,7 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
         new List<UnresolvedSubmissionCompletion>();
     internal ISubmissionCheckpointObserver SubmissionCheckpointObserver { get; set; }
     internal ISubmissionFenceWaitObserver SubmissionFenceWaitObserver { get; set; }
+    internal IAutomaticSubmissionReclamationGate AutomaticSubmissionReclamationGate { get; set; }
     private readonly VkSwapchain _mainSwapchain;
 
     private readonly List<FixedUtf8String> _surfaceExtensions = new List<FixedUtf8String>();
@@ -423,6 +429,17 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
     }
 
     private void CheckSubmittedFences()
+    {
+        if (AutomaticSubmissionReclamationGate is
+            { IsReclamationAllowed: false })
+        {
+            return;
+        }
+
+        CheckSubmittedFencesIgnoringAutomaticReclamationGate();
+    }
+
+    private void CheckSubmittedFencesIgnoringAutomaticReclamationGate()
     {
         lock (_submittedFencesLock)
         {
@@ -1502,7 +1519,10 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
         CheckResult(result);
 
         CompleteUnresolvedSubmissionCompletions();
-        CheckSubmittedFences();
+        // Waiting for the queue to become idle is an explicit lifecycle
+        // boundary. It must release completed submission ownership even when
+        // a test has paused opportunistic reclamation.
+        CheckSubmittedFencesIgnoringAutomaticReclamationGate();
         FlushValidationErrors();
     }
 

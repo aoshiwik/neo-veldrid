@@ -149,7 +149,10 @@ public class OffscreenApplication : SampleApplication
             _colorView,
             GraphicsDevice.Aniso4xSampler));
 
-        _cl = factory.CreateCommandList();
+        _cl = factory.CreateCommandList(new CommandListDescription
+        {
+            MaximumInFlightSubmissionCount = 2,
+        });
     }
 
     public struct UniformInfo

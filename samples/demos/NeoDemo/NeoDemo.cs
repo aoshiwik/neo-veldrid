@@ -636,7 +636,10 @@ public class NeoDemo
 
     private void CreateAllObjects()
     {
-        _frameCommands = _gd.ResourceFactory.CreateCommandList();
+        _frameCommands = _gd.ResourceFactory.CreateCommandList(new CommandListDescription
+        {
+            MaximumInFlightSubmissionCount = 2,
+        });
         _frameCommands.Name = "Frame Commands List";
         CommandList initCL = _gd.ResourceFactory.CreateCommandList();
         initCL.Name = "Recreation Initialization Command List";

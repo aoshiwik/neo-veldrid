@@ -1,6 +1,7 @@
 #if TEST_VULKAN
 using System;
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -54,25 +55,81 @@ public class VulkanRecordingPerformanceTests : GraphicsDeviceTestBase<VulkanDevi
     }
 
     [Fact]
-    public void BoundedSubmissionStateDoesNotAllocateAfterWarmup()
+    public void EightSlotManyResourceSubmissionStateDoesNotAllocateAfterWarmup()
     {
         const int warmupCount = 32;
-        const int measurementCount = 256;
-        DeviceBuffer buffer = RF.CreateBuffer(new BufferDescription(
-            sizeof(uint),
-            BufferUsage.VertexBuffer));
+        const int measurementCount = 128;
+        const int resourceSetCount = 64;
+        const uint maximumInFlightSubmissionCount = 8;
+
+        uint uniformPayloadSize = checked((uint)Unsafe.SizeOf<DynamicUniformPayload>());
+        uint uniformAlignment = Math.Max(1u, GD.UniformBufferMinOffsetAlignment);
+        uint uniformStride = AlignUp(uniformPayloadSize, uniformAlignment);
+        DeviceBuffer uniformBuffer = RF.CreateBuffer(new BufferDescription(
+            checked(uniformStride * resourceSetCount),
+            BufferUsage.UniformBuffer | BufferUsage.Dynamic));
+
+        ResourceLayout layout = RF.CreateResourceLayout(
+            new ResourceLayoutDescription(
+                new ResourceLayoutElementDescription(
+                    "FrameValue",
+                    ResourceKind.UniformBuffer,
+                    ShaderStages.Compute,
+                    ResourceLayoutElementOptions.DynamicBinding),
+                new ResourceLayoutElementDescription(
+                    "Output",
+                    ResourceKind.StructuredBufferReadWrite,
+                    ShaderStages.Compute)));
+        Pipeline pipeline = RF.CreateComputePipeline(
+            new ComputePipelineDescription(
+                TestShaders.LoadCompute(RF, "DynamicUniformSlot"),
+                layout,
+                1,
+                1,
+                1));
+
+        DeviceBuffer[] outputs = new DeviceBuffer[resourceSetCount];
+        ResourceSet[] resourceSets = new ResourceSet[resourceSetCount];
+        for (int resourceIndex = 0;
+             resourceIndex < resourceSetCount;
+             resourceIndex++)
+        {
+            uint dynamicOffset = checked((uint)resourceIndex * uniformStride);
+            GD.UpdateBuffer(
+                uniformBuffer,
+                dynamicOffset,
+                new DynamicUniformPayload(ExpectedResourceValue(resourceIndex)));
+            outputs[resourceIndex] = RF.CreateBuffer(new BufferDescription(
+                sizeof(uint),
+                BufferUsage.StructuredBufferReadWrite,
+                sizeof(uint)));
+            resourceSets[resourceIndex] = RF.CreateResourceSet(
+                new ResourceSetDescription(
+                    layout,
+                    new DeviceBufferRange(
+                        uniformBuffer,
+                        0,
+                        uniformPayloadSize),
+                    outputs[resourceIndex]));
+        }
+        GD.WaitForIdle();
+
         CommandList commandList = RF.CreateCommandList(new CommandListDescription
         {
-            MaximumInFlightSubmissionCount = 1,
-            InitialTrackedResourceCapacityPerSubmission = 4
+            MaximumInFlightSubmissionCount = maximumInFlightSubmissionCount,
+            InitialTrackedResourceCapacityPerSubmission = 256
         });
+        Assert.Equal(
+            maximumInFlightSubmissionCount,
+            commandList.RecordingSubmissionSlotCount);
 
-        for (uint value = 1; value <= warmupCount; value++)
+        for (int frameIndex = 0; frameIndex < warmupCount; frameIndex++)
         {
-            commandList.Begin();
-            commandList.UpdateBuffer(buffer, 0, value);
-            commandList.End();
-            GD.SubmitCommands(commandList);
+            SubmitRepresentativeFrame(
+                commandList,
+                pipeline,
+                resourceSets,
+                uniformStride);
         }
         GD.WaitForIdle();
 
@@ -81,12 +138,13 @@ public class VulkanRecordingPerformanceTests : GraphicsDeviceTestBase<VulkanDevi
         GC.Collect();
         long allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
         long started = Stopwatch.GetTimestamp();
-        for (uint value = 1; value <= measurementCount; value++)
+        for (int frameIndex = 0; frameIndex < measurementCount; frameIndex++)
         {
-            commandList.Begin();
-            commandList.UpdateBuffer(buffer, 0, value);
-            commandList.End();
-            GD.SubmitCommands(commandList);
+            SubmitRepresentativeFrame(
+                commandList,
+                pipeline,
+                resourceSets,
+                uniformStride);
         }
         TimeSpan elapsed = Stopwatch.GetElapsedTime(started);
         long allocatedBytes = GC.GetAllocatedBytesForCurrentThread() - allocatedBefore;
@@ -94,10 +152,76 @@ public class VulkanRecordingPerformanceTests : GraphicsDeviceTestBase<VulkanDevi
         GD.WaitForIdle();
 
         _output.WriteLine(
-            $"Bounded submissions: {measurementCount}; allocated bytes: {allocatedBytes}; " +
+            $"Eight-slot submissions: {measurementCount}; " +
+            $"resource sets per submission: {resourceSetCount}; " +
+            $"allocated bytes: {allocatedBytes}; " +
             $"elapsed: {elapsed.TotalMilliseconds:F3} ms; " +
             $"average: {elapsed.TotalMicroseconds / measurementCount:F3} us/submission.");
         Assert.Equal(0, allocatedBytes);
+
+        DeviceBuffer readback = GetReadback(outputs[resourceSetCount - 1]);
+        MappedResourceView<uint> mapped = GD.Map<uint>(readback, MapMode.Read);
+        try
+        {
+            Assert.Equal(
+                ExpectedResourceValue(resourceSetCount - 1),
+                mapped[0]);
+        }
+        finally
+        {
+            GD.Unmap(readback);
+        }
+    }
+
+    private void SubmitRepresentativeFrame(
+        CommandList commandList,
+        Pipeline pipeline,
+        ResourceSet[] resourceSets,
+        uint uniformStride)
+    {
+        commandList.Begin();
+        commandList.SetPipeline(pipeline);
+        for (int resourceIndex = 0;
+             resourceIndex < resourceSets.Length;
+             resourceIndex++)
+        {
+            uint dynamicOffset = checked((uint)resourceIndex * uniformStride);
+            commandList.SetComputeResourceSet(
+                0,
+                resourceSets[resourceIndex],
+                1,
+                ref dynamicOffset);
+            commandList.Dispatch(1, 1, 1);
+        }
+        commandList.End();
+        GD.SubmitCommands(commandList);
+    }
+
+    private static uint ExpectedResourceValue(int resourceIndex)
+        => checked(50_000u + (uint)resourceIndex * 131u);
+
+    private static uint AlignUp(uint value, uint alignment)
+    {
+        uint remainder = value % alignment;
+        return remainder == 0u
+            ? value
+            : checked(value + alignment - remainder);
+    }
+
+    private readonly struct DynamicUniformPayload
+    {
+        public readonly uint Value;
+        public readonly uint Padding0;
+        public readonly uint Padding1;
+        public readonly uint Padding2;
+
+        public DynamicUniformPayload(uint value)
+        {
+            Value = value;
+            Padding0 = 0;
+            Padding1 = 0;
+            Padding2 = 0;
+        }
     }
 }
 #endif

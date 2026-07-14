@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using System.Threading;
 
@@ -177,10 +178,21 @@ internal sealed class CommandListSubmissionDiagnostics
         _lastSubmittedMetrics;
 
     /// <summary>
+    /// Attempts to copy the latest submitted metrics without allocating.
+    /// </summary>
+    internal bool TryGetLastSubmissionMetrics(
+        out CommandListSubmissionMetrics metrics)
+    {
+        metrics = _lastSubmittedMetrics;
+        return metrics.SubmissionSequence != 0L;
+    }
+
+    /// <summary>
     /// Copies the latest submitted recording so it remains stable while the
     /// command list is reused for later frames. Returns null until a recording
     /// reaches a successful submission.
     /// </summary>
+    [return: MaybeNull]
     public CommandListSubmissionSnapshot CaptureLastSubmission()
     {
         if (_lastSubmittedMetrics.SubmissionSequence == 0)
