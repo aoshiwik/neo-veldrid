@@ -28,7 +28,7 @@ internal class OpenGLCommandList : CommandList
         _gd = gd;
     }
 
-    public override void Begin()
+    private protected override void BeginCore()
     {
         ClearCachedState();
         if (_currentCommands != null)
@@ -87,7 +87,10 @@ internal class OpenGLCommandList : CommandList
         _currentCommands.DrawIndexedIndirect(indirectBuffer, offset, drawCount, stride);
     }
 
-    public override void Dispatch(uint groupCountX, uint groupCountY, uint groupCountZ)
+    private protected override void DispatchCore(
+        uint groupCountX,
+        uint groupCountY,
+        uint groupCountZ)
     {
         _currentCommands.Dispatch(groupCountX, groupCountY, groupCountZ);
     }
@@ -102,7 +105,7 @@ internal class OpenGLCommandList : CommandList
         _currentCommands.ResolveTexture(source, destination);
     }
 
-    public override void End()
+    private protected override void EndCore()
     {
         _currentCommands.End();
     }
@@ -135,7 +138,12 @@ internal class OpenGLCommandList : CommandList
         _currentCommands.SetComputeResourceSet(slot, rs, dynamicOffsetCount, ref dynamicOffsets);
     }
 
-    public override void SetScissorRect(uint index, uint x, uint y, uint width, uint height)
+    private protected override void SetScissorRectCore(
+        uint index,
+        uint x,
+        uint y,
+        uint width,
+        uint height)
     {
         _currentCommands.SetScissorRect(index, x, y, width, height);
     }
@@ -148,7 +156,9 @@ internal class OpenGLCommandList : CommandList
         _currentCommands.SetVertexBuffer(index, buffer, offset);
     }
 
-    public override void SetViewport(uint index, ref Viewport viewport)
+    private protected override void SetViewportCore(
+        uint index,
+        ref Viewport viewport)
     {
         _currentCommands.SetViewport(index, ref viewport);
     }

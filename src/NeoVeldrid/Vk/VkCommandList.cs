@@ -15,6 +15,8 @@ namespace NeoVeldrid.Vk;
 internal unsafe class VkCommandList : CommandList
 {
     private const int RetainedStagingBufferCapacity = 4;
+    private const uint DefaultStagingUploadPageSize = 256u * 1024u;
+    private const uint BufferCopyAlignment = 4u;
 
     private readonly VkGraphicsDevice _gd;
     private CommandPool _pool;
@@ -72,6 +74,11 @@ internal unsafe class VkCommandList : CommandList
         _maximumInFlightSubmissionCount = ResolveCapacity(
             description.MaximumInFlightSubmissionCount,
             nameof(description.MaximumInFlightSubmissionCount));
+        if (_maximumInFlightSubmissionCount > 0)
+        {
+            ConfigureRecordingSubmissionSlots(
+                checked((uint)_maximumInFlightSubmissionCount));
+        }
         _initialTrackedResourceCapacityPerSubmission = ResolveCapacity(
             description.InitialTrackedResourceCapacityPerSubmission,
             nameof(description.InitialTrackedResourceCapacityPerSubmission));
@@ -89,7 +96,8 @@ internal unsafe class VkCommandList : CommandList
         for (int i = 0; i < _maximumInFlightSubmissionCount; i++)
         {
             _availableStagingInfos.Add(new StagingResourceInfo(
-                _initialTrackedResourceCapacityPerSubmission));
+                _initialTrackedResourceCapacityPerSubmission,
+                (uint)i));
         }
 
         CommandPoolCreateInfo poolCI = new CommandPoolCreateInfo
@@ -140,17 +148,77 @@ internal unsafe class VkCommandList : CommandList
 
     public void CommandBufferSubmitted(CommandBuffer cb)
     {
+        StagingResourceInfo info = _currentStagingInfo;
+        foreach (VkBuffer buffer in info.Buffers)
+        {
+            try
+            {
+                buffer.SubmissionAccess.BeginSubmissionUse();
+                info.AcquiredBuffers.Add(buffer);
+            }
+            catch
+            {
+                for (int i = info.AcquiredBuffers.Count - 1; i >= 0; i--)
+                {
+                    info.AcquiredBuffers[i].SubmissionAccess.EndSubmissionUse();
+                }
+
+                info.AcquiredBuffers.Clear();
+                throw;
+            }
+        }
+
         RefCount.Increment();
-        foreach (ResourceRefCount rrc in _currentStagingInfo.Resources)
+        foreach (ResourceRefCount rrc in info.Resources)
         {
             rrc.Increment();
         }
+        info.SubmissionReferencesAcquired = true;
 
+        try
+        {
+            lock (_stagingLock)
+            {
+                _submittedStagingInfos.Add(cb, info);
+            }
+            _currentStagingInfo = null;
+        }
+        catch
+        {
+            if (ReleaseSubmissionResourceReferences(info))
+                RefCount.Decrement();
+            throw;
+        }
+    }
+
+    public void CommandBufferSubmissionFailed(CommandBuffer cb)
+    {
+        StagingResourceInfo info;
+        bool releaseCommandListReference;
         lock (_stagingLock)
         {
-            _submittedStagingInfos.Add(cb, _currentStagingInfo);
+            if (_currentStagingInfo != null)
+            {
+                throw new NeoVeldridException(
+                    "A failed Vulkan submission cannot restore over an active recording transaction.");
+            }
+
+            if (!_submittedStagingInfos.Remove(cb, out info))
+            {
+                throw new NeoVeldridException(
+                    "A failed Vulkan command-buffer submission had no prepared resource transaction.");
+            }
+
+            releaseCommandListReference =
+                ReleaseSubmissionResourceReferences(info);
+
+            // Keep recorded resources and staging pages intact so the ended command
+            // buffer can be submitted again after a recoverable queue failure.
+            _currentStagingInfo = info;
         }
-        _currentStagingInfo = null;
+
+        if (releaseCommandListReference)
+            RefCount.Decrement();
     }
 
     public void CommandBufferCompleted(CommandBuffer completedCB)
@@ -169,18 +237,32 @@ internal unsafe class VkCommandList : CommandList
             }
         }
 
+        StagingResourceInfo completedInfo = null;
         lock (_stagingLock)
         {
-            if (_submittedStagingInfos.Remove(completedCB, out StagingResourceInfo info))
-            {
-                RecycleStagingInfo(info);
-            }
+            _submittedStagingInfos.Remove(completedCB, out completedInfo);
         }
 
-        RefCount.Decrement();
+        if (completedInfo != null)
+            RecycleStagingInfo(completedInfo);
     }
 
-    public override void Begin()
+    private bool ReleaseSubmissionResourceReferences(StagingResourceInfo info)
+    {
+        if (!info.SubmissionReferencesAcquired)
+            return false;
+
+        info.SubmissionReferencesAcquired = false;
+        for (int i = info.AcquiredBuffers.Count - 1; i >= 0; i--)
+            info.AcquiredBuffers[i].SubmissionAccess.EndSubmissionUse();
+        info.AcquiredBuffers.Clear();
+
+        foreach (ResourceRefCount resource in info.Resources)
+            resource.Decrement();
+        return true;
+    }
+
+    private protected override void BeginCore()
     {
         if (_commandBufferBegun)
         {
@@ -192,6 +274,7 @@ internal unsafe class VkCommandList : CommandList
             _commandBufferEnded = false;
             if (_currentStagingInfo != null)
             {
+                RecycleAbandonedEndedCommandBuffer(_cb);
                 RecycleStagingInfo(_currentStagingInfo);
             }
 
@@ -202,6 +285,9 @@ internal unsafe class VkCommandList : CommandList
         {
             _currentStagingInfo = GetStagingResourceInfo();
         }
+
+        if (RecordingSubmissionSlotCount != 0u)
+            SetRecordingSubmissionSlot(_currentStagingInfo.Slot);
 
         CommandBufferBeginInfo beginInfo = new CommandBufferBeginInfo
         {
@@ -219,6 +305,25 @@ internal unsafe class VkCommandList : CommandList
 
         _currentComputePipeline = null;
         ClearSets(_currentComputeResourceSets);
+    }
+
+    private void RecycleAbandonedEndedCommandBuffer(CommandBuffer commandBuffer)
+    {
+        lock (_commandBufferListLock)
+        {
+            for (int i = 0; i < _submittedCommandBuffers.Count; i++)
+            {
+                if (_submittedCommandBuffers[i].Handle != commandBuffer.Handle)
+                    continue;
+
+                _submittedCommandBuffers.RemoveAt(i);
+                _availableCommandBuffers.Enqueue(commandBuffer);
+                return;
+            }
+        }
+
+        throw new NeoVeldridException(
+            "An abandoned Vulkan command buffer was not owned by its command list.");
     }
 
     private protected override void ClearColorTargetCore(uint index, RgbaFloat clearColor)
@@ -310,7 +415,7 @@ internal unsafe class VkCommandList : CommandList
     {
         PreDrawCommand();
         VkBuffer vkBuffer = Util.AssertSubtype<DeviceBuffer, VkBuffer>(indirectBuffer);
-        _currentStagingInfo.Resources.Add(vkBuffer.RefCount);
+        TrackBuffer(vkBuffer);
         _gd.Vk.CmdDrawIndirect(_cb, vkBuffer.DeviceBuffer, offset, drawCount, stride);
     }
 
@@ -318,7 +423,7 @@ internal unsafe class VkCommandList : CommandList
     {
         PreDrawCommand();
         VkBuffer vkBuffer = Util.AssertSubtype<DeviceBuffer, VkBuffer>(indirectBuffer);
-        _currentStagingInfo.Resources.Add(vkBuffer.RefCount);
+        TrackBuffer(vkBuffer);
         _gd.Vk.CmdDrawIndexedIndirect(_cb, vkBuffer.DeviceBuffer, offset, drawCount, stride);
     }
 
@@ -376,6 +481,10 @@ internal unsafe class VkCommandList : CommandList
                 {
                     _currentStagingInfo.Resources.Add(vkSet.RefCounts[i]);
                 }
+                for (int i = 0; i < vkSet.Buffers.Count; i++)
+                {
+                    TrackBuffer(vkSet.Buffers[i]);
+                }
             }
 
             if (batchEnded)
@@ -409,7 +518,10 @@ internal unsafe class VkCommandList : CommandList
         }
     }
 
-    public override void Dispatch(uint groupCountX, uint groupCountY, uint groupCountZ)
+    private protected override void DispatchCore(
+        uint groupCountX,
+        uint groupCountY,
+        uint groupCountZ)
     {
         PreDispatchCommand();
 
@@ -450,7 +562,7 @@ internal unsafe class VkCommandList : CommandList
         PreDispatchCommand();
 
         VkBuffer vkBuffer = Util.AssertSubtype<DeviceBuffer, VkBuffer>(indirectBuffer);
-        _currentStagingInfo.Resources.Add(vkBuffer.RefCount);
+        TrackBuffer(vkBuffer);
         _gd.Vk.CmdDispatchIndirect(_cb, vkBuffer.DeviceBuffer, offset);
     }
 
@@ -493,7 +605,7 @@ internal unsafe class VkCommandList : CommandList
         }
     }
 
-    public override void End()
+    private protected override void EndCore()
     {
         if (!_commandBufferBegun)
         {
@@ -628,7 +740,7 @@ internal unsafe class VkCommandList : CommandList
                             vkClearValue.Color.Float32_1,
                             vkClearValue.Color.Float32_2,
                             vkClearValue.Color.Float32_3);
-                        ClearColorTarget(i, clearColor);
+                        ClearColorTargetCore(i, clearColor);
                     }
                 }
             }
@@ -683,14 +795,20 @@ internal unsafe class VkCommandList : CommandList
         VkBufferHandle deviceBuffer = vkBuffer.DeviceBuffer;
         ulong offset64 = offset;
         _gd.Vk.CmdBindVertexBuffers(_cb, index, 1, in deviceBuffer, in offset64);
-        _currentStagingInfo.Resources.Add(vkBuffer.RefCount);
+        TrackBuffer(vkBuffer);
+    }
+
+    private void TrackBuffer(VkBuffer buffer)
+    {
+        _currentStagingInfo.Resources.Add(buffer.RefCount);
+        _currentStagingInfo.Buffers.Add(buffer);
     }
 
     private protected override void SetIndexBufferCore(DeviceBuffer buffer, IndexFormat format, uint offset)
     {
         VkBuffer vkBuffer = Util.AssertSubtype<DeviceBuffer, VkBuffer>(buffer);
         _gd.Vk.CmdBindIndexBuffer(_cb, vkBuffer.DeviceBuffer, offset, VkFormats.VdToVkIndexFormat(format));
-        _currentStagingInfo.Resources.Add(vkBuffer.RefCount);
+        TrackBuffer(vkBuffer);
     }
 
     private protected override void SetPipelineCore(Pipeline pipeline)
@@ -747,7 +865,12 @@ internal unsafe class VkCommandList : CommandList
         }
     }
 
-    public override void SetScissorRect(uint index, uint x, uint y, uint width, uint height)
+    private protected override void SetScissorRectCore(
+        uint index,
+        uint x,
+        uint y,
+        uint width,
+        uint height)
     {
         if (index == 0 || _gd.Features.MultipleViewports)
         {
@@ -764,7 +887,9 @@ internal unsafe class VkCommandList : CommandList
         }
     }
 
-    public override void SetViewport(uint index, ref Viewport viewport)
+    private protected override void SetViewportCore(
+        uint index,
+        ref Viewport viewport)
     {
         if (index == 0 || _gd.Features.MultipleViewports)
         {
@@ -791,9 +916,9 @@ internal unsafe class VkCommandList : CommandList
 
     private protected override void UpdateBufferCore(DeviceBuffer buffer, uint bufferOffsetInBytes, IntPtr source, uint sizeInBytes)
     {
-        VkBuffer stagingBuffer = GetStagingBuffer(sizeInBytes);
-        _gd.UpdateBuffer(stagingBuffer, 0, source, sizeInBytes);
-        CopyBuffer(stagingBuffer, 0, buffer, bufferOffsetInBytes, sizeInBytes);
+        StagingBufferAllocation staging = AllocateStagingBuffer(sizeInBytes);
+        _gd.UpdateBuffer(staging.Buffer, staging.Offset, source, sizeInBytes);
+        CopyBuffer(staging.Buffer, staging.Offset, buffer, bufferOffsetInBytes, sizeInBytes);
     }
 
     private protected override void CopyBufferCore(
@@ -806,38 +931,18 @@ internal unsafe class VkCommandList : CommandList
         EnsureNoRenderPass();
 
         VkBuffer srcVkBuffer = Util.AssertSubtype<DeviceBuffer, VkBuffer>(source);
-        _currentStagingInfo.Resources.Add(srcVkBuffer.RefCount);
+        TrackBuffer(srcVkBuffer);
         VkBuffer dstVkBuffer = Util.AssertSubtype<DeviceBuffer, VkBuffer>(destination);
-        _currentStagingInfo.Resources.Add(dstVkBuffer.RefCount);
+        TrackBuffer(dstVkBuffer);
 
-        BufferCopy region = new BufferCopy
-        {
-            SrcOffset = sourceOffset,
-            DstOffset = destinationOffset,
-            Size = sizeInBytes
-        };
-
-        _gd.Vk.CmdCopyBuffer(_cb, srcVkBuffer.DeviceBuffer, dstVkBuffer.DeviceBuffer, 1, in region);
-
-        bool needToProtectUniform = (destination.Usage & BufferUsage.UniformBuffer) != 0;
-
-        MemoryBarrier barrier = new MemoryBarrier
-        {
-            SType = StructureType.MemoryBarrier,
-            SrcAccessMask = AccessFlags.TransferWriteBit,
-            DstAccessMask = needToProtectUniform ? AccessFlags.UniformReadBit : AccessFlags.VertexAttributeReadBit
-        };
-        _gd.Vk.CmdPipelineBarrier(
+        VkBufferCopyRecorder.Record(
+            _gd,
             _cb,
-            PipelineStageFlags.TransferBit, needToProtectUniform ?
-                PipelineStageFlags.VertexShaderBit | PipelineStageFlags.ComputeShaderBit |
-                PipelineStageFlags.FragmentShaderBit | PipelineStageFlags.GeometryShaderBit |
-                PipelineStageFlags.TessellationControlShaderBit | PipelineStageFlags.TessellationEvaluationShaderBit
-                : PipelineStageFlags.VertexInputBit,
-            0,
-            1, in barrier,
-            0, null,
-            0, null);
+            srcVkBuffer,
+            sourceOffset,
+            dstVkBuffer,
+            destinationOffset,
+            sizeInBytes);
     }
 
     private protected override void CopyTextureCore(
@@ -1330,14 +1435,30 @@ internal unsafe class VkCommandList : CommandList
         }
     }
 
-    private VkBuffer GetStagingBuffer(uint size)
+    private StagingBufferAllocation AllocateStagingBuffer(uint size)
     {
+        if (size == 0)
+            throw new ArgumentOutOfRangeException(nameof(size));
+
         lock (_stagingLock)
         {
+            uint offset = AlignUp(_currentStagingInfo.CurrentUploadOffset, BufferCopyAlignment);
+            VkBuffer current = _currentStagingInfo.CurrentUploadBuffer;
+            if (current != null &&
+                offset <= current.SizeInBytes &&
+                size <= current.SizeInBytes - offset)
+            {
+                _currentStagingInfo.CurrentUploadOffset = checked(offset + size);
+                return new StagingBufferAllocation(current, offset);
+            }
+
+            uint requiredCapacity = Math.Max(
+                DefaultStagingUploadPageSize,
+                AlignUp(size, BufferCopyAlignment));
             VkBuffer ret = null;
             foreach (VkBuffer buffer in _availableStagingBuffers)
             {
-                if (buffer.SizeInBytes >= size)
+                if (buffer.SizeInBytes >= requiredCapacity)
                 {
                     ret = buffer;
                     _availableStagingBuffers.Remove(buffer);
@@ -1346,12 +1467,35 @@ internal unsafe class VkCommandList : CommandList
             }
             if (ret == null)
             {
-                ret = (VkBuffer)_gd.ResourceFactory.CreateBuffer(new BufferDescription(size, BufferUsage.Staging));
-                ret.Name = $"Staging Buffer (CommandList {_name})";
+                ret = (VkBuffer)_gd.ResourceFactory.CreateBuffer(
+                    new BufferDescription(requiredCapacity, BufferUsage.Staging));
+                ret.Name = $"Upload Page (CommandList {_name})";
             }
 
             _currentStagingInfo.BuffersUsed.Add(ret);
-            return ret;
+            _currentStagingInfo.CurrentUploadBuffer = ret;
+            _currentStagingInfo.CurrentUploadOffset = size;
+            return new StagingBufferAllocation(ret, 0u);
+        }
+    }
+
+    private static uint AlignUp(uint value, uint alignment)
+    {
+        uint remainder = value % alignment;
+        return remainder == 0u
+            ? value
+            : checked(value + alignment - remainder);
+    }
+
+    private readonly struct StagingBufferAllocation
+    {
+        public VkBuffer Buffer { get; }
+        public uint Offset { get; }
+
+        public StagingBufferAllocation(VkBuffer buffer, uint offset)
+        {
+            Buffer = buffer;
+            Offset = offset;
         }
     }
 
@@ -1415,32 +1559,80 @@ internal unsafe class VkCommandList : CommandList
             _destroyed = true;
             _gd.Vk.DestroyCommandPool(_gd.Device, _pool, null);
 
-            Debug.Assert(_submittedStagingInfos.Count == 0);
-
-            foreach (VkBuffer buffer in _availableStagingBuffers)
+            lock (_stagingLock)
             {
-                buffer.Dispose();
+                Debug.Assert(_submittedStagingInfos.Count == 0);
+
+                foreach (VkBuffer buffer in _availableStagingBuffers)
+                    buffer.Dispose();
+
+                if (_currentStagingInfo != null)
+                {
+                    foreach (VkBuffer buffer in _currentStagingInfo.BuffersUsed)
+                        buffer.Dispose();
+                }
             }
         }
     }
 
+    internal StagingResourcePoolSnapshot CaptureStagingResourcePoolSnapshot()
+    {
+        lock (_stagingLock)
+        {
+            int disposedBufferCount = 0;
+            foreach (VkBuffer buffer in _availableStagingBuffers)
+            {
+                if (buffer.IsDisposed)
+                    disposedBufferCount++;
+            }
+
+            return new StagingResourcePoolSnapshot(
+                _availableStagingBuffers.Count,
+                disposedBufferCount,
+                _currentStagingInfo?.BuffersUsed.Count ?? 0);
+        }
+    }
+
+    internal readonly record struct StagingResourcePoolSnapshot(
+        int AvailableBufferCount,
+        int DisposedAvailableBufferCount,
+        int CurrentBufferCount);
+
     private class StagingResourceInfo
     {
+        public uint Slot { get; }
         public List<VkBuffer> BuffersUsed { get; }
         public HashSet<ResourceRefCount> Resources { get; }
+        public HashSet<VkBuffer> Buffers { get; }
+        public List<VkBuffer> AcquiredBuffers { get; }
+        public VkBuffer CurrentUploadBuffer { get; set; }
+        public uint CurrentUploadOffset { get; set; }
+        public bool SubmissionReferencesAcquired { get; set; }
 
-        public StagingResourceInfo(int initialTrackedResourceCapacity)
+        public StagingResourceInfo(
+            int initialTrackedResourceCapacity,
+            uint slot)
         {
+            Slot = slot;
             BuffersUsed = new List<VkBuffer>(RetainedStagingBufferCapacity);
             Resources = new HashSet<ResourceRefCount>(
                 initialTrackedResourceCapacity,
                 ReferenceEqualityComparer.Instance);
+            Buffers = new HashSet<VkBuffer>(
+                initialTrackedResourceCapacity,
+                ReferenceEqualityComparer.Instance);
+            AcquiredBuffers = new List<VkBuffer>(initialTrackedResourceCapacity);
         }
 
         public void Clear()
         {
             BuffersUsed.Clear();
             Resources.Clear();
+            Buffers.Clear();
+            AcquiredBuffers.Clear();
+            CurrentUploadBuffer = null;
+            CurrentUploadOffset = 0u;
+            SubmissionReferencesAcquired = false;
         }
     }
 
@@ -1457,7 +1649,9 @@ internal unsafe class VkCommandList : CommandList
             return reclaimed;
 
         if (_maximumInFlightSubmissionCount == 0)
-            return new StagingResourceInfo(_initialTrackedResourceCapacityPerSubmission);
+            return new StagingResourceInfo(
+                _initialTrackedResourceCapacityPerSubmission,
+                0u);
 
         // All bounded records are in flight. Wait for this command list's
         // oldest submission rather than draining unrelated queues or growing
@@ -1486,6 +1680,9 @@ internal unsafe class VkCommandList : CommandList
 
     private void RecycleStagingInfo(StagingResourceInfo info)
     {
+        bool releaseCommandListReference =
+            ReleaseSubmissionResourceReferences(info);
+
         lock (_stagingLock)
         {
             foreach (VkBuffer buffer in info.BuffersUsed)
@@ -1493,14 +1690,12 @@ internal unsafe class VkCommandList : CommandList
                 _availableStagingBuffers.Add(buffer);
             }
 
-            foreach (ResourceRefCount rrc in info.Resources)
-            {
-                rrc.Decrement();
-            }
-
             info.Clear();
 
             _availableStagingInfos.Add(info);
         }
+
+        if (releaseCommandListReference)
+            RefCount.Decrement();
     }
 }

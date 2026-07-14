@@ -164,10 +164,9 @@ public class OffscreenApplication : SampleApplication
     {
         _dragonRotation.Y += deltaSeconds * 10f;
 
-        UpdateUniformBuffers();
-        UpdateUniformBufferOffscreen();
-
         _cl.Begin();
+        UpdateUniformBuffers(_cl);
+        UpdateUniformBufferOffscreen(_cl);
         DrawOffscreen();
         DrawMain();
         _cl.End();
@@ -214,7 +213,7 @@ public class OffscreenApplication : SampleApplication
         return degrees * (float)Math.PI / 180f;
     }
 
-    private void UpdateUniformBuffers()
+    private void UpdateUniformBuffers(CommandList commandList)
     {
         UniformInfo ui = new UniformInfo { LightPos = new Vector4(0, 0, 0, 1) };
 
@@ -226,14 +225,14 @@ public class OffscreenApplication : SampleApplication
         ui.Model = Matrix4x4.CreateRotationY(DegreesToRadians(_dragonRotation.Y)) * ui.Model;
         ui.Model = Matrix4x4.CreateTranslation(_dragonPos) * ui.Model;
 
-        GraphicsDevice.UpdateBuffer(_uniformBuffers_vsShared, 0, ref ui);
+        commandList.UpdateBuffer(_uniformBuffers_vsShared, 0, ref ui);
 
         // Mirror
         ui.Model = Matrix4x4.Identity;
-        GraphicsDevice.UpdateBuffer(_uniformBuffers_vsMirror, 0, ref ui);
+        commandList.UpdateBuffer(_uniformBuffers_vsMirror, 0, ref ui);
     }
 
-    private void UpdateUniformBufferOffscreen()
+    private void UpdateUniformBufferOffscreen(CommandList commandList)
     {
         UniformInfo ui = new UniformInfo { LightPos = new Vector4(0, 0, 0, 1) };
 
@@ -246,6 +245,6 @@ public class OffscreenApplication : SampleApplication
         ui.Model = Matrix4x4.CreateScale(new Vector3(1, -1, 1)) * ui.Model;
         ui.Model = Matrix4x4.CreateTranslation(_dragonPos) * ui.Model;
 
-        GraphicsDevice.UpdateBuffer(_uniformBuffers_vsOffScreen, 0, ref ui);
+        commandList.UpdateBuffer(_uniformBuffers_vsOffScreen, 0, ref ui);
     }
 }

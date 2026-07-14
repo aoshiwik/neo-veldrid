@@ -42,6 +42,114 @@ public class VulkanSubmissionLifecycleTests : GraphicsDeviceTestBase<VulkanDevic
         GD.Unmap(readback);
     }
 
+    [Theory]
+    [InlineData(1u)]
+    [InlineData(2u)]
+    [InlineData(8u)]
+    public void RecordingSubmissionSlotsPreserveDynamicUniformPayloads(
+        uint maximumInFlightCount)
+    {
+        DeviceBuffer[] frameBuffers = new DeviceBuffer[maximumInFlightCount];
+        ResourceSet[] frameSets = new ResourceSet[maximumInFlightCount];
+        DeviceBuffer shaderOutput = RF.CreateBuffer(new BufferDescription(
+            sizeof(uint),
+            BufferUsage.StructuredBufferReadWrite,
+            sizeof(uint)));
+
+        ResourceLayout layout = RF.CreateResourceLayout(
+            new ResourceLayoutDescription(
+                new ResourceLayoutElementDescription(
+                    "FrameValue",
+                    ResourceKind.UniformBuffer,
+                    ShaderStages.Compute),
+                new ResourceLayoutElementDescription(
+                    "Output",
+                    ResourceKind.StructuredBufferReadWrite,
+                    ShaderStages.Compute)));
+        Pipeline pipeline = RF.CreateComputePipeline(
+            new ComputePipelineDescription(
+                TestShaders.LoadCompute(RF, "DynamicUniformSlot"),
+                layout,
+                1,
+                1,
+                1));
+
+        for (int slot = 0; slot < frameBuffers.Length; slot++)
+        {
+            frameBuffers[slot] = RF.CreateBuffer(new BufferDescription(
+                16,
+                BufferUsage.UniformBuffer | BufferUsage.Dynamic));
+            frameSets[slot] = RF.CreateResourceSet(
+                new ResourceSetDescription(
+                    layout,
+                    frameBuffers[slot],
+                    shaderOutput));
+        }
+
+        int submissionCount = checked((int)maximumInFlightCount * 3);
+        DeviceBuffer[] captures = new DeviceBuffer[submissionCount];
+        for (int submissionIndex = 0;
+             submissionIndex < captures.Length;
+             submissionIndex++)
+        {
+            captures[submissionIndex] = RF.CreateBuffer(new BufferDescription(
+                sizeof(uint),
+                BufferUsage.Staging));
+        }
+
+        CommandList commandList = RF.CreateCommandList(
+            new CommandListDescription
+            {
+                MaximumInFlightSubmissionCount = maximumInFlightCount,
+                InitialTrackedResourceCapacityPerSubmission = 8
+            });
+        Assert.Equal(
+            maximumInFlightCount,
+            commandList.RecordingSubmissionSlotCount);
+        AssertRecordingSlotUnavailable(commandList);
+
+        for (int submissionIndex = 0;
+             submissionIndex < captures.Length;
+             submissionIndex++)
+        {
+            uint expected = ExpectedSlotValue(submissionIndex);
+
+            commandList.Begin();
+            uint slot = commandList.RecordingSubmissionSlot;
+            Assert.InRange(slot, 0u, maximumInFlightCount - 1u);
+
+            // Begin reserves this frame version until the resulting submission
+            // completes, so this direct write cannot race an earlier GPU use.
+            GD.UpdateBuffer(frameBuffers[slot], 0, expected);
+            commandList.SetPipeline(pipeline);
+            commandList.SetComputeResourceSet(0, frameSets[slot]);
+            commandList.Dispatch(1, 1, 1);
+            commandList.CopyBuffer(
+                shaderOutput,
+                0,
+                captures[submissionIndex],
+                0,
+                sizeof(uint));
+            commandList.End();
+            AssertRecordingSlotUnavailable(commandList);
+
+            GD.SubmitCommands(commandList);
+        }
+
+        GD.WaitForIdle();
+
+        for (int submissionIndex = 0;
+             submissionIndex < captures.Length;
+             submissionIndex++)
+        {
+            MappedResourceView<uint> mapped = GD.Map<uint>(
+                captures[submissionIndex],
+                MapMode.Read);
+            Assert.Equal(ExpectedSlotValue(submissionIndex), mapped[0]);
+            GD.Unmap(captures[submissionIndex]);
+        }
+    }
+
     [Fact]
     public void ConcurrentDeviceUpdatesRecycleSharedSubmissionResources()
     {
@@ -359,6 +467,17 @@ public class VulkanSubmissionLifecycleTests : GraphicsDeviceTestBase<VulkanDevic
 
     private static uint ExpectedValue(int workerIndex, uint update)
         => ((uint)workerIndex + 1u) * 100_000u + update;
+
+    private static uint ExpectedSlotValue(int submissionIndex)
+        => checked(10_000u + (uint)submissionIndex * 97u);
+
+    private static void AssertRecordingSlotUnavailable(CommandList commandList)
+    {
+        Assert.Throws<NeoVeldridException>(() =>
+        {
+            _ = commandList.RecordingSubmissionSlot;
+        });
+    }
 
     private sealed class BlockingSubmissionFenceWaitObserver
         : VkGraphicsDevice.ISubmissionFenceWaitObserver, IDisposable
