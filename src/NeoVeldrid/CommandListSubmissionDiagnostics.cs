@@ -39,7 +39,7 @@ internal readonly record struct CommandListBufferAccess(
 /// Allocation-free summary of the last command recording that reached a
 /// successful <see cref="GraphicsDevice.SubmitCommands(CommandList)"/> call.
 /// </summary>
-internal readonly record struct CommandListSubmissionMetrics(
+public readonly record struct CommandListSubmissionMetrics(
     long SubmissionSequence,
     int InstrumentedCommandCount,
     int DrawCallCount,
@@ -84,9 +84,9 @@ internal readonly record struct CommandListSubmissionMetrics(
 }
 
 /// <summary>
-/// Frozen, detailed evidence for one successful command-list submission.
+/// Immutable metrics for one successful command-list submission.
 /// </summary>
-internal sealed class CommandListSubmissionSnapshot
+public sealed class CommandListSubmissionSnapshot
 {
     private readonly CommandListBufferAccess[] _bufferAccesses;
     private readonly IReadOnlyList<CommandListBufferAccess> _bufferAccessesView;
@@ -102,7 +102,7 @@ internal sealed class CommandListSubmissionSnapshot
 
     public CommandListSubmissionMetrics Metrics { get; }
 
-    public IReadOnlyList<CommandListBufferAccess> BufferAccesses =>
+    internal IReadOnlyList<CommandListBufferAccess> BufferAccesses =>
         _bufferAccessesView;
 }
 
@@ -178,10 +178,16 @@ internal sealed class CommandListSubmissionDiagnostics
 
     /// <summary>
     /// Copies the latest submitted recording so it remains stable while the
-    /// command list is reused for later frames.
+    /// command list is reused for later frames. Returns null until a recording
+    /// reaches a successful submission.
     /// </summary>
     public CommandListSubmissionSnapshot CaptureLastSubmission()
     {
+        if (_lastSubmittedMetrics.SubmissionSequence == 0)
+        {
+            return null;
+        }
+
         var accesses = _submittedBufferAccesses.Count == 0
             ? Array.Empty<CommandListBufferAccess>()
             : _submittedBufferAccesses.ToArray();

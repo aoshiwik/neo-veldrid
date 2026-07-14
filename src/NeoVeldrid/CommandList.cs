@@ -157,10 +157,10 @@ public abstract class CommandList : DeviceResource, IDisposable
     /// <param name="initialBufferAccessCapacity">
     /// Initial capacity for each reusable buffer-access store.
     /// </param>
-    internal CommandListSubmissionDiagnostics EnableSubmissionDiagnostics(
+    public void EnableSubmissionDiagnostics(
         int initialBufferAccessCapacity = 64)
     {
-        return _submissionDiagnostics ??= new CommandListSubmissionDiagnostics(
+        _submissionDiagnostics ??= new CommandListSubmissionDiagnostics(
             initialBufferAccessCapacity);
     }
 
@@ -168,12 +168,20 @@ public abstract class CommandList : DeviceResource, IDisposable
     /// Stops collecting diagnostics for future recordings.
     /// Existing snapshots remain independent and valid.
     /// </summary>
-    internal void DisableSubmissionDiagnostics()
+    public void DisableSubmissionDiagnostics()
     {
         _submissionDiagnostics = null;
     }
 
-    internal bool SubmissionDiagnosticsEnabled => _submissionDiagnostics is not null;
+    public bool SubmissionDiagnosticsEnabled => _submissionDiagnostics is not null;
+
+    /// <summary>
+    /// Freezes the latest command recording that reached a successful graphics-device
+    /// submission. Returns null when diagnostics are disabled or no diagnosed
+    /// submission has completed.
+    /// </summary>
+    public CommandListSubmissionSnapshot CaptureLastSubmissionDiagnostics() =>
+        _submissionDiagnostics?.CaptureLastSubmission();
 
     internal CommandListSubmissionDiagnostics SubmissionDiagnostics =>
         _submissionDiagnostics;

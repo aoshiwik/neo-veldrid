@@ -5,6 +5,53 @@ namespace NeoVeldrid.Tests;
 public sealed class CommandListSubmissionDiagnosticsTests
 {
     [Fact]
+    public void CaptureReturnsNullUntilSubmissionSucceeds()
+    {
+        var diagnostics = new CommandListSubmissionDiagnostics(
+            initialBufferAccessCapacity: 1);
+
+        Assert.Null(diagnostics.CaptureLastSubmission());
+
+        diagnostics.BeginRecording();
+        diagnostics.RecordDraw(3, 1, 0, 0);
+        diagnostics.EndRecording();
+
+        Assert.Null(diagnostics.CaptureLastSubmission());
+
+        diagnostics.CompleteSuccessfulSubmission();
+
+        Assert.NotNull(diagnostics.CaptureLastSubmission());
+    }
+
+    [Fact]
+    public void PublicFacadeExposesSnapshotsWithoutPublishingMutableRecorderState()
+    {
+        Assert.True(typeof(CommandListSubmissionMetrics).IsPublic);
+        Assert.True(typeof(CommandListSubmissionSnapshot).IsPublic);
+        Assert.False(typeof(CommandListSubmissionDiagnostics).IsPublic);
+        Assert.False(typeof(CommandListBufferAccess).IsPublic);
+        Assert.False(typeof(CommandListBufferAccessKind).IsPublic);
+
+        var enable = typeof(CommandList).GetMethod(
+            nameof(CommandList.EnableSubmissionDiagnostics));
+        var disable = typeof(CommandList).GetMethod(
+            nameof(CommandList.DisableSubmissionDiagnostics));
+        var enabled = typeof(CommandList).GetProperty(
+            nameof(CommandList.SubmissionDiagnosticsEnabled));
+        var capture = typeof(CommandList).GetMethod(
+            nameof(CommandList.CaptureLastSubmissionDiagnostics));
+
+        Assert.NotNull(enable);
+        Assert.Equal(typeof(void), enable.ReturnType);
+        Assert.NotNull(disable);
+        Assert.NotNull(enabled);
+        Assert.Equal(typeof(bool), enabled.PropertyType);
+        Assert.NotNull(capture);
+        Assert.Equal(typeof(CommandListSubmissionSnapshot), capture.ReturnType);
+        Assert.Null(typeof(CommandList).GetProperty("SubmissionDiagnostics"));
+    }
+
+    [Fact]
     public void SuccessfulSubmissionPublishesExactCommandAndBufferRangeEvidence()
     {
         var diagnostics = new CommandListSubmissionDiagnostics(
