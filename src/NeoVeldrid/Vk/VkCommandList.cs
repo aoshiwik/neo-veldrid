@@ -706,6 +706,11 @@ internal unsafe class VkCommandList : CommandList
             }
         }
 
+        if (haveAnyAttachments && !_newFramebuffer)
+        {
+            SynchronizeFramebufferContinuation();
+        }
+
         RenderPassBeginInfo renderPassBI = new RenderPassBeginInfo
         {
             SType = StructureType.RenderPassBeginInfo,
@@ -773,16 +778,36 @@ internal unsafe class VkCommandList : CommandList
         _gd.Vk.CmdEndRenderPass(_cb);
         _currentFramebuffer.TransitionToIntermediateLayout(_cb);
         _activeRenderPass = default;
+    }
 
-        // Place a barrier between RenderPasses, so that color / depth outputs
-        // can be read in subsequent passes.
+    private void SynchronizeFramebufferContinuation()
+    {
+        // A transfer or compute command can suspend the current render pass.
+        // Make its attachment stores available and visible before the load
+        // pass resumes the same framebuffer.
+        MemoryBarrier attachmentStoreBarrier = new MemoryBarrier
+        {
+            SType = StructureType.MemoryBarrier,
+            SrcAccessMask =
+                AccessFlags.ColorAttachmentWriteBit
+                | AccessFlags.DepthStencilAttachmentWriteBit,
+            DstAccessMask =
+                AccessFlags.ColorAttachmentReadBit
+                | AccessFlags.ColorAttachmentWriteBit
+                | AccessFlags.DepthStencilAttachmentReadBit
+                | AccessFlags.DepthStencilAttachmentWriteBit
+        };
+        const PipelineStageFlags attachmentStages =
+            PipelineStageFlags.ColorAttachmentOutputBit
+            | PipelineStageFlags.EarlyFragmentTestsBit
+            | PipelineStageFlags.LateFragmentTestsBit;
         _gd.Vk.CmdPipelineBarrier(
             _cb,
-            PipelineStageFlags.BottomOfPipeBit,
-            PipelineStageFlags.TopOfPipeBit,
+            attachmentStages,
+            attachmentStages,
             0,
-            0,
-            null,
+            1,
+            &attachmentStoreBarrier,
             0,
             null,
             0,

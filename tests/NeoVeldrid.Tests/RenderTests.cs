@@ -791,6 +791,121 @@ public abstract class RenderTests<T> : GraphicsDeviceTestBase<T> where T : Graph
         GD.Unmap(readback);
     }
 
+    [Fact]
+    public void InPassBufferUpdatePreservesEarlierAttachmentWrites()
+    {
+        const uint width = 32;
+        const uint height = 16;
+
+        using Texture output = RF.CreateTexture(TextureDescription.Texture2D(
+            width,
+            height,
+            1,
+            1,
+            PixelFormat.R32_G32_B32_A32_Float,
+            TextureUsage.RenderTarget));
+        using Framebuffer framebuffer =
+            RF.CreateFramebuffer(new FramebufferDescription(null, output));
+
+        float yMod = GD.IsClipSpaceYInverted ? -1.0f : 1.0f;
+        ColoredVertex[] leftVertices =
+        {
+            new() { Position = new Vector2(-1, 1 * yMod), Color = Vector4.UnitX },
+            new() { Position = new Vector2(0, 1 * yMod), Color = Vector4.UnitX },
+            new() { Position = new Vector2(-1, -1 * yMod), Color = Vector4.UnitX },
+            new() { Position = new Vector2(0, -1 * yMod), Color = Vector4.UnitX }
+        };
+        ColoredVertex[] rightVertices =
+        {
+            new() { Position = new Vector2(0, 1 * yMod), Color = Vector4.UnitY },
+            new() { Position = new Vector2(1, 1 * yMod), Color = Vector4.UnitY },
+            new() { Position = new Vector2(0, -1 * yMod), Color = Vector4.UnitY },
+            new() { Position = new Vector2(1, -1 * yMod), Color = Vector4.UnitY }
+        };
+
+        uint vertexSize = (uint)Unsafe.SizeOf<ColoredVertex>();
+        using DeviceBuffer leftVerticesBuffer = RF.CreateBuffer(new BufferDescription(
+            vertexSize * (uint)leftVertices.Length,
+            BufferUsage.StructuredBufferReadOnly,
+            vertexSize));
+        using DeviceBuffer rightVerticesBuffer = RF.CreateBuffer(new BufferDescription(
+            vertexSize * (uint)rightVertices.Length,
+            BufferUsage.StructuredBufferReadOnly,
+            vertexSize));
+        GD.UpdateBuffer(leftVerticesBuffer, 0, leftVertices);
+        GD.UpdateBuffer(rightVerticesBuffer, 0, rightVertices);
+
+        using ResourceLayout graphicsLayout = RF.CreateResourceLayout(
+            new ResourceLayoutDescription(
+                new ResourceLayoutElementDescription(
+                    "InputVertices",
+                    ResourceKind.StructuredBufferReadOnly,
+                    ShaderStages.Vertex)));
+        using ResourceSet leftGraphicsSet =
+            RF.CreateResourceSet(new ResourceSetDescription(graphicsLayout, leftVerticesBuffer));
+        using ResourceSet rightGraphicsSet =
+            RF.CreateResourceSet(new ResourceSetDescription(graphicsLayout, rightVerticesBuffer));
+        using Pipeline pipeline = RF.CreateGraphicsPipeline(
+            new GraphicsPipelineDescription(
+                BlendStateDescription.SingleOverrideBlend,
+                DepthStencilStateDescription.Disabled,
+                RasterizerStateDescription.Default,
+                PrimitiveTopology.TriangleStrip,
+                new ShaderSetDescription(
+                    Array.Empty<VertexLayoutDescription>(),
+                    TestShaders.LoadVertexFragment(RF, "ColoredQuadRenderer")),
+                graphicsLayout,
+                framebuffer.OutputDescription));
+
+        using DeviceBuffer uploadTarget = RF.CreateBuffer(
+            new BufferDescription(sizeof(uint), BufferUsage.VertexBuffer));
+        using CommandList commandList = RF.CreateCommandList();
+
+        commandList.Begin();
+        commandList.SetFramebuffer(framebuffer);
+        commandList.ClearColorTarget(0, RgbaFloat.Black);
+        commandList.SetPipeline(pipeline);
+        commandList.SetGraphicsResourceSet(0, leftGraphicsSet);
+
+        // Vulkan buffer uploads are transfer commands, so this deliberately
+        // suspends and resumes the render pass repeatedly before drawing the
+        // second half. Multiple continuations make lost store/load visibility
+        // deterministic on drivers which tolerate a single missing dependency.
+        for (uint continuationIndex = 0; continuationIndex < 16; continuationIndex++)
+        {
+            commandList.Draw(4);
+            commandList.UpdateBuffer(
+                uploadTarget,
+                0,
+                0xA5A50000u + continuationIndex);
+        }
+
+        commandList.SetGraphicsResourceSet(0, rightGraphicsSet);
+        commandList.Draw(4);
+        commandList.End();
+        GD.SubmitCommands(commandList);
+        GD.WaitForIdle();
+
+        using Texture readback = GetReadback(output);
+        MappedResourceView<RgbaFloat> readView =
+            GD.Map<RgbaFloat>(readback, MapMode.Read);
+        try
+        {
+            Assert.Equal(
+                new RgbaFloat(1, 0, 0, 0),
+                readView[width / 4, height / 2],
+                RgbaFloatFuzzyComparer.Instance);
+            Assert.Equal(
+                new RgbaFloat(0, 1, 0, 0),
+                readView[width * 3 / 4, height / 2],
+                RgbaFloatFuzzyComparer.Instance);
+        }
+        finally
+        {
+            GD.Unmap(readback);
+        }
+    }
+
     [SkippableFact]
     public void ComputeGeneratedTexture()
     {
