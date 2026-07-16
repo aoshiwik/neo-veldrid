@@ -132,7 +132,11 @@ public abstract class GraphicsDevice : IDisposable
     /// </summary>
     /// <param name="commandList">The completed <see cref="CommandList"/> to execute. <see cref="CommandList.End"/> must have
     /// been previously called on this object.</param>
-    public void SubmitCommands(CommandList commandList) => SubmitCommandsCore(commandList, null);
+    public void SubmitCommands(CommandList commandList)
+    {
+        SubmitCommandsCore(commandList, null);
+        commandList.CompleteSuccessfulSubmissionDiagnostics();
+    }
 
     /// <summary>
     /// Submits the given <see cref="CommandList"/> for execution by this device.
@@ -144,7 +148,11 @@ public abstract class GraphicsDevice : IDisposable
     /// been previously called on this object.</param>
     /// <param name="fence">A <see cref="Fence"/> which will become signaled after this submission fully completes
     /// execution.</param>
-    public void SubmitCommands(CommandList commandList, Fence fence) => SubmitCommandsCore(commandList, fence);
+    public void SubmitCommands(CommandList commandList, Fence fence)
+    {
+        SubmitCommandsCore(commandList, fence);
+        commandList.CompleteSuccessfulSubmissionDiagnostics();
+    }
 
     private protected abstract void SubmitCommandsCore(
         CommandList commandList,

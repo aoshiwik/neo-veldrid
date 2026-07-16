@@ -11,8 +11,8 @@ public abstract class ResourceSet : DeviceResource, IDisposable
 {
     internal ResourceSet(ref ResourceSetDescription description)
     {
-#if VALIDATE_USAGE
         Layout = description.Layout;
+#if VALIDATE_USAGE
         Resources = description.BoundResources;
 #endif
     }
@@ -33,8 +33,8 @@ public abstract class ResourceSet : DeviceResource, IDisposable
     /// </summary>
     public abstract void Dispose();
 
-#if VALIDATE_USAGE
     internal ResourceLayout Layout { get; }
+#if VALIDATE_USAGE
     internal BindableResource[] Resources { get; }
 #endif
 }

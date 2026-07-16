@@ -179,7 +179,10 @@ public unsafe class AnimatedMesh : SampleApplication
             _indexCount * 4, BufferUsage.IndexBuffer));
         GraphicsDevice.UpdateBuffer(_indexBuffer, 0, indices.ToArray());
 
-        _cl = factory.CreateCommandList();
+        _cl = factory.CreateCommandList(new CommandListDescription
+        {
+            MaximumInFlightSubmissionCount = 2,
+        });
         _camera.Position = new Vector3(110, -87, -532);
         _camera.Yaw = 0.45f;
         _camera.Pitch = -0.55f;
@@ -190,8 +193,8 @@ public unsafe class AnimatedMesh : SampleApplication
     protected override void Draw(float deltaSeconds)
     {
         UpdateAnimation(deltaSeconds);
-        UpdateUniforms();
         _cl.Begin();
+        UploadFrameResources(_cl);
         _cl.SetFramebuffer(GraphicsDevice.SwapchainFramebuffer);
         _cl.ClearColorTarget(0, RgbaFloat.Black);
         _cl.ClearDepthStencil(1f);
@@ -223,7 +226,6 @@ public unsafe class AnimatedMesh : SampleApplication
             _boneAnimInfo.BonesTransformations[i] = _boneTransformations[i];
         }
 
-        GraphicsDevice.UpdateBuffer(_bonesBuffer, 0, _boneAnimInfo.GetBlittable());
     }
 
     private void UpdateChannel(double time, Node* node, Matrix4x4 parentTransform)
@@ -387,10 +389,20 @@ public unsafe class AnimatedMesh : SampleApplication
         }
     }
 
-    private void UpdateUniforms()
+    private void UploadFrameResources(CommandList commandList)
     {
-        GraphicsDevice.UpdateBuffer(_projectionBuffer, 0, _camera.ProjectionMatrix);
-        GraphicsDevice.UpdateBuffer(_viewBuffer, 0, _camera.ViewMatrix);
+        commandList.UpdateBuffer(
+            _bonesBuffer,
+            0,
+            _boneAnimInfo.GetBlittable());
+        commandList.UpdateBuffer(
+            _projectionBuffer,
+            0,
+            _camera.ProjectionMatrix);
+        commandList.UpdateBuffer(
+            _viewBuffer,
+            0,
+            _camera.ViewMatrix);
     }
 
     private const string VertexCode = @"

@@ -4,7 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    # Validate main-targeted changes and stacked Codex review branches.
+    branches: [main, 'codex/**']
 
 jobs:
   build-and-test:

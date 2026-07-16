@@ -131,7 +131,7 @@ internal unsafe class D3D11CommandList : CommandList
 
     public override bool IsDisposed => _disposed;
 
-    public override void Begin()
+    private protected override void BeginCore()
     {
         if (_commandList.Handle != null)
         {
@@ -216,7 +216,7 @@ internal unsafe class D3D11CommandList : CommandList
         Util.ClearArray(boundSets);
     }
 
-    public override void End()
+    private protected override void EndCore()
     {
         if (_commandList.Handle != null)
         {
@@ -687,7 +687,10 @@ internal unsafe class D3D11CommandList : CommandList
         }
     }
 
-    public override void Dispatch(uint groupCountX, uint groupCountY, uint groupCountZ)
+    private protected override void DispatchCore(
+        uint groupCountX,
+        uint groupCountY,
+        uint groupCountZ)
     {
         PreDispatchCommand();
 
@@ -776,14 +779,21 @@ internal unsafe class D3D11CommandList : CommandList
         }
     }
 
-    public override void SetScissorRect(uint index, uint x, uint y, uint width, uint height)
+    private protected override void SetScissorRectCore(
+        uint index,
+        uint x,
+        uint y,
+        uint width,
+        uint height)
     {
         _scissorRectsChanged = true;
         Util.EnsureArrayMinimumSize(ref _scissors, index + 1);
         _scissors[index] = new RawRect((int)x, (int)y, (int)(x + width), (int)(y + height));
     }
 
-    public override void SetViewport(uint index, ref Viewport viewport)
+    private protected override void SetViewportCore(
+        uint index,
+        ref Viewport viewport)
     {
         _viewportsChanged = true;
         Util.EnsureArrayMinimumSize(ref _viewports, index + 1);

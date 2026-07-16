@@ -612,7 +612,10 @@ public class Scene
             r.CreateDeviceObjects(gd, cl, sc);
         }
 
-        _resourceUpdateCL = gd.ResourceFactory.CreateCommandList();
+        _resourceUpdateCL = gd.ResourceFactory.CreateCommandList(new CommandListDescription
+        {
+            MaximumInFlightSubmissionCount = 2,
+        });
         _resourceUpdateCL.Name = "Scene Resource Update Command List";
     }
 

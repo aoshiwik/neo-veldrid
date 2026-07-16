@@ -1,5 +1,6 @@
 #if TEST_VULKAN
 using System;
+using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
@@ -40,6 +41,243 @@ public class VulkanSubmissionLifecycleTests : GraphicsDeviceTestBase<VulkanDevic
         MappedResourceView<uint> mapped = GD.Map<uint>(readback, MapMode.Read);
         Assert.Equal(submissionCount, mapped[0]);
         GD.Unmap(readback);
+    }
+
+    [Theory]
+    [InlineData(1u)]
+    [InlineData(2u)]
+    [InlineData(8u)]
+    public void RecordingSubmissionSlotsPreserveDynamicUniformPayloads(
+        uint maximumInFlightCount)
+    {
+        VkGraphicsDevice graphicsDevice = Assert.IsType<VkGraphicsDevice>(GD);
+        const int uniformSliceCount = 48;
+        uint uniformPayloadSize = checked((uint)Unsafe.SizeOf<DynamicUniformPayload>());
+        uint uniformAlignment = Math.Max(1u, GD.UniformBufferMinOffsetAlignment);
+        uint uniformStride = AlignUp(uniformPayloadSize, uniformAlignment);
+        uint uniformBufferSize = checked(uniformStride * uniformSliceCount);
+
+        DeviceBuffer[] frameBuffers = new DeviceBuffer[maximumInFlightCount];
+        ResourceSet[] frameSets = new ResourceSet[maximumInFlightCount];
+        DeviceBuffer shaderOutput = RF.CreateBuffer(new BufferDescription(
+            sizeof(uint),
+            BufferUsage.StructuredBufferReadWrite,
+            sizeof(uint)));
+
+        ResourceLayout layout = RF.CreateResourceLayout(
+            new ResourceLayoutDescription(
+                new ResourceLayoutElementDescription(
+                    "FrameValue",
+                    ResourceKind.UniformBuffer,
+                    ShaderStages.Compute,
+                    ResourceLayoutElementOptions.DynamicBinding),
+                new ResourceLayoutElementDescription(
+                    "Output",
+                    ResourceKind.StructuredBufferReadWrite,
+                    ShaderStages.Compute)));
+        Pipeline pipeline = RF.CreateComputePipeline(
+            new ComputePipelineDescription(
+                TestShaders.LoadCompute(RF, "DynamicUniformSlot"),
+                layout,
+                1,
+                1,
+                1));
+
+        for (int slot = 0; slot < frameBuffers.Length; slot++)
+        {
+            frameBuffers[slot] = RF.CreateBuffer(new BufferDescription(
+                uniformBufferSize,
+                BufferUsage.UniformBuffer | BufferUsage.Dynamic));
+            frameSets[slot] = RF.CreateResourceSet(
+                new ResourceSetDescription(
+                    layout,
+                    new DeviceBufferRange(
+                        frameBuffers[slot],
+                        0,
+                        uniformPayloadSize),
+                    shaderOutput));
+        }
+
+        int submissionCount = checked((int)maximumInFlightCount * 3);
+        DeviceBuffer[] captures = new DeviceBuffer[submissionCount];
+        for (int submissionIndex = 0;
+             submissionIndex < captures.Length;
+             submissionIndex++)
+        {
+            captures[submissionIndex] = RF.CreateBuffer(new BufferDescription(
+                checked((uint)(uniformSliceCount * sizeof(uint))),
+                BufferUsage.Staging));
+        }
+
+        CommandList commandList = RF.CreateCommandList(
+            new CommandListDescription
+            {
+                MaximumInFlightSubmissionCount = maximumInFlightCount,
+                InitialTrackedResourceCapacityPerSubmission = 8
+            });
+        Assert.Equal(
+            maximumInFlightCount,
+            commandList.RecordingSubmissionSlotCount);
+        AssertRecordingSlotUnavailable(commandList);
+        GD.WaitForIdle();
+        using var reclamationGate =
+            new VulkanAutomaticSubmissionReclamationGate(graphicsDevice);
+        var retainedSlots = new HashSet<uint>();
+        uint oldestRetainedSlot = uint.MaxValue;
+        uint? alreadyBegunSubmissionSlot = null;
+
+        for (int submissionIndex = 0;
+             submissionIndex < captures.Length;
+             submissionIndex++)
+        {
+            uint slot;
+            if (alreadyBegunSubmissionSlot.HasValue)
+            {
+                slot = alreadyBegunSubmissionSlot.GetValueOrDefault();
+                alreadyBegunSubmissionSlot = null;
+            }
+            else
+            {
+                commandList.Begin();
+                slot = commandList.RecordingSubmissionSlot;
+            }
+
+            Assert.InRange(slot, 0u, maximumInFlightCount - 1u);
+            if (submissionIndex < maximumInFlightCount)
+            {
+                Assert.True(
+                    retainedSlots.Add(slot),
+                    $"Submission slot {slot} was reused before automatic reclamation was released.");
+                if (submissionIndex == 0)
+                    oldestRetainedSlot = slot;
+            }
+
+            // Begin reserves this frame version until the resulting submission
+            // completes. Exercise the same aligned, per-draw dynamic slices
+            // used by Domain instead of merely binding one whole uniform buffer.
+            commandList.SetPipeline(pipeline);
+            for (int sliceIndex = 0;
+                 sliceIndex < uniformSliceCount;
+                 sliceIndex++)
+            {
+                uint dynamicOffset = checked((uint)sliceIndex * uniformStride);
+                var payload = new DynamicUniformPayload(
+                    ExpectedSlotValue(submissionIndex, sliceIndex));
+                GD.UpdateBuffer(
+                    frameBuffers[slot],
+                    dynamicOffset,
+                    payload);
+                commandList.SetComputeResourceSet(
+                    0,
+                    frameSets[slot],
+                    1,
+                    ref dynamicOffset);
+                commandList.Dispatch(1, 1, 1);
+                commandList.CopyBuffer(
+                    shaderOutput,
+                    0,
+                    captures[submissionIndex],
+                    checked((uint)(sliceIndex * sizeof(uint))),
+                    sizeof(uint));
+            }
+            commandList.End();
+            AssertRecordingSlotUnavailable(commandList);
+
+            GD.SubmitCommands(commandList);
+            if (submissionIndex == maximumInFlightCount - 1)
+            {
+                Assert.Equal(
+                    checked((int)maximumInFlightCount),
+                    retainedSlots.Count);
+                Assert.Equal(
+                    checked((int)maximumInFlightCount),
+                    graphicsDevice
+                        .CaptureSubmissionResourcePoolSnapshot()
+                        .TrackedSubmissionCount);
+
+                VulkanSubmissionWraparoundObservation wraparound =
+                    VulkanSubmissionWraparoundProbe.BeginAfterCapacityReached(
+                        graphicsDevice,
+                        commandList,
+                        reclamationGate);
+                Assert.True(
+                    wraparound.WaitWasObserved,
+                    "The capacity-plus-one Begin did not enter the bounded fence-wait path.");
+                Assert.False(
+                    wraparound.BeginCompletedWhilePaused,
+                    "The capacity-plus-one Begin reused retained submission state before completion.");
+                Assert.Equal(
+                    checked((int)maximumInFlightCount),
+                    wraparound.TrackedSubmissionCountWhilePaused);
+                Assert.Equal(
+                    oldestRetainedSlot,
+                    wraparound.RecordingSubmissionSlot);
+                alreadyBegunSubmissionSlot =
+                    wraparound.RecordingSubmissionSlot;
+            }
+        }
+
+        GD.WaitForIdle();
+
+        for (int submissionIndex = 0;
+             submissionIndex < captures.Length;
+             submissionIndex++)
+        {
+            MappedResourceView<uint> mapped = GD.Map<uint>(
+                captures[submissionIndex],
+                MapMode.Read);
+            try
+            {
+                for (int sliceIndex = 0;
+                     sliceIndex < uniformSliceCount;
+                     sliceIndex++)
+                {
+                    Assert.Equal(
+                        ExpectedSlotValue(submissionIndex, sliceIndex),
+                        mapped[checked((uint)sliceIndex)]);
+                }
+            }
+            finally
+            {
+                GD.Unmap(captures[submissionIndex]);
+            }
+        }
+    }
+
+    [Fact]
+    public void WaitForIdleReleasesOwnershipWhileAutomaticReclamationIsPaused()
+    {
+        VkGraphicsDevice graphicsDevice = Assert.IsType<VkGraphicsDevice>(GD);
+        DeviceBuffer buffer = RF.CreateBuffer(new BufferDescription(
+            sizeof(uint),
+            BufferUsage.VertexBuffer));
+        CommandList commandList = RF.CreateCommandList(
+            new CommandListDescription
+            {
+                MaximumInFlightSubmissionCount = 1,
+                InitialTrackedResourceCapacityPerSubmission = 2
+            });
+
+        GD.WaitForIdle();
+        using var reclamationGate =
+            new VulkanAutomaticSubmissionReclamationGate(graphicsDevice);
+        commandList.Begin();
+        commandList.UpdateBuffer(buffer, 0, 42u);
+        commandList.End();
+        GD.SubmitCommands(commandList);
+        Assert.Equal(
+            1,
+            graphicsDevice
+                .CaptureSubmissionResourcePoolSnapshot()
+                .TrackedSubmissionCount);
+
+        GD.WaitForIdle();
+
+        Assert.Equal(
+            0,
+            graphicsDevice
+                .CaptureSubmissionResourcePoolSnapshot()
+                .TrackedSubmissionCount);
     }
 
     [Fact]
@@ -159,7 +397,7 @@ public class VulkanSubmissionLifecycleTests : GraphicsDeviceTestBase<VulkanDevic
 
         VkGraphicsDevice vkGraphicsDevice = Assert.IsType<VkGraphicsDevice>(GD);
         VkCommandList firstCommandList = Assert.IsType<VkCommandList>(commandLists[0]);
-        using BlockingSubmissionFenceWaitObserver observer = new BlockingSubmissionFenceWaitObserver();
+        using var observer = new VulkanBlockingSubmissionFenceWaitObserver();
         vkGraphicsDevice.SubmissionFenceWaitObserver = observer;
 
         Task waitTask = Task.CompletedTask;
@@ -360,30 +598,43 @@ public class VulkanSubmissionLifecycleTests : GraphicsDeviceTestBase<VulkanDevic
     private static uint ExpectedValue(int workerIndex, uint update)
         => ((uint)workerIndex + 1u) * 100_000u + update;
 
-    private sealed class BlockingSubmissionFenceWaitObserver
-        : VkGraphicsDevice.ISubmissionFenceWaitObserver, IDisposable
+    private static uint ExpectedSlotValue(int submissionIndex, int sliceIndex)
+        => checked(
+            10_000u +
+            (uint)submissionIndex * 10_007u +
+            (uint)sliceIndex * 97u);
+
+    private static uint AlignUp(uint value, uint alignment)
     {
-        private readonly ManualResetEventSlim _entered = new ManualResetEventSlim(false);
-        private readonly ManualResetEventSlim _release = new ManualResetEventSlim(false);
+        uint remainder = value % alignment;
+        return remainder == 0u
+            ? value
+            : checked(value + alignment - remainder);
+    }
 
-        public void BeforeWait()
+    private readonly struct DynamicUniformPayload
+    {
+        public readonly uint Value;
+        public readonly uint Padding0;
+        public readonly uint Padding1;
+        public readonly uint Padding2;
+
+        public DynamicUniformPayload(uint value)
         {
-            _entered.Set();
-            _release.Wait();
-        }
-
-        public bool WaitUntilEntered(TimeSpan timeout)
-            => _entered.Wait(timeout);
-
-        public void Release()
-            => _release.Set();
-
-        public void Dispose()
-        {
-            _release.Set();
-            _entered.Dispose();
-            _release.Dispose();
+            Value = value;
+            Padding0 = 0;
+            Padding1 = 0;
+            Padding2 = 0;
         }
     }
+
+    private static void AssertRecordingSlotUnavailable(CommandList commandList)
+    {
+        Assert.Throws<NeoVeldridException>(() =>
+        {
+            _ = commandList.RecordingSubmissionSlot;
+        });
+    }
+
 }
 #endif

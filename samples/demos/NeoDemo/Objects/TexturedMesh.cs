@@ -317,7 +317,7 @@ public class TexturedMesh : CullRenderable
         WorldAndInverse wai;
         wai.World = _transform.GetTransformMatrix();
         wai.InverseWorld = VdUtilities.CalculateInverseTranspose(ref wai.World);
-        gd.UpdateBuffer(_worldAndInverseBuffer, _uniformOffset * 2, ref wai);
+        cl.UpdateBuffer(_worldAndInverseBuffer, _uniformOffset * 2, ref wai);
     }
 
     private void RenderShadowMap(CommandList cl, SceneContext sc, int shadowMapIndex)

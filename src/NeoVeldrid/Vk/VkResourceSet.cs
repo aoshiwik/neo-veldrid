@@ -10,6 +10,7 @@ internal unsafe class VkResourceSet : ResourceSet
     private readonly DescriptorResourceCounts _descriptorCounts;
     private readonly DescriptorAllocationToken _descriptorAllocationToken;
     private readonly List<ResourceRefCount> _refCounts = new List<ResourceRefCount>();
+    private readonly List<VkBuffer> _buffers = new List<VkBuffer>();
     private bool _destroyed;
     private string _name;
 
@@ -22,6 +23,7 @@ internal unsafe class VkResourceSet : ResourceSet
 
     public ResourceRefCount RefCount { get; }
     public List<ResourceRefCount> RefCounts => _refCounts;
+    public List<VkBuffer> Buffers => _buffers;
 
     public override bool IsDisposed => _destroyed;
 
@@ -62,6 +64,7 @@ internal unsafe class VkResourceSet : ResourceSet
                 bufferInfos[i].Range = range.SizeInBytes;
                 descriptorWrites[i].PBufferInfo = &bufferInfos[i];
                 _refCounts.Add(rangedVkBuffer.RefCount);
+                _buffers.Add(rangedVkBuffer);
             }
             else if (type == DescriptorType.SampledImage)
             {

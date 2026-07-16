@@ -19,9 +19,27 @@ namespace NeoVeldrid.Vk;
 
 internal unsafe class VkGraphicsDevice : GraphicsDevice
 {
+    internal enum SubmissionCheckpoint
+    {
+        BeforeCompletionFenceAcquisition,
+        BeforePrimaryQueueSubmit,
+        BeforeAuxiliaryCompletionSubmit,
+        BeforeCompletionTracking
+    }
+
+    internal interface ISubmissionCheckpointObserver
+    {
+        void OnCheckpoint(SubmissionCheckpoint checkpoint);
+    }
+
     internal interface ISubmissionFenceWaitObserver
     {
         void BeforeWait();
+    }
+
+    internal interface IAutomaticSubmissionReclamationGate
+    {
+        bool IsReclamationAllowed { get; }
     }
 
     private const uint VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR = 0x00000001;
@@ -131,7 +149,11 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
     private readonly ConcurrentQueue<VkFenceHandle> _availableSubmissionFences = new ConcurrentQueue<VkFenceHandle>();
     private readonly List<FenceSubmissionInfo> _submittedFences =
         new List<FenceSubmissionInfo>(SharedCommandPoolCount * 2);
+    private readonly List<UnresolvedSubmissionCompletion> _unresolvedSubmissionCompletions =
+        new List<UnresolvedSubmissionCompletion>();
+    internal ISubmissionCheckpointObserver SubmissionCheckpointObserver { get; set; }
     internal ISubmissionFenceWaitObserver SubmissionFenceWaitObserver { get; set; }
+    internal IAutomaticSubmissionReclamationGate AutomaticSubmissionReclamationGate { get; set; }
     private readonly VkSwapchain _mainSwapchain;
 
     private readonly List<FixedUtf8String> _surfaceExtensions = new List<FixedUtf8String>();
@@ -220,7 +242,6 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
         VkCommandList vkCL = Util.AssertSubtype<CommandList, VkCommandList>(cl);
         CommandBuffer vkCB = vkCL.CommandBuffer;
 
-        vkCL.CommandBufferSubmitted(vkCB);
         SubmitCommandBuffer(vkCL, vkCB, waitSemaphoreCount, waitSemaphoresPtr, signalSemaphoreCount, signalSemaphoresPtr, fence);
     }
 
@@ -234,9 +255,23 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
         Fence fence,
         SharedCommandPool sharedCommandPool = null,
         VkTexture stagingTexture = null,
-        VkBuffer stagingBuffer = null)
+        VkBuffer stagingBuffer = null,
+        VkBuffer retainedBuffer = null)
     {
         CheckSubmittedFences();
+
+        var resources = new SubmissionResourceOwnership(
+            this,
+            vkCL,
+            vkCB,
+            sharedCommandPool,
+            stagingTexture,
+            stagingBuffer,
+            retainedBuffer);
+        bool primarySubmissionSucceeded = false;
+        bool internalFenceAcquired = false;
+        bool internalFenceSubmitted = false;
+        bool submissionTracked = false;
 
         bool useExtraFence = fence != null;
         SubmitInfo si = new SubmitInfo(sType: StructureType.SubmitInfo);
@@ -250,47 +285,161 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
         si.PSignalSemaphores = signalSemaphoresPtr;
         si.SignalSemaphoreCount = signalSemaphoreCount;
 
-        VkFenceHandle vkFence = default;
+        VkFenceHandle callerFence = default;
         VkFenceHandle submissionFence = default;
-        if (useExtraFence)
+        try
         {
-            vkFence = Util.AssertSubtype<Fence, NeoVeldrid.Vk.VkFence>(fence).DeviceFence;
-            submissionFence = GetFreeSubmissionFence();
-        }
-        else
-        {
-            vkFence = GetFreeSubmissionFence();
-            submissionFence = vkFence;
-        }
+            resources.PrepareForSubmission();
+            SubmissionCheckpointObserver?.OnCheckpoint(
+                SubmissionCheckpoint.BeforeCompletionFenceAcquisition);
 
-        lock (_graphicsQueueLock)
-        {
-            Result result = _vk.QueueSubmit(_graphicsQueue, 1, &si, vkFence);
-            CheckResult(result);
-            FlushValidationErrors();
+            submissionFence = GetFreeSubmissionFence();
+            internalFenceAcquired = true;
             if (useExtraFence)
             {
-                result = _vk.QueueSubmit(_graphicsQueue, 0, (SubmitInfo*)null, submissionFence);
-                CheckResult(result);
+                callerFence = Util.AssertSubtype<Fence, NeoVeldrid.Vk.VkFence>(fence).DeviceFence;
             }
 
-            // Preserve the graphics-queue order assumed by completion polling.
-            // Appending after releasing _graphicsQueueLock lets concurrent
-            // submitters reorder this retained list.
+            lock (_graphicsQueueLock)
+            {
+                try
+                {
+                    SubmissionCheckpointObserver?.OnCheckpoint(
+                        SubmissionCheckpoint.BeforePrimaryQueueSubmit);
+                    // Track the primary work with our owned fence. When the caller
+                    // supplies a fence, it is attached to the following ordered
+                    // submit so observing it also proves this tracking fence can
+                    // be reclaimed before the caller reuses host-visible buffers.
+                    Result result = _vk.QueueSubmit(_graphicsQueue, 1, &si, submissionFence);
+                    CheckResult(result);
+                    primarySubmissionSucceeded = true;
+                    internalFenceSubmitted = true;
+
+                    FlushValidationErrors();
+                    if (useExtraFence)
+                    {
+                        SubmissionCheckpointObserver?.OnCheckpoint(
+                            SubmissionCheckpoint.BeforeAuxiliaryCompletionSubmit);
+                        result = _vk.QueueSubmit(_graphicsQueue, 0, (SubmitInfo*)null, callerFence);
+                        CheckResult(result);
+                    }
+
+                    SubmissionCheckpointObserver?.OnCheckpoint(
+                        SubmissionCheckpoint.BeforeCompletionTracking);
+
+                    TrackFenceSubmission(
+                        submissionFence,
+                        resources);
+                    submissionTracked = true;
+                }
+                catch (Exception submissionError)
+                {
+                    if (primarySubmissionSucceeded && !submissionTracked)
+                    {
+                        try
+                        {
+                            CompletePrimarySubmissionSynchronously(
+                                resources,
+                                submissionFence,
+                                internalFenceAcquired,
+                                internalFenceSubmitted);
+                            internalFenceAcquired = false;
+                        }
+                        catch (Exception completionError)
+                        {
+                            throw new AggregateException(
+                                "A Vulkan submission succeeded, but its exceptional completion handoff failed.",
+                                submissionError,
+                                completionError);
+                        }
+                    }
+
+                    throw;
+                }
+            }
+        }
+        catch
+        {
+            if (!primarySubmissionSucceeded)
+            {
+                if (internalFenceAcquired)
+                    ReturnSubmissionFence(submissionFence);
+                resources.RollbackBeforeSubmission();
+            }
+
+            throw;
+        }
+    }
+
+    private void CompletePrimarySubmissionSynchronously(
+        SubmissionResourceOwnership resources,
+        VkFenceHandle internalFence,
+        bool internalFenceAcquired,
+        bool internalFenceSubmitted)
+    {
+        Result waitResult = _vk.QueueWaitIdle(_graphicsQueue);
+        if (waitResult != Result.Success)
+        {
+            if (internalFenceAcquired && !internalFenceSubmitted)
+            {
+                ReturnSubmissionFence(internalFence);
+                internalFenceAcquired = false;
+            }
+
             lock (_submittedFencesLock)
             {
-                _submittedFences.Add(new FenceSubmissionInfo(
-                    submissionFence,
-                    vkCL,
-                    vkCB,
-                    sharedCommandPool,
-                    stagingTexture,
-                    stagingBuffer));
+                _unresolvedSubmissionCompletions.Add(
+                    new UnresolvedSubmissionCompletion(
+                        resources,
+                        internalFence,
+                        internalFenceAcquired,
+                        internalFenceSubmitted));
+            }
+
+            CheckResult(waitResult);
+        }
+
+        try
+        {
+            resources.CompleteSubmission();
+        }
+        finally
+        {
+            if (internalFenceAcquired)
+            {
+                RecycleSubmissionFence(
+                    internalFence,
+                    internalFenceSubmitted);
             }
         }
     }
 
+    private void TrackFenceSubmission(
+        VkFenceHandle fence,
+        SubmissionResourceOwnership resources)
+    {
+        // Call while holding _graphicsQueueLock. This preserves the queue order
+        // assumed by completion polling across concurrent submitters.
+        lock (_submittedFencesLock)
+        {
+            _submittedFences.Add(new FenceSubmissionInfo(
+                fence,
+                resources));
+        }
+    }
+
     private void CheckSubmittedFences()
+    {
+        if (AutomaticSubmissionReclamationGate is
+            { IsReclamationAllowed: false })
+        {
+            return;
+        }
+
+        CheckSubmittedFencesIgnoringAutomaticReclamationGate();
+    }
+
+    private void CheckSubmittedFencesIgnoringAutomaticReclamationGate()
     {
         lock (_submittedFencesLock)
         {
@@ -315,8 +464,12 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
             Result status = _vk.GetFenceStatus(_device, fsi.Fence);
             if (status == Result.Success)
             {
-                CompleteFenceSubmission(fsi);
+                // Detach first while still holding _submittedFencesLock. The
+                // completion proof is final, and any later fence-reset error
+                // must not leave a nonterminal ownership record that polling
+                // could complete a second time.
                 _submittedFences.RemoveAt(i);
+                CompleteFenceSubmission(fsi);
                 i -= 1;
             }
             else if (status == Result.NotReady)
@@ -332,6 +485,37 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
 
     internal void ReclaimCompletedSubmissions()
         => CheckSubmittedFences();
+
+    internal SubmissionResourcePoolSnapshot CaptureSubmissionResourcePoolSnapshot()
+    {
+        int sharedCommandPools;
+        lock (_graphicsCommandPoolLock)
+            sharedCommandPools = _sharedGraphicsCommandPools.Count;
+
+        int stagingTextures;
+        int stagingBuffers;
+        lock (_stagingResourcesLock)
+        {
+            stagingTextures = _availableStagingTextures.Count;
+            stagingBuffers = _availableStagingBuffers.Count;
+        }
+
+        int trackedSubmissions;
+        int unresolvedSubmissions;
+        lock (_submittedFencesLock)
+        {
+            trackedSubmissions = _submittedFences.Count;
+            unresolvedSubmissions = _unresolvedSubmissionCompletions.Count;
+        }
+
+        return new SubmissionResourcePoolSnapshot(
+            sharedCommandPools,
+            stagingTextures,
+            stagingBuffers,
+            _availableSubmissionFences.Count,
+            trackedSubmissions,
+            unresolvedSubmissions);
+    }
 
     internal void WaitForOldestSubmissionCompletion(VkCommandList commandList)
     {
@@ -386,15 +570,14 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
                 }
 
                 claimedSubmission = _submittedFences[submissionIndex];
-                // Publish the recycled command-buffer and staging records
-                // before removing the only tracked submission. Otherwise a
-                // concurrent Begin can observe an exhausted bounded pool with
-                // neither an available record nor an in-flight fence to wait
-                // for. This critical section is short; the unbounded native
-                // fence wait remains outside the registry lock.
-                CompleteFenceSubmission(claimedSubmission);
+                // Detach and publish the recycled records in one locked
+                // transaction. A concurrent Begin cannot observe the detached
+                // fence until completion has published the command-buffer and
+                // staging records. Detaching first also prevents a fallible
+                // fence reset from making ownership cleanup replayable.
                 _submittedFences.RemoveAt(submissionIndex);
                 submissionDetached = true;
+                CompleteFenceSubmission(claimedSubmission);
             }
         }
         finally
@@ -440,48 +623,70 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
     private void CompleteFenceSubmission(FenceSubmissionInfo fsi)
     {
         VkFenceHandle fence = fsi.Fence;
-        CommandBuffer completedCB = fsi.CommandBuffer;
-        fsi.CommandList?.CommandBufferCompleted(completedCB);
-        Result resetResult = _vk.ResetFences(_device, 1, &fence);
-        CheckResult(resetResult);
-        ReturnSubmissionFence(fence);
+        try
+        {
+            fsi.CompleteSubmission();
+        }
+        finally
+        {
+            RecycleSubmissionFence(fence, fenceWasSubmitted: true);
+        }
+    }
 
-        if (fsi.StagingTexture != null)
+    private void RecycleSubmissionFence(
+        VkFenceHandle fence,
+        bool fenceWasSubmitted)
+    {
+        if (fenceWasSubmitted)
+        {
+            Result resetResult = _vk.ResetFences(_device, 1, &fence);
+            CheckResult(resetResult);
+        }
+
+        ReturnSubmissionFence(fence);
+    }
+
+    private void RecycleSubmissionAuxiliaryResources(
+        SharedCommandPool sharedCommandPool,
+        VkTexture stagingTexture,
+        VkBuffer stagingBuffer)
+    {
+        if (stagingTexture != null)
         {
             lock (_stagingResourcesLock)
             {
-                _availableStagingTextures.Add(fsi.StagingTexture);
+                _availableStagingTextures.Add(stagingTexture);
             }
         }
 
-        if (fsi.StagingBuffer != null)
+        if (stagingBuffer != null)
         {
-            if (fsi.StagingBuffer.SizeInBytes <= MaxStagingBufferSize)
+            if (stagingBuffer.SizeInBytes <= MaxStagingBufferSize)
             {
                 lock (_stagingResourcesLock)
                 {
-                    _availableStagingBuffers.Add(fsi.StagingBuffer);
+                    _availableStagingBuffers.Add(stagingBuffer);
                 }
             }
             else
             {
-                fsi.StagingBuffer.Dispose();
+                stagingBuffer.Dispose();
             }
         }
 
-        if (fsi.SharedCommandPool != null)
+        if (sharedCommandPool == null)
+            return;
+
+        if (sharedCommandPool.IsCached)
         {
-            if (fsi.SharedCommandPool.IsCached)
+            lock (_graphicsCommandPoolLock)
             {
-                lock (_graphicsCommandPoolLock)
-                {
-                    _sharedGraphicsCommandPools.Push(fsi.SharedCommandPool);
-                }
+                _sharedGraphicsCommandPools.Push(sharedCommandPool);
             }
-            else
-            {
-                fsi.SharedCommandPool.Destroy();
-            }
+        }
+        else
+        {
+            sharedCommandPool.Destroy();
         }
     }
 
@@ -1170,6 +1375,7 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
     protected override MappedResource MapCore(MappableResource resource, MapMode mode, uint subresource)
     {
         VkMemoryBlock memoryBlock = default(VkMemoryBlock);
+        VkBuffer mappedBuffer = null;
         IntPtr mappedPtr = IntPtr.Zero;
         uint sizeInBytes;
         uint offset = 0;
@@ -1177,6 +1383,9 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
         uint depthPitch = 0;
         if (resource is VkBuffer buffer)
         {
+            ReclaimCompletedSubmissions();
+            buffer.SubmissionAccess.BeginHostMap(buffer.Name);
+            mappedBuffer = buffer;
             memoryBlock = buffer.Memory;
             sizeInBytes = buffer.SizeInBytes;
         }
@@ -1191,39 +1400,49 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
             depthPitch = (uint)layout.DepthPitch;
         }
 
-        if (memoryBlock.DeviceMemory.Handle != 0)
+        try
         {
-            if (memoryBlock.IsPersistentMapped)
+            if (memoryBlock.DeviceMemory.Handle != 0)
             {
-                mappedPtr = (IntPtr)memoryBlock.BlockMappedPointer;
-            }
-            else
-            {
-                mappedPtr = _memoryManager.Map(memoryBlock, out Result result);
-                if (result == Result.ErrorMemoryMapFailed)
+                if (memoryBlock.IsPersistentMapped)
                 {
-                    throw NeoVeldridMappedResourceException.MapFailed(resource, subresource);
+                    mappedPtr = (IntPtr)memoryBlock.BlockMappedPointer;
                 }
-                CheckResult(result);
+                else
+                {
+                    mappedPtr = _memoryManager.Map(memoryBlock, out Result result);
+                    if (result == Result.ErrorMemoryMapFailed)
+                    {
+                        throw NeoVeldridMappedResourceException.MapFailed(resource, subresource);
+                    }
+                    CheckResult(result);
+                }
             }
-        }
 
-        byte* dataPtr = (byte*)mappedPtr.ToPointer() + offset;
-        return new MappedResource(
-            resource,
-            mode,
-            (IntPtr)dataPtr,
-            sizeInBytes,
-            subresource,
-            rowPitch,
-            depthPitch);
+            byte* dataPtr = (byte*)mappedPtr.ToPointer() + offset;
+            return new MappedResource(
+                resource,
+                mode,
+                (IntPtr)dataPtr,
+                sizeInBytes,
+                subresource,
+                rowPitch,
+                depthPitch);
+        }
+        catch
+        {
+            mappedBuffer?.SubmissionAccess.EndHostMap();
+            throw;
+        }
     }
 
     protected override void UnmapCore(MappableResource resource, uint subresource)
     {
         VkMemoryBlock memoryBlock = default(VkMemoryBlock);
+        VkBuffer mappedBuffer = null;
         if (resource is VkBuffer buffer)
         {
+            mappedBuffer = buffer;
             memoryBlock = buffer.Memory;
         }
         else
@@ -1232,15 +1451,23 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
             memoryBlock = tex.Memory;
         }
 
-        if (memoryBlock.DeviceMemory.Handle != 0 && !memoryBlock.IsPersistentMapped)
+        try
         {
-            _vk.UnmapMemory(_device, memoryBlock.DeviceMemory);
+            if (memoryBlock.DeviceMemory.Handle != 0 && !memoryBlock.IsPersistentMapped)
+            {
+                _vk.UnmapMemory(_device, memoryBlock.DeviceMemory);
+            }
+        }
+        finally
+        {
+            mappedBuffer?.SubmissionAccess.EndHostMap();
         }
     }
 
     protected override void PlatformDispose()
     {
         Debug.Assert(_submittedFences.Count == 0);
+        Debug.Assert(_unresolvedSubmissionCompletions.Count == 0);
         foreach (VkFenceHandle fence in _availableSubmissionFences)
         {
             _vk.DestroyFence(_device, fence, null);
@@ -1291,8 +1518,42 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
         }
         CheckResult(result);
 
-        CheckSubmittedFences();
+        CompleteUnresolvedSubmissionCompletions();
+        // Waiting for the queue to become idle is an explicit lifecycle
+        // boundary. It must release completed submission ownership even when
+        // a test has paused opportunistic reclamation.
+        CheckSubmittedFencesIgnoringAutomaticReclamationGate();
         FlushValidationErrors();
+    }
+
+    private void CompleteUnresolvedSubmissionCompletions()
+    {
+        lock (_submittedFencesLock)
+        {
+            for (int i = 0; i < _unresolvedSubmissionCompletions.Count; i++)
+            {
+                UnresolvedSubmissionCompletion completion =
+                    _unresolvedSubmissionCompletions[i];
+                try
+                {
+                    completion.CompleteSubmission();
+                    if (completion.InternalFenceAcquired)
+                    {
+                        RecycleSubmissionFence(
+                            completion.InternalFence,
+                            completion.InternalFenceSubmitted);
+                    }
+                }
+                catch
+                {
+                    _unresolvedSubmissionCompletions[i] = completion;
+                    _unresolvedSubmissionCompletions.RemoveRange(0, i);
+                    throw;
+                }
+            }
+
+            _unresolvedSubmissionCompletions.Clear();
+        }
     }
 
     public override TextureSampleCount GetSampleCountLimit(PixelFormat format, bool depthFormat)
@@ -1388,38 +1649,50 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
     private protected override void UpdateBufferCore(DeviceBuffer buffer, uint bufferOffsetInBytes, IntPtr source, uint sizeInBytes)
     {
         VkBuffer vkBuffer = Util.AssertSubtype<DeviceBuffer, VkBuffer>(buffer);
-        VkBuffer copySrcVkBuffer = null;
-        IntPtr mappedPtr;
-        byte* destPtr;
-        bool isPersistentMapped = vkBuffer.Memory.IsPersistentMapped;
-        if (isPersistentMapped)
+        ReclaimCompletedSubmissions();
+        if (vkBuffer.Memory.IsPersistentMapped)
         {
-            mappedPtr = (IntPtr)vkBuffer.Memory.BlockMappedPointer;
-            destPtr = (byte*)mappedPtr + bufferOffsetInBytes;
-        }
-        else
-        {
-            copySrcVkBuffer = GetFreeStagingBuffer(sizeInBytes);
-            mappedPtr = (IntPtr)copySrcVkBuffer.Memory.BlockMappedPointer;
-            destPtr = (byte*)mappedPtr;
-        }
-
-        Unsafe.CopyBlock(destPtr, source.ToPointer(), sizeInBytes);
-
-        if (!isPersistentMapped)
-        {
-            SharedCommandPool pool = GetFreeCommandPool();
-            CommandBuffer cb = pool.BeginNewCommandBuffer();
-
-            BufferCopy copyRegion = new BufferCopy
+            vkBuffer.SubmissionAccess.BeginHostWrite(vkBuffer.Name);
+            try
             {
-                DstOffset = bufferOffsetInBytes,
-                Size = sizeInBytes
-            };
-            _vk.CmdCopyBuffer(cb, copySrcVkBuffer.DeviceBuffer, vkBuffer.DeviceBuffer, 1, in copyRegion);
+                byte* destination =
+                    (byte*)vkBuffer.Memory.BlockMappedPointer + bufferOffsetInBytes;
+                Unsafe.CopyBlock(destination, source.ToPointer(), sizeInBytes);
+            }
+            finally
+            {
+                vkBuffer.SubmissionAccess.EndHostWrite();
+            }
 
-            pool.EndAndSubmit(cb, copySrcVkBuffer);
+            return;
         }
+
+        VkBuffer copySource = GetFreeStagingBuffer(sizeInBytes);
+        copySource.SubmissionAccess.BeginHostWrite(copySource.Name);
+        try
+        {
+            Unsafe.CopyBlock(
+                copySource.Memory.BlockMappedPointer,
+                source.ToPointer(),
+                sizeInBytes);
+        }
+        finally
+        {
+            copySource.SubmissionAccess.EndHostWrite();
+        }
+
+        SharedCommandPool pool = GetFreeCommandPool();
+        CommandBuffer commandBuffer = pool.BeginNewCommandBuffer();
+        VkBufferCopyRecorder.Record(
+            this,
+            commandBuffer,
+            copySource,
+            0u,
+            vkBuffer,
+            bufferOffsetInBytes,
+            sizeInBytes);
+
+        pool.EndAndSubmit(commandBuffer, copySource, vkBuffer);
     }
 
     private SharedCommandPool GetFreeCommandPool()
@@ -1709,6 +1982,32 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
         pool.EndAndSubmit(cb);
     }
 
+    internal readonly struct SubmissionResourcePoolSnapshot
+    {
+        public int AvailableSharedCommandPoolCount { get; }
+        public int AvailableStagingTextureCount { get; }
+        public int AvailableStagingBufferCount { get; }
+        public int AvailableSubmissionFenceCount { get; }
+        public int TrackedSubmissionCount { get; }
+        public int UnresolvedSubmissionCount { get; }
+
+        public SubmissionResourcePoolSnapshot(
+            int availableSharedCommandPoolCount,
+            int availableStagingTextureCount,
+            int availableStagingBufferCount,
+            int availableSubmissionFenceCount,
+            int trackedSubmissionCount,
+            int unresolvedSubmissionCount)
+        {
+            AvailableSharedCommandPoolCount = availableSharedCommandPoolCount;
+            AvailableStagingTextureCount = availableStagingTextureCount;
+            AvailableStagingBufferCount = availableStagingBufferCount;
+            AvailableSubmissionFenceCount = availableSubmissionFenceCount;
+            TrackedSubmissionCount = trackedSubmissionCount;
+            UnresolvedSubmissionCount = unresolvedSubmissionCount;
+        }
+    }
+
     private class SharedCommandPool
     {
         private readonly VkGraphicsDevice _gd;
@@ -1759,10 +2058,17 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
         public void EndAndSubmit(CommandBuffer cb, VkBuffer stagingBuffer)
             => EndAndSubmitCore(cb, null, stagingBuffer);
 
+        public void EndAndSubmit(
+            CommandBuffer cb,
+            VkBuffer stagingBuffer,
+            VkBuffer retainedBuffer)
+            => EndAndSubmitCore(cb, null, stagingBuffer, retainedBuffer);
+
         private void EndAndSubmitCore(
             CommandBuffer cb,
             VkTexture stagingTexture,
-            VkBuffer stagingBuffer)
+            VkBuffer stagingBuffer,
+            VkBuffer retainedBuffer = null)
         {
             Result result = _gd._vk.EndCommandBuffer(cb);
             CheckResult(result);
@@ -1776,7 +2082,8 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
                 null,
                 this,
                 stagingTexture,
-                stagingBuffer);
+                stagingBuffer,
+                retainedBuffer);
         }
 
         internal void Destroy()
@@ -1785,32 +2092,165 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
         }
     }
 
-    private struct FenceSubmissionInfo
+    private struct SubmissionResourceOwnership
     {
-        public VkFenceHandle Fence { get; }
-        public VkCommandList CommandList { get; }
-        public CommandBuffer CommandBuffer { get; }
-        public SharedCommandPool SharedCommandPool { get; }
-        public VkTexture StagingTexture { get; }
-        public VkBuffer StagingBuffer { get; }
-        public bool CompletionClaimed { get; set; }
+        private readonly VkGraphicsDevice _graphicsDevice;
+        private readonly VkCommandList _commandList;
+        private readonly CommandBuffer _commandBuffer;
+        private readonly SharedCommandPool _sharedCommandPool;
+        private readonly VkTexture _stagingTexture;
+        private readonly VkBuffer _stagingBuffer;
+        private readonly VkBuffer _retainedBuffer;
 
-        public FenceSubmissionInfo(
-            VkFenceHandle fence,
+        private bool _commandListPrepared;
+        private bool _retainedBufferLeaseAcquired;
+        private bool _retainedBufferReferenceAcquired;
+        private bool _terminal;
+
+        public readonly VkCommandList CommandList => _commandList;
+
+        public SubmissionResourceOwnership(
+            VkGraphicsDevice graphicsDevice,
             VkCommandList commandList,
             CommandBuffer commandBuffer,
             SharedCommandPool sharedCommandPool,
             VkTexture stagingTexture,
-            VkBuffer stagingBuffer)
+            VkBuffer stagingBuffer,
+            VkBuffer retainedBuffer)
+        {
+            _graphicsDevice = graphicsDevice;
+            _commandList = commandList;
+            _commandBuffer = commandBuffer;
+            _sharedCommandPool = sharedCommandPool;
+            _stagingTexture = stagingTexture;
+            _stagingBuffer = stagingBuffer;
+            _retainedBuffer = retainedBuffer;
+            _commandListPrepared = false;
+            _retainedBufferLeaseAcquired = false;
+            _retainedBufferReferenceAcquired = false;
+            _terminal = false;
+        }
+
+        public void PrepareForSubmission()
+        {
+            if (_terminal || _commandListPrepared || _retainedBufferLeaseAcquired)
+            {
+                throw new NeoVeldridException(
+                    "Vulkan submission resources cannot be prepared more than once.");
+            }
+
+            try
+            {
+                if (_commandList != null)
+                {
+                    _commandList.CommandBufferSubmitted(_commandBuffer);
+                    _commandListPrepared = true;
+                }
+
+                if (_retainedBuffer != null)
+                {
+                    _retainedBuffer.SubmissionAccess.BeginSubmissionUse();
+                    _retainedBufferLeaseAcquired = true;
+                    _retainedBuffer.RefCount.Increment();
+                    _retainedBufferReferenceAcquired = true;
+                }
+            }
+            catch
+            {
+                RollbackBeforeSubmission();
+                throw;
+            }
+        }
+
+        public void RollbackBeforeSubmission()
+            => Release(completedSubmission: false);
+
+        public void CompleteSubmission()
+            => Release(completedSubmission: true);
+
+        private void Release(bool completedSubmission)
+        {
+            if (_terminal)
+                return;
+            _terminal = true;
+
+            try
+            {
+                if (_commandListPrepared)
+                {
+                    if (completedSubmission)
+                        _commandList.CommandBufferCompleted(_commandBuffer);
+                    else
+                        _commandList.CommandBufferSubmissionFailed(_commandBuffer);
+                }
+            }
+            finally
+            {
+                try
+                {
+                    try
+                    {
+                        if (_retainedBufferLeaseAcquired)
+                            _retainedBuffer.SubmissionAccess.EndSubmissionUse();
+                    }
+                    finally
+                    {
+                        if (_retainedBufferReferenceAcquired)
+                            _retainedBuffer.RefCount.Decrement();
+                    }
+                }
+                finally
+                {
+                    _graphicsDevice.RecycleSubmissionAuxiliaryResources(
+                        _sharedCommandPool,
+                        _stagingTexture,
+                        _stagingBuffer);
+                }
+            }
+        }
+    }
+
+    private struct UnresolvedSubmissionCompletion
+    {
+        private SubmissionResourceOwnership _resources;
+        public VkFenceHandle InternalFence { get; }
+        public bool InternalFenceAcquired { get; }
+        public bool InternalFenceSubmitted { get; }
+
+        public UnresolvedSubmissionCompletion(
+            SubmissionResourceOwnership resources,
+            VkFenceHandle internalFence,
+            bool internalFenceAcquired,
+            bool internalFenceSubmitted)
+        {
+            _resources = resources;
+            InternalFence = internalFence;
+            InternalFenceAcquired = internalFenceAcquired;
+            InternalFenceSubmitted = internalFenceSubmitted;
+        }
+
+        public void CompleteSubmission()
+            => _resources.CompleteSubmission();
+    }
+
+    private struct FenceSubmissionInfo
+    {
+        private SubmissionResourceOwnership _resources;
+        public VkFenceHandle Fence { get; }
+        public readonly VkCommandList CommandList => _resources.CommandList;
+        public bool CompletionClaimed { get; set; }
+
+        public FenceSubmissionInfo(
+            VkFenceHandle fence,
+            SubmissionResourceOwnership resources)
         {
             Fence = fence;
-            CommandList = commandList;
-            CommandBuffer = commandBuffer;
-            SharedCommandPool = sharedCommandPool;
-            StagingTexture = stagingTexture;
-            StagingBuffer = stagingBuffer;
+            _resources = resources;
             CompletionClaimed = false;
         }
+
+        public void CompleteSubmission()
+            => _resources.CompleteSubmission();
     }
 }
 

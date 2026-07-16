@@ -1,5 +1,6 @@
 using System;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
@@ -26,6 +27,9 @@ public abstract class CommandList : DeviceResource, IDisposable
     private readonly GraphicsDeviceFeatures _features;
     private readonly uint _uniformBufferAlignment;
     private readonly uint _structuredBufferAlignment;
+    private uint _recordingSubmissionSlot;
+    private bool _isRecording;
+    private CommandListSubmissionDiagnostics _submissionDiagnostics;
 
     private protected Framebuffer _framebuffer;
     private protected Pipeline _graphicsPipeline;
@@ -47,6 +51,37 @@ public abstract class CommandList : DeviceResource, IDisposable
         _structuredBufferAlignment = structuredAlignment;
     }
 
+    /// <summary>
+    /// Gets the number of backend-owned stable recording slots available to this
+    /// command list, or zero when the backend does not provide that capability.
+    /// A stable slot is not reused until its prior submission completes.
+    /// </summary>
+    public uint RecordingSubmissionSlotCount { get; private set; }
+
+    /// <summary>
+    /// Gets the slot owned by the current recording. Frame-versioned resources
+    /// may use this identity after <see cref="Begin"/> returns.
+    /// </summary>
+    public uint RecordingSubmissionSlot
+    {
+        get
+        {
+            if (RecordingSubmissionSlotCount == 0u)
+            {
+                throw new NeoVeldridException(
+                    "This command list does not expose backend-owned stable recording slots.");
+            }
+
+            if (!_isRecording)
+            {
+                throw new NeoVeldridException(
+                    "A recording submission slot is available only between Begin and End.");
+            }
+
+            return _recordingSubmissionSlot;
+        }
+    }
+
     internal void ClearCachedState()
     {
         _framebuffer = null;
@@ -63,14 +98,144 @@ public abstract class CommandList : DeviceResource, IDisposable
     /// Begin must only be called if it has not been previously called, if <see cref="End"/> has been called,
     /// or if <see cref="GraphicsDevice.SubmitCommands(CommandList)"/> has been called on this instance.
     /// </summary>
-    public abstract void Begin();
+    public void Begin()
+    {
+        BeginCore();
+        _isRecording = true;
+        _submissionDiagnostics?.BeginRecording();
+    }
+
+    private protected void ConfigureRecordingSubmissionSlots(uint slotCount)
+    {
+        if (slotCount == 0u)
+            throw new ArgumentOutOfRangeException(nameof(slotCount));
+        if (RecordingSubmissionSlotCount != 0u)
+        {
+            throw new InvalidOperationException(
+                "Stable recording slots have already been configured for this command list.");
+        }
+
+        RecordingSubmissionSlotCount = slotCount;
+        _recordingSubmissionSlot = slotCount - 1u;
+    }
+
+    private protected void SetRecordingSubmissionSlot(uint slot)
+    {
+        if (slot >= RecordingSubmissionSlotCount)
+            throw new ArgumentOutOfRangeException(nameof(slot));
+
+        _recordingSubmissionSlot = slot;
+    }
+
+    private protected abstract void BeginCore();
 
     /// <summary>
     /// Completes this list of graphics commands, putting it into an executable state for a <see cref="GraphicsDevice"/>.
     /// This function must only be called after <see cref="Begin"/> has been called.
     /// It is an error to call this function in succession, unless <see cref="Begin"/> has been called in between invocations.
     /// </summary>
-    public abstract void End();
+    public void End()
+    {
+        try
+        {
+            EndCore();
+        }
+        finally
+        {
+            _isRecording = false;
+            _submissionDiagnostics?.EndRecording();
+        }
+    }
+
+    private protected abstract void EndCore();
+
+    /// <summary>
+    /// Enables reusable command submission diagnostics for this command list.
+    /// Diagnostics are disabled by default. Enabling allocates the recorder and
+    /// its two reusable buffer-access stores; normal recording remains free of
+    /// diagnostic collection allocations. Diagnostics configuration cannot be
+    /// changed between <see cref="Begin"/> and <see cref="End"/>; enable before
+    /// beginning the first recording that should be measured.
+    /// </summary>
+    /// <param name="initialBufferAccessCapacity">
+    /// Initial capacity for each reusable buffer-access store.
+    /// </param>
+    public void EnableSubmissionDiagnostics(
+        int initialBufferAccessCapacity = 64)
+    {
+        EnsureSubmissionDiagnosticsConfigurationMayChange();
+        _submissionDiagnostics ??= new CommandListSubmissionDiagnostics(
+            initialBufferAccessCapacity);
+    }
+
+    /// <summary>
+    /// Stops collecting diagnostics for future recordings.
+    /// Existing snapshots remain independent and valid. Disabling discards the
+    /// command list's retained metrics and must occur outside an active recording.
+    /// </summary>
+    public void DisableSubmissionDiagnostics()
+    {
+        EnsureSubmissionDiagnosticsConfigurationMayChange();
+        _submissionDiagnostics = null;
+    }
+
+    /// <summary>
+    /// Gets whether submission diagnostics are currently enabled.
+    /// </summary>
+    public bool SubmissionDiagnosticsEnabled => _submissionDiagnostics is not null;
+
+    /// <summary>
+    /// Attempts to read the allocation-free metrics for the latest diagnosed
+    /// recording that reached a successful graphics-device submission.
+    /// </summary>
+    /// <param name="metrics">
+    /// Receives the latest metrics when this method returns true; otherwise,
+    /// receives the default value.
+    /// </param>
+    /// <returns>
+    /// True when diagnostics are enabled and a diagnosed submission has
+    /// completed successfully; otherwise, false.
+    /// </returns>
+    public bool TryGetLastSubmissionMetrics(
+        out CommandListSubmissionMetrics metrics)
+    {
+        CommandListSubmissionDiagnostics diagnostics = _submissionDiagnostics;
+        if (diagnostics is null)
+        {
+            metrics = default;
+            return false;
+        }
+
+        return diagnostics.TryGetLastSubmissionMetrics(out metrics);
+    }
+
+    /// <summary>
+    /// Freezes the latest command recording that reached a successful graphics-device
+    /// submission. Returns null when diagnostics are disabled or no diagnosed
+    /// submission has completed. This operation allocates a stable snapshot;
+    /// use <see cref="TryGetLastSubmissionMetrics"/>
+    /// when only allocation-free aggregate metrics are required.
+    /// </summary>
+    [return: MaybeNull]
+    public CommandListSubmissionSnapshot CaptureLastSubmissionDiagnostics() =>
+        _submissionDiagnostics?.CaptureLastSubmission();
+
+    private void EnsureSubmissionDiagnosticsConfigurationMayChange()
+    {
+        if (_isRecording)
+        {
+            throw new InvalidOperationException(
+                "Submission diagnostics can only be enabled or disabled outside an active command-list recording.");
+        }
+    }
+
+    internal CommandListSubmissionDiagnostics SubmissionDiagnostics =>
+        _submissionDiagnostics;
+
+    internal void CompleteSuccessfulSubmissionDiagnostics()
+    {
+        _submissionDiagnostics?.CompleteSuccessfulSubmission();
+    }
 
     /// <summary>
     /// Sets the active <see cref="Pipeline"/> used for rendering.
@@ -92,6 +257,7 @@ public abstract class CommandList : DeviceResource, IDisposable
         }
 
         SetPipelineCore(pipeline);
+        _submissionDiagnostics?.RecordSetPipeline(pipeline);
     }
 
     private protected abstract void SetPipelineCore(Pipeline pipeline);
@@ -129,6 +295,7 @@ public abstract class CommandList : DeviceResource, IDisposable
         }
 #endif
         SetVertexBufferCore(index, buffer, offset);
+        _submissionDiagnostics?.RecordSetVertexBuffer(index, buffer, offset);
     }
 
     private protected abstract void SetVertexBufferCore(uint index, DeviceBuffer buffer, uint offset);
@@ -164,6 +331,7 @@ public abstract class CommandList : DeviceResource, IDisposable
         _indexFormat = format;
 #endif
         SetIndexBufferCore(buffer, format, offset);
+        _submissionDiagnostics?.RecordSetIndexBuffer(buffer, format, offset);
     }
 
     private protected abstract void SetIndexBufferCore(DeviceBuffer buffer, IndexFormat format, uint offset);
@@ -275,6 +443,11 @@ public abstract class CommandList : DeviceResource, IDisposable
         ValidateResourceSetNotDisposed(slot, rs);
 #endif
         SetGraphicsResourceSetCore(slot, rs, dynamicOffsetsCount, ref dynamicOffsets);
+        _submissionDiagnostics?.RecordSetGraphicsResourceSet(
+            slot,
+            rs,
+            dynamicOffsetsCount,
+            ref dynamicOffsets);
     }
 
 
@@ -358,6 +531,11 @@ public abstract class CommandList : DeviceResource, IDisposable
         ValidateResourceSetNotDisposed(slot, rs);
 #endif
         SetComputeResourceSetCore(slot, rs, dynamicOffsetsCount, ref dynamicOffsets);
+        _submissionDiagnostics?.RecordSetComputeResourceSet(
+            slot,
+            rs,
+            dynamicOffsetsCount,
+            ref dynamicOffsets);
     }
 
 
@@ -396,6 +574,7 @@ public abstract class CommandList : DeviceResource, IDisposable
         {
             _framebuffer = fb;
             SetFramebufferCore(fb);
+            _submissionDiagnostics?.RecordSetFramebuffer(fb);
             SetFullViewports();
             SetFullScissorRects();
         }
@@ -445,6 +624,7 @@ public abstract class CommandList : DeviceResource, IDisposable
         }
 #endif
         ClearColorTargetCore(index, clearColor);
+        _submissionDiagnostics?.RecordClearColorTarget(index, clearColor);
     }
 
     private protected abstract void ClearColorTargetCore(uint index, RgbaFloat clearColor);
@@ -481,6 +661,7 @@ public abstract class CommandList : DeviceResource, IDisposable
 #endif
 
         ClearDepthStencilCore(depth, stencil);
+        _submissionDiagnostics?.RecordClearDepthStencil(depth, stencil);
     }
 
     private protected abstract void ClearDepthStencilCore(float depth, byte stencil);
@@ -521,7 +702,15 @@ public abstract class CommandList : DeviceResource, IDisposable
     /// </summary>
     /// <param name="index">The color target index.</param>
     /// <param name="viewport">The new <see cref="Viewport"/>.</param>
-    public abstract void SetViewport(uint index, ref Viewport viewport);
+    public void SetViewport(uint index, ref Viewport viewport)
+    {
+        SetViewportCore(index, ref viewport);
+        _submissionDiagnostics?.RecordSetViewport(index, in viewport);
+    }
+
+    private protected abstract void SetViewportCore(
+        uint index,
+        ref Viewport viewport);
 
     /// <summary>
     /// Sets all active scissor rectangles to cover the active <see cref="Framebuffer"/>.
@@ -554,7 +743,28 @@ public abstract class CommandList : DeviceResource, IDisposable
     /// <param name="y">The Y value of the scissor rectangle.</param>
     /// <param name="width">The width of the scissor rectangle.</param>
     /// <param name="height">The height of the scissor rectangle.</param>
-    public abstract void SetScissorRect(uint index, uint x, uint y, uint width, uint height);
+    public void SetScissorRect(
+        uint index,
+        uint x,
+        uint y,
+        uint width,
+        uint height)
+    {
+        SetScissorRectCore(index, x, y, width, height);
+        _submissionDiagnostics?.RecordSetScissorRect(
+            index,
+            x,
+            y,
+            width,
+            height);
+    }
+
+    private protected abstract void SetScissorRectCore(
+        uint index,
+        uint x,
+        uint y,
+        uint width,
+        uint height);
 
     /// <summary>
     /// Draws primitives from the currently-bound state in this CommandList. An index Buffer is not used.
@@ -573,6 +783,11 @@ public abstract class CommandList : DeviceResource, IDisposable
     {
         PreDrawValidation();
         DrawCore(vertexCount, instanceCount, vertexStart, instanceStart);
+        _submissionDiagnostics?.RecordDraw(
+            vertexCount,
+            instanceCount,
+            vertexStart,
+            instanceStart);
     }
 
     private protected abstract void DrawCore(uint vertexCount, uint instanceCount, uint vertexStart, uint instanceStart);
@@ -609,6 +824,12 @@ public abstract class CommandList : DeviceResource, IDisposable
 
 
         DrawIndexedCore(indexCount, instanceCount, indexStart, vertexOffset, instanceStart);
+        _submissionDiagnostics?.RecordDrawIndexed(
+            indexCount,
+            instanceCount,
+            indexStart,
+            vertexOffset,
+            instanceStart);
     }
 
     private protected abstract void DrawIndexedCore(uint indexCount, uint instanceCount, uint indexStart, int vertexOffset, uint instanceStart);
@@ -633,6 +854,12 @@ public abstract class CommandList : DeviceResource, IDisposable
         PreDrawValidation();
 
         DrawIndirectCore(indirectBuffer, offset, drawCount, stride);
+        _submissionDiagnostics?.RecordDrawIndirect(
+            indirectBuffer,
+            offset,
+            drawCount,
+            stride,
+            indexed: false);
     }
 
 
@@ -665,6 +892,12 @@ public abstract class CommandList : DeviceResource, IDisposable
         PreDrawValidation();
 
         DrawIndexedIndirectCore(indirectBuffer, offset, drawCount, stride);
+        _submissionDiagnostics?.RecordDrawIndirect(
+            indirectBuffer,
+            offset,
+            drawCount,
+            stride,
+            indexed: true);
     }
 
 
@@ -720,7 +953,19 @@ public abstract class CommandList : DeviceResource, IDisposable
     /// <param name="groupCountX">The X dimension of the compute thread groups that are dispatched.</param>
     /// <param name="groupCountY">The Y dimension of the compute thread groups that are dispatched.</param>
     /// <param name="groupCountZ">The Z dimension of the compute thread groups that are dispatched.</param>
-    public abstract void Dispatch(uint groupCountX, uint groupCountY, uint groupCountZ);
+    public void Dispatch(uint groupCountX, uint groupCountY, uint groupCountZ)
+    {
+        DispatchCore(groupCountX, groupCountY, groupCountZ);
+        _submissionDiagnostics?.RecordDispatch(
+            groupCountX,
+            groupCountY,
+            groupCountZ);
+    }
+
+    private protected abstract void DispatchCore(
+        uint groupCountX,
+        uint groupCountY,
+        uint groupCountZ);
 
     /// <summary>
     /// Issues an indirect compute dispatch command based on the information contained in the given indirect
@@ -736,6 +981,10 @@ public abstract class CommandList : DeviceResource, IDisposable
         ValidateIndirectBuffer(indirectBuffer);
         ValidateIndirectOffset(offset);
         DispatchIndirectCore(indirectBuffer, offset);
+        _submissionDiagnostics?.RecordDispatchIndirect(
+            indirectBuffer,
+            offset,
+            (uint)Unsafe.SizeOf<IndirectDispatchArguments>());
     }
 
 
@@ -768,6 +1017,7 @@ public abstract class CommandList : DeviceResource, IDisposable
 #endif
 
         ResolveTextureCore(source, destination);
+        _submissionDiagnostics?.RecordResolveTexture(source, destination);
     }
 
     /// <summary>
@@ -924,6 +1174,10 @@ public abstract class CommandList : DeviceResource, IDisposable
         }
 
         UpdateBufferCore(buffer, bufferOffsetInBytes, source, sizeInBytes);
+        _submissionDiagnostics?.RecordUpdateBuffer(
+            buffer,
+            bufferOffsetInBytes,
+            sizeInBytes);
     }
 
     private protected abstract void UpdateBufferCore(
@@ -951,6 +1205,12 @@ public abstract class CommandList : DeviceResource, IDisposable
         }
 
         CopyBufferCore(source, sourceOffset, destination, destinationOffset, sizeInBytes);
+        _submissionDiagnostics?.RecordCopyBuffer(
+            source,
+            sourceOffset,
+            destination,
+            destinationOffset,
+            sizeInBytes);
     }
 
     /// <summary>
@@ -1123,6 +1383,23 @@ public abstract class CommandList : DeviceResource, IDisposable
             dstBaseArrayLayer,
             width, height, depth,
             layerCount);
+        _submissionDiagnostics?.RecordCopyTexture(
+            source,
+            srcX,
+            srcY,
+            srcZ,
+            srcMipLevel,
+            srcBaseArrayLayer,
+            destination,
+            dstX,
+            dstY,
+            dstZ,
+            dstMipLevel,
+            dstBaseArrayLayer,
+            width,
+            height,
+            depth,
+            layerCount);
     }
 
     /// <summary>
@@ -1173,6 +1450,7 @@ public abstract class CommandList : DeviceResource, IDisposable
         if (texture.MipLevels > 1)
         {
             GenerateMipmapsCore(texture);
+            _submissionDiagnostics?.RecordGenerateMipmaps(texture);
         }
     }
 
