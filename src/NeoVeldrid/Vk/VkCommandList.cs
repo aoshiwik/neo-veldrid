@@ -1247,8 +1247,8 @@ internal unsafe class VkCommandList : CommandList
 
             Util.GetMipDimensions(srcVkTexture, srcMipLevel, out uint mipWidth, out uint mipHeight, out _);
             uint blockSize = FormatHelpers.IsCompressedFormat(srcVkTexture.Format) ? 4u : 1u;
-            uint bufferRowLength = Math.Max(mipWidth, blockSize);
-            uint bufferImageHeight = Math.Max(mipHeight, blockSize);
+            uint bufferRowLength = AlignUp(mipWidth, blockSize);
+            uint bufferImageHeight = AlignUp(mipHeight, blockSize);
             uint compressedX = srcX / blockSize;
             uint compressedY = srcY / blockSize;
             uint blockSizeInBytes = blockSize == 1
@@ -1298,8 +1298,8 @@ internal unsafe class VkCommandList : CommandList
 
             Util.GetMipDimensions(dstVkTexture, dstMipLevel, out uint mipWidth, out uint mipHeight, out uint mipDepth);
             uint blockSize = FormatHelpers.IsCompressedFormat(srcVkTexture.Format) ? 4u : 1u;
-            uint bufferRowLength = Math.Max(mipWidth, blockSize);
-            uint bufferImageHeight = Math.Max(mipHeight, blockSize);
+            uint bufferRowLength = AlignUp(mipWidth, blockSize);
+            uint bufferImageHeight = AlignUp(mipHeight, blockSize);
             uint compressedDstX = dstX / blockSize;
             uint compressedDstY = dstY / blockSize;
             uint blockSizeInBytes = blockSize == 1
