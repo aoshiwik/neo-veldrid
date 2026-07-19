@@ -689,15 +689,15 @@ internal unsafe class D3D11GraphicsDevice : GraphicsDevice
         else
         {
             int subresource = D3D11Util.ComputeSubresource(mipLevel, texture.MipLevels, arrayLayer);
-            Box resourceRegion = new Box
-            {
-                Left = x,
-                Top = y,
-                Front = z,
-                Right = x + width,
-                Bottom = y + height,
-                Back = z + depth,
-            };
+            Box resourceRegion = D3D11Util.GetTextureRegion(
+                d3dTex,
+                x,
+                y,
+                z,
+                width,
+                height,
+                depth,
+                mipLevel);
 
             uint srcRowPitch = FormatHelpers.GetRowPitch(width, texture.Format);
             uint srcDepthPitch = FormatHelpers.GetDepthPitch(srcRowPitch, height, texture.Format);

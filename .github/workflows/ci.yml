@@ -62,6 +62,12 @@ jobs:
       - name: Run SPIRV tests
         run: dotnet test tests/NeoVeldrid.SPIRV.Tests/NeoVeldrid.SPIRV.Tests.csproj -c Release --no-build
 
+      - name: Run D3D11 GPU tests (Windows)
+        if: runner.os == 'Windows'
+        run: >-
+          dotnet test tests/NeoVeldrid.Tests/NeoVeldrid.Tests.csproj -c Release --no-build
+          --filter "Backend=D3D11"
+
       - name: Verify Vulkan software driver (Linux)
         if: runner.os == 'Linux'
         env:

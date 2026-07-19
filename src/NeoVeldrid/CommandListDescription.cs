@@ -21,6 +21,16 @@ public struct CommandListDescription : IEquatable<CommandListDescription>
     public uint InitialTrackedResourceCapacityPerSubmission { readonly get; set; }
 
     /// <summary>
+    /// Gets or sets the capacity, in bytes, of each submission slot's retained
+    /// staging upload page on backends which use submission-owned staging pages
+    /// (currently Vulkan). Zero keeps lazy backend allocation. Other backends
+    /// may ignore this hint. A non-zero value moves the expected Vulkan staging
+    /// allocation to command-list creation and keeps interactive uploads within
+    /// a fixed native-memory envelope.
+    /// </summary>
+    public uint InitialStagingUploadPageSize { readonly get; set; }
+
+    /// <summary>
     /// Element-wise equality.
     /// </summary>
     /// <param name="other">The instance to compare to.</param>
@@ -29,7 +39,9 @@ public struct CommandListDescription : IEquatable<CommandListDescription>
     {
         return MaximumInFlightSubmissionCount == other.MaximumInFlightSubmissionCount &&
                InitialTrackedResourceCapacityPerSubmission ==
-               other.InitialTrackedResourceCapacityPerSubmission;
+               other.InitialTrackedResourceCapacityPerSubmission &&
+               InitialStagingUploadPageSize ==
+               other.InitialStagingUploadPageSize;
     }
 
     /// <summary>
@@ -40,6 +52,7 @@ public struct CommandListDescription : IEquatable<CommandListDescription>
     {
         return HashCode.Combine(
             MaximumInFlightSubmissionCount,
-            InitialTrackedResourceCapacityPerSubmission);
+            InitialTrackedResourceCapacityPerSubmission,
+            InitialStagingUploadPageSize);
     }
 }

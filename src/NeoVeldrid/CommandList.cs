@@ -1187,6 +1187,187 @@ public abstract class CommandList : DeviceResource, IDisposable
         uint sizeInBytes);
 
     /// <summary>
+    /// Records a tightly-packed CPU texture-region upload in this command
+    /// list. Unlike <see cref="GraphicsDevice.UpdateTexture(Texture, IntPtr, uint, uint, uint, uint, uint, uint, uint, uint, uint)"/>,
+    /// the upload is ordered and retained by the surrounding submission. This
+    /// is the preferred path for interactive ranged updates because it avoids
+    /// a second command pool, fence, and queue submission.
+    /// </summary>
+    public void UpdateTexture(
+        Texture texture,
+        IntPtr source,
+        uint sizeInBytes,
+        uint x,
+        uint y,
+        uint z,
+        uint width,
+        uint height,
+        uint depth,
+        uint mipLevel,
+        uint arrayLayer)
+    {
+        ValidateUpdateTextureParameters(
+            texture,
+            source,
+            sizeInBytes,
+            x,
+            y,
+            z,
+            width,
+            height,
+            depth,
+            mipLevel,
+            arrayLayer);
+        UpdateTextureCore(
+            texture,
+            source,
+            sizeInBytes,
+            x,
+            y,
+            z,
+            width,
+            height,
+            depth,
+            mipLevel,
+            arrayLayer);
+        _submissionDiagnostics?.RecordUpdateTexture(
+            texture,
+            sizeInBytes,
+            x,
+            y,
+            z,
+            width,
+            height,
+            depth,
+            mipLevel,
+            arrayLayer);
+    }
+
+    /// <summary>
+    /// Records a tightly-packed CPU texture-region upload from a span.
+    /// </summary>
+    public void UpdateTexture<T>(
+        Texture texture,
+        T[] source,
+        uint x,
+        uint y,
+        uint z,
+        uint width,
+        uint height,
+        uint depth,
+        uint mipLevel,
+        uint arrayLayer)
+        where T : unmanaged
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        UpdateTexture(
+            texture,
+            (ReadOnlySpan<T>)source,
+            x,
+            y,
+            z,
+            width,
+            height,
+            depth,
+            mipLevel,
+            arrayLayer);
+    }
+
+    /// <summary>
+    /// Records a tightly-packed CPU texture-region upload from a span.
+    /// </summary>
+    public unsafe void UpdateTexture<T>(
+        Texture texture,
+        ReadOnlySpan<T> source,
+        uint x,
+        uint y,
+        uint z,
+        uint width,
+        uint height,
+        uint depth,
+        uint mipLevel,
+        uint arrayLayer)
+        where T : unmanaged
+    {
+        var sizeInBytes = checked((uint)(sizeof(T) * source.Length));
+        fixed (void* sourcePointer = &MemoryMarshal.GetReference(source))
+        {
+            UpdateTexture(
+                texture,
+                (IntPtr)sourcePointer,
+                sizeInBytes,
+                x,
+                y,
+                z,
+                width,
+                height,
+                depth,
+                mipLevel,
+                arrayLayer);
+        }
+    }
+
+    private protected abstract void UpdateTextureCore(
+        Texture texture,
+        IntPtr source,
+        uint sizeInBytes,
+        uint x,
+        uint y,
+        uint z,
+        uint width,
+        uint height,
+        uint depth,
+        uint mipLevel,
+        uint arrayLayer);
+
+    internal static void ValidateUpdateTextureParameters(
+        Texture texture,
+        IntPtr source,
+        uint sizeInBytes,
+        uint x,
+        uint y,
+        uint z,
+        uint width,
+        uint height,
+        uint depth,
+        uint mipLevel,
+        uint arrayLayer)
+    {
+        ArgumentNullException.ThrowIfNull(texture);
+        if (source == IntPtr.Zero)
+            throw new ArgumentNullException(nameof(source));
+        if ((texture.Usage & TextureUsage.Staging) != 0)
+        {
+            throw new NeoVeldridException(
+                "CommandList.UpdateTexture cannot target a staging Texture. Map the staging Texture or copy from it instead.");
+        }
+        if ((texture.Usage & TextureUsage.DepthStencil) != 0 ||
+            FormatHelpers.IsStencilFormat(texture.Format))
+        {
+            throw new NeoVeldridException(
+                "CommandList.UpdateTexture currently supports color Texture regions only. Depth-stencil uploads require an aspect-explicit contract.");
+        }
+        if (texture.SampleCount != TextureSampleCount.Count1)
+        {
+            throw new NeoVeldridException(
+                "CommandList.UpdateTexture cannot target a multisampled Texture.");
+        }
+
+        GraphicsDevice.ValidateUpdateTextureParameters(
+            texture,
+            sizeInBytes,
+            x,
+            y,
+            z,
+            width,
+            height,
+            depth,
+            mipLevel,
+            arrayLayer,
+            GraphicsDevice.TextureUpdateValidationMode.CommandListExact);
+    }
+
+    /// <summary>
     /// Copies a region from the source <see cref="DeviceBuffer"/> to another region in the destination <see cref="DeviceBuffer"/>.
     /// </summary>
     /// <param name="source">The source <see cref="DeviceBuffer"/> from which data will be copied.</param>

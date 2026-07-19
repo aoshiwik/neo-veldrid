@@ -972,6 +972,186 @@ public abstract class RenderTests<T> : GraphicsDeviceTestBase<T> where T : Graph
         GD.Unmap(readback);
     }
 
+    [SkippableFact]
+    public void CommandListTextureUpdateSynchronizesBothDirectionsWithComputeSampling()
+    {
+        Skip.IfNot(GD.Features.ComputeShader);
+
+        Texture sampledTexture = RF.CreateTexture(
+            TextureDescription.Texture2D(
+                1,
+                1,
+                1,
+                1,
+                PixelFormat.R8_G8_B8_A8_UNorm,
+                TextureUsage.Sampled));
+        DeviceBuffer computeOutput = RF.CreateBuffer(new BufferDescription(
+            16,
+            BufferUsage.StructuredBufferReadWrite,
+            16));
+        DeviceBuffer readback = RF.CreateBuffer(new BufferDescription(
+            16,
+            BufferUsage.Staging));
+        ResourceLayout layout = RF.CreateResourceLayout(
+            new ResourceLayoutDescription(
+                new ResourceLayoutElementDescription(
+                    "InputTexture",
+                    ResourceKind.TextureReadOnly,
+                    ShaderStages.Compute),
+                new ResourceLayoutElementDescription(
+                    "InputSampler",
+                    ResourceKind.Sampler,
+                    ShaderStages.Compute),
+                new ResourceLayoutElementDescription(
+                    "OutputBuffer",
+                    ResourceKind.StructuredBufferReadWrite,
+                    ShaderStages.Compute)));
+        ResourceSet resourceSet = RF.CreateResourceSet(
+            new ResourceSetDescription(
+                layout,
+                sampledTexture,
+                GD.PointSampler,
+                computeOutput));
+        Pipeline pipeline = RF.CreateComputePipeline(
+            new ComputePipelineDescription(
+                TestShaders.LoadCompute(RF, "ComputeTextureSampler"),
+                layout,
+                1,
+                1,
+                1));
+        byte[] red = { 255, 0, 0, 255 };
+        byte[] green = { 0, 255, 0, 255 };
+        CommandList commandList = RF.CreateCommandList();
+
+        commandList.Begin();
+        commandList.UpdateTexture(
+            sampledTexture, red,
+            0, 0, 0,
+            1, 1, 1,
+            0, 0);
+        commandList.SetPipeline(pipeline);
+        commandList.SetComputeResourceSet(0, resourceSet);
+        commandList.Dispatch(1, 1, 1);
+        commandList.UpdateTexture(
+            sampledTexture, green,
+            0, 0, 0,
+            1, 1, 1,
+            0, 0);
+        commandList.Dispatch(1, 1, 1);
+        commandList.CopyBuffer(computeOutput, 0, readback, 0, 16);
+        commandList.End();
+        GD.SubmitCommands(commandList);
+        GD.WaitForIdle();
+
+        MappedResourceView<RgbaFloat> mapped =
+            GD.Map<RgbaFloat>(readback, MapMode.Read);
+        try
+        {
+            Assert.Equal(
+                RgbaFloat.Green,
+                mapped[0],
+                RgbaFloatFuzzyComparer.Instance);
+        }
+        finally
+        {
+            GD.Unmap(readback);
+        }
+    }
+
+    [Fact]
+    public void CommandListTextureUpdatePreservesSuspendedFramebufferState()
+    {
+        const uint size = 4;
+        Texture target = RF.CreateTexture(
+            TextureDescription.Texture2D(
+                size,
+                size,
+                1,
+                1,
+                PixelFormat.R8_G8_B8_A8_UNorm,
+                TextureUsage.Sampled | TextureUsage.RenderTarget));
+        Framebuffer framebuffer = RF.CreateFramebuffer(
+            new FramebufferDescription(null, target));
+        Texture input = RF.CreateTexture(
+            TextureDescription.Texture2D(
+                1,
+                1,
+                1,
+                1,
+                PixelFormat.R8_G8_B8_A8_UNorm,
+                TextureUsage.Sampled));
+        byte[] white = { 255, 255, 255, 255 };
+        GD.UpdateTexture(input, white, 0, 0, 0, 1, 1, 1, 0, 0);
+
+        ResourceLayout layout = RF.CreateResourceLayout(
+            new ResourceLayoutDescription(
+                new ResourceLayoutElementDescription(
+                    "Input",
+                    ResourceKind.TextureReadOnly,
+                    ShaderStages.Fragment),
+                new ResourceLayoutElementDescription(
+                    "InputSampler",
+                    ResourceKind.Sampler,
+                    ShaderStages.Fragment)));
+        ResourceSet resourceSet = RF.CreateResourceSet(
+            new ResourceSetDescription(layout, input, GD.PointSampler));
+        Pipeline pipeline = RF.CreateGraphicsPipeline(
+            new GraphicsPipelineDescription(
+                BlendStateDescription.SingleOverrideBlend,
+                DepthStencilStateDescription.Disabled,
+                RasterizerStateDescription.CullNone,
+                PrimitiveTopology.TriangleStrip,
+                new ShaderSetDescription(
+                    Array.Empty<VertexLayoutDescription>(),
+                    TestShaders.LoadVertexFragment(RF, "FullScreenBlit")),
+                layout,
+                framebuffer.OutputDescription));
+        byte[] redPixel = { 255, 0, 0, 255 };
+        CommandList commandList = RF.CreateCommandList();
+
+        commandList.Begin();
+        commandList.SetFramebuffer(framebuffer);
+        commandList.ClearColorTarget(0, RgbaFloat.Black);
+        commandList.SetPipeline(pipeline);
+        commandList.SetGraphicsResourceSet(0, resourceSet);
+        commandList.Draw(4);
+        commandList.UpdateTexture(
+            target,
+            redPixel,
+            1,
+            1,
+            0,
+            1,
+            1,
+            1,
+            0,
+            0);
+        commandList.Draw(4);
+        commandList.End();
+        GD.SubmitCommands(commandList);
+        GD.WaitForIdle();
+
+        Texture readback = GetReadback(target);
+        MappedResourceView<RgbaByte> mapped =
+            GD.Map<RgbaByte>(readback, MapMode.Read);
+        try
+        {
+            for (uint y = 0; y < size; y++)
+            {
+                for (uint x = 0; x < size; x++)
+                {
+                    Assert.Equal(
+                        new RgbaByte(255, 255, 255, 255),
+                        mapped[x, y]);
+                }
+            }
+        }
+        finally
+        {
+            GD.Unmap(readback);
+        }
+    }
+
     [SkippableTheory]
     [InlineData(2)]
     [InlineData(6)]

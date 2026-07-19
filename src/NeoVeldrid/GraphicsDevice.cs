@@ -540,67 +540,181 @@ public abstract class GraphicsDevice : IDisposable
         uint width, uint height, uint depth,
         uint mipLevel, uint arrayLayer);
 
-    [Conditional("VALIDATE_USAGE")]
-    private static void ValidateUpdateTextureParameters(
+    internal enum TextureUpdateValidationMode
+    {
+        /// <summary>
+        /// The immediate device API consumes the leading bytes required by
+        /// the region. Existing callers may supply a larger backing array or
+        /// a block-padded compressed edge region.
+        /// </summary>
+        GraphicsDeviceCompatible,
+
+        /// <summary>
+        /// A command-list upload copies and retains the supplied payload, so
+        /// it requires one exact logical region with no unused trailing data.
+        /// </summary>
+        CommandListExact,
+    }
+
+    internal static void ValidateUpdateTextureParameters(
         Texture texture,
         uint sizeInBytes,
         uint x, uint y, uint z,
         uint width, uint height, uint depth,
-        uint mipLevel, uint arrayLayer)
+        uint mipLevel, uint arrayLayer,
+        TextureUpdateValidationMode validationMode =
+            TextureUpdateValidationMode.GraphicsDeviceCompatible)
     {
-        if (FormatHelpers.IsCompressedFormat(texture.Format))
-        {
-            if (x % 4 != 0 || y % 4 != 0 || height % 4 != 0 || width % 4 != 0)
-            {
-                Util.GetMipDimensions(texture, mipLevel, out uint mipWidth, out uint mipHeight, out _);
-                if (width != mipWidth && height != mipHeight)
-                {
-                    throw new NeoVeldridException($"Updates to block-compressed textures must use a region that is block-size aligned and sized.");
-                }
-            }
-        }
-        uint expectedSize = FormatHelpers.GetRegionSize(width, height, depth, texture.Format);
-        if (sizeInBytes < expectedSize)
+        ArgumentNullException.ThrowIfNull(texture);
+        if (texture.IsDisposed)
+            throw new ObjectDisposedException(nameof(texture));
+        if (width == 0u || height == 0u || depth == 0u)
         {
             throw new NeoVeldridException(
-                $"The data size is less than expected for the given update region. At least {expectedSize} bytes must be provided, but only {sizeInBytes} were.");
+                "Texture update dimensions must all be greater than zero.");
         }
-
-        // Compressed textures don't necessarily need to have a Texture.Width and Texture.Height that are a multiple of 4.
-        // But the mipdata width and height *does* need to be a multiple of 4.
-        uint roundedTextureWidth, roundedTextureHeight;
-        if (FormatHelpers.IsCompressedFormat(texture.Format))
-        {
-            roundedTextureWidth = (texture.Width + 3) / 4 * 4;
-            roundedTextureHeight = (texture.Height + 3) / 4 * 4;
-        }
-        else
-        {
-            roundedTextureWidth = texture.Width;
-            roundedTextureHeight = texture.Height;
-        }
-
-        if (x + width > roundedTextureWidth || y + height > roundedTextureHeight || z + depth > texture.Depth)
-        {
-            throw new NeoVeldridException($"The given region does not fit into the Texture.");
-        }
-
         if (mipLevel >= texture.MipLevels)
         {
             throw new NeoVeldridException(
                 $"{nameof(mipLevel)} ({mipLevel}) must be less than the Texture's mip level count ({texture.MipLevels}).");
         }
 
-        uint effectiveArrayLayers = texture.ArrayLayers;
-        if ((texture.Usage & TextureUsage.Cubemap) != 0)
+        uint effectiveArrayLayers;
+        try
         {
-            effectiveArrayLayers *= 6;
+            effectiveArrayLayers =
+                (texture.Usage & TextureUsage.Cubemap) != 0
+                    ? checked(texture.ArrayLayers * 6u)
+                    : texture.ArrayLayers;
+        }
+        catch (OverflowException exception)
+        {
+            throw new NeoVeldridException(
+                "The Texture's effective array layer count exceeds UInt32.MaxValue.",
+                exception);
         }
         if (arrayLayer >= effectiveArrayLayers)
         {
             throw new NeoVeldridException(
                 $"{nameof(arrayLayer)} ({arrayLayer}) must be less than the Texture's effective array layer count ({effectiveArrayLayers}).");
         }
+
+        Util.GetMipDimensions(
+            texture,
+            mipLevel,
+            out uint mipWidth,
+            out uint mipHeight,
+            out uint mipDepth);
+        bool isCompressed =
+            FormatHelpers.IsCompressedFormat(texture.Format);
+        ulong storageWidth = mipWidth;
+        ulong storageHeight = mipHeight;
+        if (isCompressed &&
+            validationMode ==
+                TextureUpdateValidationMode.GraphicsDeviceCompatible)
+        {
+            // Preserve the immediate API's established block-storage
+            // vocabulary for tiny compressed mips. The command-list API uses
+            // logical extents because those extents are recorded directly in
+            // a backend copy command.
+            storageWidth = RoundUpToBlockExtent(mipWidth);
+            storageHeight = RoundUpToBlockExtent(mipHeight);
+        }
+
+        if ((ulong)x + width > storageWidth ||
+            (ulong)y + height > storageHeight ||
+            (ulong)z + depth > mipDepth)
+        {
+            throw new NeoVeldridException(
+                "The given region does not fit into the selected Texture mip level.");
+        }
+
+        if (isCompressed)
+        {
+            const uint blockExtent = 4u;
+            bool widthReachesMipEdge = x + width == mipWidth;
+            bool heightReachesMipEdge = y + height == mipHeight;
+            if (x % blockExtent != 0u ||
+                y % blockExtent != 0u ||
+                (width % blockExtent != 0u && !widthReachesMipEdge) ||
+                (height % blockExtent != 0u && !heightReachesMipEdge))
+            {
+                throw new NeoVeldridException(
+                    "Updates to block-compressed textures must use block-aligned offsets and block-sized extents except at the selected mip level's edge.");
+            }
+        }
+
+        uint expectedSize = CalculateTextureUpdateSize(
+            width,
+            height,
+            depth,
+            texture.Format);
+        if (validationMode ==
+                TextureUpdateValidationMode.CommandListExact &&
+            sizeInBytes != expectedSize)
+        {
+            throw new NeoVeldridException(
+                $"The data size must exactly match the given update region. Expected {expectedSize} bytes, but {sizeInBytes} were provided.");
+        }
+        if (validationMode ==
+                TextureUpdateValidationMode.GraphicsDeviceCompatible &&
+            sizeInBytes < expectedSize)
+        {
+            throw new NeoVeldridException(
+                $"The data size is less than expected for the given update region. At least {expectedSize} bytes must be provided, but only {sizeInBytes} were.");
+        }
+    }
+
+    private static ulong RoundUpToBlockExtent(uint value)
+    {
+        const ulong blockExtent = 4u;
+        return ((ulong)value + blockExtent - 1u) /
+            blockExtent * blockExtent;
+    }
+
+    private static uint CalculateTextureUpdateSize(
+        uint width,
+        uint height,
+        uint depth,
+        PixelFormat format)
+    {
+        ulong byteCount;
+        try
+        {
+            if (FormatHelpers.IsCompressedFormat(format))
+            {
+                const ulong blockExtent = 4u;
+                ulong blockColumns = ((ulong)width + blockExtent - 1u) / blockExtent;
+                ulong blockRows = ((ulong)height + blockExtent - 1u) / blockExtent;
+                byteCount = checked(
+                    blockColumns *
+                    blockRows *
+                    depth *
+                    FormatHelpers.GetBlockSizeInBytes(format));
+            }
+            else
+            {
+                byteCount = checked(
+                    (ulong)width *
+                    height *
+                    depth *
+                    FormatSizeHelpers.GetSizeInBytes(format));
+            }
+        }
+        catch (OverflowException exception)
+        {
+            throw new NeoVeldridException(
+                "The texture update byte count exceeds UInt64.MaxValue.",
+                exception);
+        }
+
+        if (byteCount > uint.MaxValue)
+        {
+            throw new NeoVeldridException(
+                "A single texture update cannot exceed UInt32.MaxValue bytes.");
+        }
+
+        return (uint)byteCount;
     }
 
     /// <summary>

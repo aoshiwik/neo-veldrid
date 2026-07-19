@@ -314,6 +314,7 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
                     CheckResult(result);
                     primarySubmissionSucceeded = true;
                     internalFenceSubmitted = true;
+                    resources.CommitPrimarySubmission();
 
                     FlushValidationErrors();
                     if (useExtraFence)
@@ -676,6 +677,8 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
 
         if (sharedCommandPool == null)
             return;
+
+        sharedCommandPool.ImageLayouts.ReleaseCommittedResources();
 
         if (sharedCommandPool.IsCached)
         {
@@ -1778,7 +1781,8 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
                 cb,
                 stagingTex, 0, 0, 0, 0, 0,
                 texture, x, y, z, mipLevel, arrayLayer,
-                width, height, depth, 1);
+                width, height, depth, 1,
+                pool.ImageLayouts);
             pool.EndAndSubmit(cb, stagingTex);
         }
     }
@@ -1931,10 +1935,16 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
              effectiveLayers);
         SharedCommandPool pool = GetFreeCommandPool();
         CommandBuffer cb = pool.BeginNewCommandBuffer();
-        texture.TransitionImageLayout(cb, 0, texture.MipLevels, 0, effectiveLayers, ImageLayout.TransferDstOptimal);
+        texture.TransitionImageLayout(
+            cb, 0, texture.MipLevels, 0, effectiveLayers,
+            ImageLayout.TransferDstOptimal,
+            pool.ImageLayouts);
         _vk.CmdClearColorImage(cb, texture.OptimalDeviceImage, ImageLayout.TransferDstOptimal, &color, 1, &range);
         ImageLayout colorLayout = texture.IsSwapchainTexture ? ImageLayout.PresentSrcKhr : ImageLayout.ColorAttachmentOptimal;
-        texture.TransitionImageLayout(cb, 0, texture.MipLevels, 0, effectiveLayers, colorLayout);
+        texture.TransitionImageLayout(
+            cb, 0, texture.MipLevels, 0, effectiveLayers,
+            colorLayout,
+            pool.ImageLayouts);
         pool.EndAndSubmit(cb);
     }
 
@@ -1956,7 +1966,10 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
             effectiveLayers);
         SharedCommandPool pool = GetFreeCommandPool();
         CommandBuffer cb = pool.BeginNewCommandBuffer();
-        texture.TransitionImageLayout(cb, 0, texture.MipLevels, 0, effectiveLayers, ImageLayout.TransferDstOptimal);
+        texture.TransitionImageLayout(
+            cb, 0, texture.MipLevels, 0, effectiveLayers,
+            ImageLayout.TransferDstOptimal,
+            pool.ImageLayouts);
         _vk.CmdClearDepthStencilImage(
             cb,
             texture.OptimalDeviceImage,
@@ -1964,7 +1977,10 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
             &clearValue,
             1,
             &range);
-        texture.TransitionImageLayout(cb, 0, texture.MipLevels, 0, effectiveLayers, ImageLayout.DepthStencilAttachmentOptimal);
+        texture.TransitionImageLayout(
+            cb, 0, texture.MipLevels, 0, effectiveLayers,
+            ImageLayout.DepthStencilAttachmentOptimal,
+            pool.ImageLayouts);
         pool.EndAndSubmit(cb);
     }
 
@@ -1978,7 +1994,10 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
     {
         SharedCommandPool pool = GetFreeCommandPool();
         CommandBuffer cb = pool.BeginNewCommandBuffer();
-        texture.TransitionImageLayout(cb, 0, texture.MipLevels, 0, texture.ActualArrayLayers, layout);
+        texture.TransitionImageLayout(
+            cb, 0, texture.MipLevels, 0, texture.ActualArrayLayers,
+            layout,
+            pool.ImageLayouts);
         pool.EndAndSubmit(cb);
     }
 
@@ -2014,6 +2033,9 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
         private readonly CommandPool _pool;
         private readonly CommandBuffer _cb;
 
+        public VkImageLayoutTransaction ImageLayouts { get; } =
+            new VkImageLayoutTransaction();
+
         public bool IsCached { get; }
 
         public SharedCommandPool(VkGraphicsDevice gd, bool isCached)
@@ -2041,6 +2063,7 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
 
         public CommandBuffer BeginNewCommandBuffer()
         {
+            ImageLayouts.ResetForReuse();
             CommandBufferBeginInfo beginInfo = new CommandBufferBeginInfo(sType: StructureType.CommandBufferBeginInfo);
             beginInfo.Flags = CommandBufferUsageFlags.OneTimeSubmitBit;
             Result result = _gd._vk.BeginCommandBuffer(_cb, in beginInfo);
@@ -2071,7 +2094,11 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
             VkBuffer retainedBuffer = null)
         {
             Result result = _gd._vk.EndCommandBuffer(cb);
-            CheckResult(result);
+            if (result != Result.Success)
+            {
+                ImageLayouts.Rollback();
+                CheckResult(result);
+            }
             _gd.SubmitCommandBuffer(
                 null,
                 cb,
@@ -2141,6 +2168,8 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
 
             try
             {
+                _sharedCommandPool?.ImageLayouts.ValidateSubmissionOrder();
+
                 if (_commandList != null)
                 {
                     _commandList.CommandBufferSubmitted(_commandBuffer);
@@ -2165,6 +2194,13 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
         public void RollbackBeforeSubmission()
             => Release(completedSubmission: false);
 
+        public readonly void CommitPrimarySubmission()
+        {
+            if (_commandListPrepared)
+                _commandList.CommandBufferSubmissionSucceeded(_commandBuffer);
+            _sharedCommandPool?.ImageLayouts.CommitAfterSubmission();
+        }
+
         public void CompleteSubmission()
             => Release(completedSubmission: true);
 
@@ -2183,6 +2219,9 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
                     else
                         _commandList.CommandBufferSubmissionFailed(_commandBuffer);
                 }
+
+                if (!completedSubmission && _sharedCommandPool != null)
+                    _sharedCommandPool.ImageLayouts.Rollback();
             }
             finally
             {

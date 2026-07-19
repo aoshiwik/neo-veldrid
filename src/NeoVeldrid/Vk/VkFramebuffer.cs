@@ -15,6 +15,8 @@ internal unsafe class VkFramebuffer : VkFramebufferBase
     private readonly RenderPass _renderPassNoClear;
     private readonly RenderPass _renderPassClear;
     private readonly List<ImageView> _attachmentViews = new List<ImageView>();
+    private readonly ImageLayout[] _firstUseColorLayouts;
+    private readonly ImageLayout? _firstUseDepthLayout;
     private bool _destroyed;
     private string _name;
 
@@ -41,6 +43,7 @@ internal unsafe class VkFramebuffer : VkFramebufferBase
         };
 
         uint colorAttachmentCount = (uint)ColorTargets.Count;
+        _firstUseColorLayouts = new ImageLayout[ColorTargets.Count];
         AttachmentDescription* attachments = stackalloc AttachmentDescription[(int)colorAttachmentCount + 1];
         uint attachmentCount = 0;
         AttachmentReference* colorAttachmentRefs = stackalloc AttachmentReference[(int)colorAttachmentCount];
@@ -59,6 +62,7 @@ internal unsafe class VkFramebuffer : VkFramebufferBase
                 : ((vkColorTex.Usage & TextureUsage.Sampled) != 0)
                     ? ImageLayout.ShaderReadOnlyOptimal
                     : ImageLayout.ColorAttachmentOptimal;
+            _firstUseColorLayouts[i] = colorAttachmentDesc.InitialLayout;
             colorAttachmentDesc.FinalLayout = ImageLayout.ColorAttachmentOptimal;
             attachments[attachmentCount++] = colorAttachmentDesc;
 
@@ -85,6 +89,7 @@ internal unsafe class VkFramebuffer : VkFramebufferBase
             depthAttachmentDesc.InitialLayout = ((vkDepthTex.Usage & TextureUsage.Sampled) != 0)
                 ? ImageLayout.ShaderReadOnlyOptimal
                 : ImageLayout.DepthStencilAttachmentOptimal;
+            _firstUseDepthLayout = depthAttachmentDesc.InitialLayout;
             depthAttachmentDesc.FinalLayout = ImageLayout.DepthStencilAttachmentOptimal;
 
             depthAttachmentRef.Attachment = (uint)description.ColorTargets.Length;
@@ -261,13 +266,91 @@ internal unsafe class VkFramebuffer : VkFramebufferBase
         AttachmentCount += (uint)ColorTargets.Count;
     }
 
-    public override void TransitionToIntermediateLayout(CommandBuffer cb)
+    public override void PrepareForRenderPass(
+        CommandBuffer cb,
+        VkRenderPassInitialLayoutKind initialLayoutKind,
+        VkImageLayoutTransaction transaction)
+    {
+        for (int i = 0; i < ColorTargets.Count; i++)
+        {
+            FramebufferAttachment attachment = ColorTargets[i];
+            VkTexture texture =
+                Util.AssertSubtype<Texture, VkTexture>(attachment.Target);
+            PrepareAttachment(
+                cb,
+                texture,
+                attachment.MipLevel,
+                attachment.ArrayLayer,
+                initialLayoutKind,
+                _firstUseColorLayouts[i],
+                ImageLayout.ColorAttachmentOptimal,
+                transaction);
+        }
+
+        if (DepthTarget != null)
+        {
+            FramebufferAttachment attachment = DepthTarget.Value;
+            VkTexture texture =
+                Util.AssertSubtype<Texture, VkTexture>(attachment.Target);
+            PrepareAttachment(
+                cb,
+                texture,
+                attachment.MipLevel,
+                attachment.ArrayLayer,
+                initialLayoutKind,
+                _firstUseDepthLayout!.Value,
+                ImageLayout.DepthStencilAttachmentOptimal,
+                transaction);
+        }
+    }
+
+    private static void PrepareAttachment(
+        CommandBuffer cb,
+        VkTexture texture,
+        uint mipLevel,
+        uint arrayLayer,
+        VkRenderPassInitialLayoutKind initialLayoutKind,
+        ImageLayout firstUseLayout,
+        ImageLayout continuationLayout,
+        VkImageLayoutTransaction transaction)
+    {
+        if (initialLayoutKind == VkRenderPassInitialLayoutKind.Discard)
+        {
+            // A clear render pass intentionally declares Undefined and discards
+            // the previous contents. Observe the attachment without attempting
+            // an invalid transition to Undefined so ordering and rollback still
+            // include this render-pass use.
+            _ = texture.GetImageLayout(mipLevel, arrayLayer, transaction);
+            return;
+        }
+
+        ImageLayout requiredLayout =
+            initialLayoutKind == VkRenderPassInitialLayoutKind.FirstUse
+                ? firstUseLayout
+                : continuationLayout;
+        texture.TransitionImageLayout(
+            cb,
+            mipLevel,
+            1,
+            arrayLayer,
+            1,
+            requiredLayout,
+            transaction);
+    }
+
+    public override void TransitionToIntermediateLayout(
+        CommandBuffer cb,
+        VkImageLayoutTransaction transaction)
     {
         for (int i = 0; i < ColorTargets.Count; i++)
         {
             FramebufferAttachment ca = ColorTargets[i];
             VkTexture vkTex = Util.AssertSubtype<Texture, VkTexture>(ca.Target);
-            vkTex.SetImageLayout(ca.MipLevel, ca.ArrayLayer, ImageLayout.ColorAttachmentOptimal);
+            vkTex.SetImageLayout(
+                ca.MipLevel,
+                ca.ArrayLayer,
+                ImageLayout.ColorAttachmentOptimal,
+                transaction);
         }
         if (DepthTarget != null)
         {
@@ -275,11 +358,14 @@ internal unsafe class VkFramebuffer : VkFramebufferBase
             vkTex.SetImageLayout(
                 DepthTarget.Value.MipLevel,
                 DepthTarget.Value.ArrayLayer,
-                ImageLayout.DepthStencilAttachmentOptimal);
+                ImageLayout.DepthStencilAttachmentOptimal,
+                transaction);
         }
     }
 
-    public override void TransitionToFinalLayout(CommandBuffer cb)
+    public override void TransitionToFinalLayout(
+        CommandBuffer cb,
+        VkImageLayoutTransaction transaction)
     {
         for (int i = 0; i < ColorTargets.Count; i++)
         {
@@ -291,7 +377,8 @@ internal unsafe class VkFramebuffer : VkFramebufferBase
                     cb,
                     ca.MipLevel, 1,
                     ca.ArrayLayer, 1,
-                    ImageLayout.ShaderReadOnlyOptimal);
+                    ImageLayout.ShaderReadOnlyOptimal,
+                    transaction);
             }
         }
         if (DepthTarget != null)
@@ -303,7 +390,8 @@ internal unsafe class VkFramebuffer : VkFramebufferBase
                     cb,
                     DepthTarget.Value.MipLevel, 1,
                     DepthTarget.Value.ArrayLayer, 1,
-                    ImageLayout.ShaderReadOnlyOptimal);
+                    ImageLayout.ShaderReadOnlyOptimal,
+                    transaction);
             }
         }
     }

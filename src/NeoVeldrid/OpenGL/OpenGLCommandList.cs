@@ -173,6 +173,33 @@ internal class OpenGLCommandList : CommandList
         _currentCommands.UpdateBuffer(buffer, bufferOffsetInBytes, source, sizeInBytes);
     }
 
+    private protected override void UpdateTextureCore(
+        Texture texture,
+        IntPtr source,
+        uint sizeInBytes,
+        uint x,
+        uint y,
+        uint z,
+        uint width,
+        uint height,
+        uint depth,
+        uint mipLevel,
+        uint arrayLayer)
+    {
+        _currentCommands.UpdateTexture(
+            texture,
+            source,
+            sizeInBytes,
+            x,
+            y,
+            z,
+            width,
+            height,
+            depth,
+            mipLevel,
+            arrayLayer);
+    }
+
     private protected override void CopyBufferCore(
         DeviceBuffer source,
         uint sourceOffset,

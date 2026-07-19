@@ -168,23 +168,49 @@ internal unsafe class VkSwapchainFramebuffer : VkFramebufferBase
         }
     }
 
-    public override void TransitionToIntermediateLayout(CommandBuffer cb)
+    public override void PrepareForRenderPass(
+        CommandBuffer cb,
+        VkRenderPassInitialLayoutKind initialLayoutKind,
+        VkImageLayoutTransaction transaction)
+    {
+        _scFramebuffers[(int)_currentImageIndex].PrepareForRenderPass(
+            cb,
+            initialLayoutKind,
+            transaction);
+    }
+
+    public override void TransitionToIntermediateLayout(
+        CommandBuffer cb,
+        VkImageLayoutTransaction transaction)
     {
         for (int i = 0; i < ColorTargets.Count; i++)
         {
             FramebufferAttachment ca = ColorTargets[i];
             VkTexture vkTex = Util.AssertSubtype<Texture, VkTexture>(ca.Target);
-            vkTex.SetImageLayout(0, ca.ArrayLayer, ImageLayout.ColorAttachmentOptimal);
+            vkTex.SetImageLayout(
+                0,
+                ca.ArrayLayer,
+                ImageLayout.ColorAttachmentOptimal,
+                transaction);
         }
     }
 
-    public override void TransitionToFinalLayout(CommandBuffer cb)
+    public override void TransitionToFinalLayout(
+        CommandBuffer cb,
+        VkImageLayoutTransaction transaction)
     {
         for (int i = 0; i < ColorTargets.Count; i++)
         {
             FramebufferAttachment ca = ColorTargets[i];
             VkTexture vkTex = Util.AssertSubtype<Texture, VkTexture>(ca.Target);
-            vkTex.TransitionImageLayout(cb, 0, 1, ca.ArrayLayer, 1, ImageLayout.PresentSrcKhr);
+            vkTex.TransitionImageLayout(
+                cb,
+                0,
+                1,
+                ca.ArrayLayer,
+                1,
+                ImageLayout.PresentSrcKhr,
+                transaction);
         }
     }
 

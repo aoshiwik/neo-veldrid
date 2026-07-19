@@ -91,6 +91,9 @@ internal unsafe class OpenGLNoAllocCommandEntryList : OpenGLCommandEntryList, ID
     private const byte InsertDebugMarkerEntryID = 26;
     private static readonly uint InsertDebugMarkerEntrySize = Util.USizeOf<NoAllocInsertDebugMarkerEntry>();
 
+    private const byte UpdateTextureEntryID = 27;
+    private static readonly uint UpdateTextureEntrySize = Util.USizeOf<NoAllocUpdateTextureEntry>();
+
     public OpenGLCommandList Parent { get; }
 
     public OpenGLNoAllocCommandEntryList(OpenGLCommandList cl)
@@ -334,6 +337,22 @@ internal unsafe class OpenGLNoAllocCommandEntryList : OpenGLCommandEntryList, ID
                         (IntPtr)dataPtr, ube.StagingBlockSize);
                     currentOffset += UpdateBufferEntrySize;
                     break;
+                case UpdateTextureEntryID:
+                    NoAllocUpdateTextureEntry ute =
+                        Unsafe.ReadUnaligned<NoAllocUpdateTextureEntry>(entryBasePtr);
+                    executor.UpdateTexture(
+                        ute.Texture.Get(_resourceList),
+                        (IntPtr)ute.StagingBlock.Data,
+                        ute.X,
+                        ute.Y,
+                        ute.Z,
+                        ute.Width,
+                        ute.Height,
+                        ute.Depth,
+                        ute.MipLevel,
+                        ute.ArrayLayer);
+                    currentOffset += UpdateTextureEntrySize;
+                    break;
                 case CopyBufferEntryID:
                     NoAllocCopyBufferEntry cbe = Unsafe.ReadUnaligned<NoAllocCopyBufferEntry>(entryBasePtr);
                     executor.CopyBuffer(
@@ -530,6 +549,35 @@ internal unsafe class OpenGLNoAllocCommandEntryList : OpenGLCommandEntryList, ID
         _stagingBlocks.Add(stagingBlock);
         NoAllocUpdateBufferEntry entry = new NoAllocUpdateBufferEntry(Track(buffer), bufferOffsetInBytes, stagingBlock, sizeInBytes);
         AddEntry(UpdateBufferEntryID, ref entry);
+    }
+
+    public void UpdateTexture(
+        Texture texture,
+        IntPtr source,
+        uint sizeInBytes,
+        uint x,
+        uint y,
+        uint z,
+        uint width,
+        uint height,
+        uint depth,
+        uint mipLevel,
+        uint arrayLayer)
+    {
+        StagingBlock stagingBlock = _memoryPool.Stage(source, sizeInBytes);
+        _stagingBlocks.Add(stagingBlock);
+        NoAllocUpdateTextureEntry entry = new NoAllocUpdateTextureEntry(
+            Track(texture),
+            stagingBlock,
+            x,
+            y,
+            z,
+            width,
+            height,
+            depth,
+            mipLevel,
+            arrayLayer);
+        AddEntry(UpdateTextureEntryID, ref entry);
     }
 
     public void CopyBuffer(DeviceBuffer source, uint sourceOffset, DeviceBuffer destination, uint destinationOffset, uint sizeInBytes)

@@ -4,6 +4,13 @@ using VkFramebufferHandle = Silk.NET.Vulkan.Framebuffer;
 
 namespace NeoVeldrid.Vk;
 
+internal enum VkRenderPassInitialLayoutKind
+{
+    FirstUse,
+    Continuation,
+    Discard
+}
+
 internal abstract class VkFramebufferBase : Framebuffer
 {
     public VkFramebufferBase(
@@ -36,6 +43,14 @@ internal abstract class VkFramebufferBase : Framebuffer
     public abstract RenderPass RenderPassNoClear_Load { get; }
     public abstract RenderPass RenderPassClear { get; }
     public abstract uint AttachmentCount { get; }
-    public abstract void TransitionToIntermediateLayout(CommandBuffer cb);
-    public abstract void TransitionToFinalLayout(CommandBuffer cb);
+    public abstract void PrepareForRenderPass(
+        CommandBuffer cb,
+        VkRenderPassInitialLayoutKind initialLayoutKind,
+        VkImageLayoutTransaction transaction);
+    public abstract void TransitionToIntermediateLayout(
+        CommandBuffer cb,
+        VkImageLayoutTransaction transaction);
+    public abstract void TransitionToFinalLayout(
+        CommandBuffer cb,
+        VkImageLayoutTransaction transaction);
 }

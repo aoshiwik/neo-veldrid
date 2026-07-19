@@ -10,12 +10,14 @@ public class CommandListDescriptionTests
         CommandListDescription description = new CommandListDescription
         {
             MaximumInFlightSubmissionCount = 8,
-            InitialTrackedResourceCapacityPerSubmission = 256
+            InitialTrackedResourceCapacityPerSubmission = 256,
+            InitialStagingUploadPageSize = 1_048_576
         };
         CommandListDescription same = new CommandListDescription
         {
             MaximumInFlightSubmissionCount = 8,
-            InitialTrackedResourceCapacityPerSubmission = 256
+            InitialTrackedResourceCapacityPerSubmission = 256,
+            InitialStagingUploadPageSize = 1_048_576
         };
 
         Assert.True(description.Equals(same));
@@ -27,6 +29,10 @@ public class CommandListDescriptionTests
         same.MaximumInFlightSubmissionCount = 8;
         same.InitialTrackedResourceCapacityPerSubmission = 255;
         Assert.False(description.Equals(same));
+
+        same.InitialTrackedResourceCapacityPerSubmission = 256;
+        same.InitialStagingUploadPageSize = 524_288;
+        Assert.False(description.Equals(same));
     }
 
     [Fact]
@@ -36,6 +42,7 @@ public class CommandListDescriptionTests
 
         Assert.Equal(0u, description.MaximumInFlightSubmissionCount);
         Assert.Equal(0u, description.InitialTrackedResourceCapacityPerSubmission);
+        Assert.Equal(0u, description.InitialStagingUploadPageSize);
         Assert.True(description.Equals(default));
     }
 }

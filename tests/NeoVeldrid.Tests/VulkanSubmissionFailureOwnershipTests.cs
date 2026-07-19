@@ -118,17 +118,16 @@ public sealed class VulkanSubmissionFailureOwnershipTests
         AssertPoolSnapshotEqual(
             before,
             graphicsDevice.CaptureSubmissionResourcePoolSnapshot());
+        Assert.Equal(
+            Silk.NET.Vulkan.ImageLayout.ShaderReadOnlyOptimal,
+            Assert.IsType<VkTexture>(target).GetImageLayout(0, 0));
 
-        Texture recoveredTarget = RF.CreateTexture(TextureDescription.Texture2D(
-            width,
-            height,
-            1,
-            1,
-            PixelFormat.R8_G8_B8_A8_UNorm,
-            TextureUsage.Sampled));
+        byte[] recoveredPayload = CreatePayload(
+            checked((int)(width * height * 4)),
+            71);
         GD.UpdateTexture(
-            recoveredTarget,
-            payload,
+            target,
+            recoveredPayload,
             0,
             0,
             0,
@@ -137,7 +136,31 @@ public sealed class VulkanSubmissionFailureOwnershipTests
             1,
             0,
             0);
+
+        Texture readback = RF.CreateTexture(TextureDescription.Texture2D(
+            width,
+            height,
+            1,
+            1,
+            PixelFormat.R8_G8_B8_A8_UNorm,
+            TextureUsage.Staging));
+        CommandList commandList = RF.CreateCommandList();
+        commandList.Begin();
+        commandList.CopyTexture(target, readback);
+        commandList.End();
+        GD.SubmitCommands(commandList);
         GD.WaitForIdle();
+
+        MappedResourceView<byte> mapped = GD.Map<byte>(readback, MapMode.Read);
+        try
+        {
+            for (int i = 0; i < recoveredPayload.Length; i++)
+                Assert.Equal(recoveredPayload[i], mapped[checked((uint)i)]);
+        }
+        finally
+        {
+            GD.Unmap(readback);
+        }
     }
 
     [Theory]
@@ -317,6 +340,116 @@ public sealed class VulkanSubmissionFailureOwnershipTests
         finally
         {
             GD.Unmap(target);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void RejectedTextureRecordingCanBeRetriedOrTransactionallyAbandoned(
+        bool abandonRejectedRecording)
+    {
+        const uint width = 4;
+        const uint height = 4;
+        VkGraphicsDevice graphicsDevice = Assert.IsType<VkGraphicsDevice>(GD);
+        Texture target = RF.CreateTexture(TextureDescription.Texture2D(
+            width,
+            height,
+            1,
+            1,
+            PixelFormat.R8_UNorm,
+            TextureUsage.Storage));
+        VkTexture vkTarget = Assert.IsType<VkTexture>(target);
+        byte[] rejectedPayload = CreatePayload(checked((int)(width * height)), 19);
+        byte[] replacementPayload = CreatePayload(rejectedPayload.Length, 83);
+        CommandList commandList = RF.CreateCommandList();
+
+        commandList.Begin();
+        commandList.UpdateTexture(
+            target,
+            rejectedPayload,
+            0,
+            0,
+            0,
+            width,
+            height,
+            1,
+            0,
+            0);
+        commandList.End();
+        Assert.Equal(
+            Silk.NET.Vulkan.ImageLayout.General,
+            vkTarget.GetImageLayout(0, 0));
+
+        var failure = new ThrowOnceAtCheckpoint(
+            VkGraphicsDevice.SubmissionCheckpoint.BeforePrimaryQueueSubmit);
+        graphicsDevice.SubmissionCheckpointObserver = failure;
+        try
+        {
+            Assert.Throws<InjectedSubmissionFailureException>(
+                () => GD.SubmitCommands(commandList));
+        }
+        finally
+        {
+            graphicsDevice.SubmissionCheckpointObserver = null;
+        }
+
+        Assert.True(failure.WasTriggered);
+        Assert.Equal(
+            Silk.NET.Vulkan.ImageLayout.General,
+            vkTarget.GetImageLayout(0, 0));
+
+        byte[] expected;
+        if (abandonRejectedRecording)
+        {
+            commandList.Begin();
+            Assert.Equal(
+                Silk.NET.Vulkan.ImageLayout.Undefined,
+                vkTarget.GetImageLayout(0, 0));
+            commandList.UpdateTexture(
+                target,
+                replacementPayload,
+                0,
+                0,
+                0,
+                width,
+                height,
+                1,
+                0,
+                0);
+            commandList.End();
+            expected = replacementPayload;
+        }
+        else
+        {
+            expected = rejectedPayload;
+        }
+
+        GD.SubmitCommands(commandList);
+
+        Texture readback = RF.CreateTexture(TextureDescription.Texture2D(
+            width,
+            height,
+            1,
+            1,
+            PixelFormat.R8_UNorm,
+            TextureUsage.Staging));
+        CommandList copy = RF.CreateCommandList();
+        copy.Begin();
+        copy.CopyTexture(target, readback);
+        copy.End();
+        GD.SubmitCommands(copy);
+        GD.WaitForIdle();
+
+        MappedResourceView<byte> mapped = GD.Map<byte>(readback, MapMode.Read);
+        try
+        {
+            for (int i = 0; i < expected.Length; i++)
+                Assert.Equal(expected[i], mapped[checked((uint)i)]);
+        }
+        finally
+        {
+            GD.Unmap(readback);
         }
     }
 

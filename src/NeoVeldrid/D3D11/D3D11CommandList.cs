@@ -1382,6 +1382,89 @@ internal unsafe class D3D11CommandList : CommandList
         }
     }
 
+    private protected override void UpdateTextureCore(
+        Texture texture,
+        IntPtr source,
+        uint sizeInBytes,
+        uint x,
+        uint y,
+        uint z,
+        uint width,
+        uint height,
+        uint depth,
+        uint mipLevel,
+        uint arrayLayer)
+    {
+        D3D11Texture destination =
+            Util.AssertSubtype<Texture, D3D11Texture>(texture);
+        uint subresource = checked((uint)D3D11Util.ComputeSubresource(
+            mipLevel,
+            texture.MipLevels,
+            arrayLayer));
+        Box region = D3D11Util.GetTextureRegion(
+            destination,
+            x,
+            y,
+            z,
+            width,
+            height,
+            depth,
+            mipLevel);
+        uint rowPitch = FormatHelpers.GetRowPitch(width, texture.Format);
+        uint depthPitch = FormatHelpers.GetDepthPitch(
+            rowPitch,
+            height,
+            texture.Format);
+        void* adjustedSource = source.ToPointer();
+        if (!_gd.SupportsCommandLists && (x != 0u || y != 0u || z != 0u))
+        {
+            // The D3D11 software command-list path incorrectly reapplies the
+            // destination-box origin to pSrcData during playback. Supply the
+            // inverse byte offset so the runtime lands on the tightly-packed
+            // source region. This is the texture form of the documented
+            // deferred-context UpdateSubresource workaround used below for
+            // partial buffer writes.
+            nuint sourceAdjustment =
+                CalculateDeferredTextureUpdateSourceAdjustment(
+                    texture.Format,
+                    x,
+                    y,
+                    z,
+                    rowPitch,
+                    depthPitch);
+            adjustedSource =
+                (byte*)adjustedSource - checked((nint)sourceAdjustment);
+        }
+        Ctx->UpdateSubresource(
+            destination.DeviceTexture,
+            subresource,
+            &region,
+            adjustedSource,
+            rowPitch,
+            depthPitch);
+    }
+
+    internal static nuint CalculateDeferredTextureUpdateSourceAdjustment(
+        PixelFormat format,
+        uint x,
+        uint y,
+        uint z,
+        uint sourceRowPitch,
+        uint sourceDepthPitch)
+    {
+        bool compressed = FormatHelpers.IsCompressedFormat(format);
+        ulong blockX = compressed ? x / 4u : x;
+        ulong blockY = compressed ? y / 4u : y;
+        uint bytesPerElement = compressed
+            ? FormatHelpers.GetBlockSizeInBytes(format)
+            : FormatSizeHelpers.GetSizeInBytes(format);
+        ulong adjustment = checked(
+            ((ulong)z * sourceDepthPitch) +
+            (blockY * sourceRowPitch) +
+            (blockX * bytesPerElement));
+        return checked((nuint)adjustment);
+    }
+
     private void UpdateSubresource_Workaround(
         ID3D11Resource* resource,
         int subresource,
@@ -1452,22 +1535,27 @@ internal unsafe class D3D11CommandList : CommandList
         D3D11Texture srcD3D11Texture = Util.AssertSubtype<Texture, D3D11Texture>(source);
         D3D11Texture dstD3D11Texture = Util.AssertSubtype<Texture, D3D11Texture>(destination);
 
-        uint blockSize = FormatHelpers.IsCompressedFormat(source.Format) ? 4u : 1u;
-        uint clampedWidth = Math.Max(blockSize, width);
-        uint clampedHeight = Math.Max(blockSize, height);
-
-        bool useRegion = srcX != 0 || srcY != 0 || srcZ != 0
-            || clampedWidth != source.Width || clampedHeight != source.Height || depth != source.Depth;
-
-        Box region = new Box
-        {
-            Left = srcX,
-            Top = srcY,
-            Front = srcZ,
-            Right = srcX + clampedWidth,
-            Bottom = srcY + clampedHeight,
-            Back = srcZ + depth,
-        };
+        Box region = D3D11Util.GetTextureRegion(
+            srcD3D11Texture,
+            srcX,
+            srcY,
+            srcZ,
+            width,
+            height,
+            depth,
+            srcMipLevel);
+        D3D11Util.GetTextureSubresourceStorageDimensions(
+            srcD3D11Texture,
+            srcMipLevel,
+            out uint storageWidth,
+            out uint storageHeight,
+            out uint storageDepth);
+        bool useRegion = region.Left != 0u ||
+            region.Top != 0u ||
+            region.Front != 0u ||
+            region.Right != storageWidth ||
+            region.Bottom != storageHeight ||
+            region.Back != storageDepth;
 
         for (uint i = 0; i < layerCount; i++)
         {

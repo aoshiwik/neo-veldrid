@@ -9,6 +9,321 @@ namespace NeoVeldrid.Tests;
 public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> where T : GraphicsDeviceCreator
 {
     [Fact]
+    public void CommandListTextureUpdateValidationIsBackendIndependent()
+    {
+        Texture texture = RF.CreateTexture(
+            TextureDescription.Texture2D(
+                4,
+                4,
+                1,
+                1,
+                PixelFormat.R8_UNorm,
+                TextureUsage.Sampled));
+        CommandList commandList = RF.CreateCommandList();
+        byte[] undersizedSource = new byte[15];
+
+        NeoVeldridException exception = Assert.Throws<NeoVeldridException>(
+            () => commandList.UpdateTexture(
+                texture,
+                undersizedSource,
+                0,
+                0,
+                0,
+                4,
+                4,
+                1,
+                0,
+                0));
+
+        Assert.Contains("exactly match", exception.Message);
+    }
+
+    [Fact]
+    public unsafe void CommandListTextureUpdatesAreOrderedInSingleSubmission()
+    {
+        const uint textureSize = 8;
+        Texture destination = RF.CreateTexture(
+            TextureDescription.Texture2D(
+                textureSize,
+                textureSize,
+                1,
+                1,
+                PixelFormat.R8_UNorm,
+                TextureUsage.Sampled));
+        Texture capture = RF.CreateTexture(
+            TextureDescription.Texture2D(
+                textureSize,
+                textureSize,
+                1,
+                1,
+                PixelFormat.R8_UNorm,
+                TextureUsage.Staging));
+        byte[] initial = new byte[checked((int)(textureSize * textureSize))];
+        byte[] patch = { 11, 22, 33, 44, 55, 66 };
+        CommandList commandList = RF.CreateCommandList();
+        commandList.EnableSubmissionDiagnostics(
+            initialBufferAccessCapacity: 2);
+
+        commandList.Begin();
+        commandList.UpdateTexture(
+            destination,
+            initial,
+            0,
+            0,
+            0,
+            textureSize,
+            textureSize,
+            1,
+            0,
+            0);
+        commandList.UpdateTexture(
+            destination,
+            patch,
+            x: 2,
+            y: 3,
+            z: 0,
+            width: 3,
+            height: 2,
+            depth: 1,
+            mipLevel: 0,
+            arrayLayer: 0);
+        commandList.CopyTexture(destination, capture);
+        commandList.End();
+
+        GD.SubmitCommands(commandList);
+        GD.WaitForIdle();
+
+        Assert.True(commandList.TryGetLastSubmissionMetrics(
+            out CommandListSubmissionMetrics metrics));
+        Assert.Equal(1L, metrics.SubmissionSequence);
+        Assert.Equal(2, metrics.UpdateTextureCallCount);
+        Assert.Equal(70UL, metrics.UpdatedTextureBytes);
+        Assert.Equal(1, metrics.CopyTextureCallCount);
+
+        MappedResource mapped = GD.Map(capture, MapMode.Read);
+        try
+        {
+            byte* basePointer = (byte*)mapped.Data;
+            for (uint y = 0; y < textureSize; y++)
+            {
+                for (uint x = 0; x < textureSize; x++)
+                {
+                    int patchX = checked((int)x - 2);
+                    int patchY = checked((int)y - 3);
+                    byte expected =
+                        patchX >= 0 && patchX < 3 &&
+                        patchY >= 0 && patchY < 2
+                            ? patch[(patchY * 3) + patchX]
+                            : (byte)0;
+                    nuint byteOffset = checked(
+                        ((nuint)y * mapped.RowPitch) + x);
+                    byte actual = *(basePointer + checked((nint)byteOffset));
+                    Assert.Equal(expected, actual);
+                }
+            }
+        }
+        finally
+        {
+            GD.Unmap(capture);
+        }
+    }
+
+    [Fact]
+    public unsafe void CommandListTextureUpdateRetainsArrayMipPayloadAtRecordTime()
+    {
+        const uint textureSize = 8;
+        const uint mipLevel = 1;
+        const uint arrayLayer = 1;
+        const uint mipSize = textureSize >> (int)mipLevel;
+        TextureDescription description = TextureDescription.Texture2D(
+            textureSize,
+            textureSize,
+            3,
+            2,
+            PixelFormat.R8_UNorm,
+            TextureUsage.Sampled);
+        Texture destination = RF.CreateTexture(description);
+        description.Usage = TextureUsage.Staging;
+        Texture capture = RF.CreateTexture(description);
+        byte[] source = new byte[checked((int)(mipSize * mipSize))];
+        for (int i = 0; i < source.Length; i++)
+            source[i] = checked((byte)(31 + i));
+        byte[] expected = source.ToArray();
+        CommandList commandList = RF.CreateCommandList();
+
+        commandList.Begin();
+        commandList.UpdateTexture(
+            destination,
+            source,
+            0,
+            0,
+            0,
+            mipSize,
+            mipSize,
+            1,
+            mipLevel,
+            arrayLayer);
+        Array.Fill(source, (byte)0xEE);
+        commandList.CopyTexture(
+            destination, 0, 0, 0, mipLevel, arrayLayer,
+            capture, 0, 0, 0, mipLevel, arrayLayer,
+            mipSize, mipSize, 1, 1);
+        commandList.End();
+        GD.SubmitCommands(commandList);
+        GD.WaitForIdle();
+
+        uint subresource = capture.CalculateSubresource(mipLevel, arrayLayer);
+        MappedResource mapped = GD.Map(capture, MapMode.Read, subresource);
+        try
+        {
+            byte* basePointer = (byte*)mapped.Data;
+            for (uint y = 0; y < mipSize; y++)
+            {
+                for (uint x = 0; x < mipSize; x++)
+                {
+                    byte actual = *(basePointer + checked((nint)(y * mapped.RowPitch + x)));
+                    Assert.Equal(expected[checked((int)(y * mipSize + x))], actual);
+                }
+            }
+        }
+        finally
+        {
+            GD.Unmap(capture, subresource);
+        }
+    }
+
+    [SkippableFact]
+    public unsafe void CommandListCompressedEdgeMipUploadRetainsPayload()
+    {
+        const PixelFormat format = PixelFormat.BC1_Rgba_UNorm;
+        Skip.IfNot(
+            GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Sampled) &&
+            GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Staging),
+            $"{format} does not support compressed staging readback on {GD.BackendType}.");
+
+        TextureDescription description = TextureDescription.Texture2D(
+            7,
+            5,
+            2,
+            1,
+            format,
+            TextureUsage.Sampled);
+        Texture destination = RF.CreateTexture(description);
+        description.Usage = TextureUsage.Staging;
+        Texture capture = RF.CreateTexture(description);
+        byte[] source = { 3, 5, 8, 13, 21, 34, 55, 89 };
+        byte[] expected = source.ToArray();
+        CommandList commandList = RF.CreateCommandList();
+
+        commandList.Begin();
+        commandList.UpdateTexture(
+            destination,
+            source,
+            0,
+            0,
+            0,
+            3,
+            2,
+            1,
+            1,
+            0);
+        Array.Fill(source, (byte)0xCC);
+        commandList.CopyTexture(
+            destination, 0, 0, 0, 1, 0,
+            capture, 0, 0, 0, 1, 0,
+            3, 2, 1, 1);
+        commandList.End();
+        GD.SubmitCommands(commandList);
+        GD.WaitForIdle();
+
+        uint subresource = capture.CalculateSubresource(1, 0);
+        MappedResourceView<byte> mapped = GD.Map<byte>(capture, MapMode.Read, subresource);
+        try
+        {
+            for (uint i = 0; i < expected.Length; i++)
+                Assert.Equal(expected[i], mapped[i]);
+        }
+        finally
+        {
+            GD.Unmap(capture, subresource);
+        }
+    }
+
+    [SkippableFact]
+    public unsafe void CommandListCompressedOffsetEdgeUploadRetainsPayload()
+    {
+        const PixelFormat format = PixelFormat.BC1_Rgba_UNorm;
+        Skip.IfNot(
+            GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Sampled) &&
+            GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Staging),
+            $"{format} does not support compressed staging readback on {GD.BackendType}.");
+
+        TextureDescription description = TextureDescription.Texture2D(
+            10,
+            10,
+            1,
+            1,
+            format,
+            TextureUsage.Sampled);
+        Texture destination = RF.CreateTexture(description);
+        description.Usage = TextureUsage.Staging;
+        Texture capture = RF.CreateTexture(description);
+        byte[] initial = new byte[3 * 3 * 8];
+        byte[] source = Enumerable.Range(0, 4 * 8)
+            .Select(index => checked((byte)(17 + index)))
+            .ToArray();
+        byte[] expected = source.ToArray();
+        CommandList commandList = RF.CreateCommandList();
+
+        commandList.Begin();
+        commandList.UpdateTexture(
+            destination,
+            initial,
+            0, 0, 0,
+            10, 10, 1,
+            0, 0);
+        commandList.UpdateTexture(
+            destination,
+            source,
+            4, 4, 0,
+            6, 6, 1,
+            0, 0);
+        Array.Fill(source, (byte)0xCC);
+        commandList.CopyTexture(destination, capture);
+        commandList.End();
+        GD.SubmitCommands(commandList);
+        GD.WaitForIdle();
+
+        MappedResource mapped = GD.Map(capture, MapMode.Read);
+        try
+        {
+            byte* basePointer = (byte*)mapped.Data;
+            for (uint blockY = 0; blockY < 2; blockY++)
+            {
+                for (uint blockX = 0; blockX < 2; blockX++)
+                {
+                    for (uint byteInBlock = 0; byteInBlock < 8; byteInBlock++)
+                    {
+                        uint expectedOffset =
+                            ((blockY * 2u + blockX) * 8u) + byteInBlock;
+                        nuint actualOffset = checked(
+                            ((nuint)(blockY + 1u) * mapped.RowPitch) +
+                            ((nuint)(blockX + 1u) * 8u) +
+                            byteInBlock);
+                        Assert.Equal(
+                            expected[expectedOffset],
+                            *(basePointer + checked((nint)actualOffset)));
+                    }
+                }
+            }
+        }
+        finally
+        {
+            GD.Unmap(capture);
+        }
+    }
+
+    [Fact]
     public void Map_Succeeds()
     {
         Texture texture = RF.CreateTexture(

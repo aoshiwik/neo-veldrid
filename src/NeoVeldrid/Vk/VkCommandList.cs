@@ -59,6 +59,7 @@ internal unsafe class VkCommandList : CommandList
     private readonly List<VkBuffer> _availableStagingBuffers;
     private readonly int _maximumInFlightSubmissionCount;
     private readonly int _initialTrackedResourceCapacityPerSubmission;
+    private readonly uint _initialStagingUploadPageSize;
 
     public CommandPool CommandPool => _pool;
     public CommandBuffer CommandBuffer => _cb;
@@ -82,6 +83,8 @@ internal unsafe class VkCommandList : CommandList
         _initialTrackedResourceCapacityPerSubmission = ResolveCapacity(
             description.InitialTrackedResourceCapacityPerSubmission,
             nameof(description.InitialTrackedResourceCapacityPerSubmission));
+        _initialStagingUploadPageSize =
+            description.InitialStagingUploadPageSize;
         _availableCommandBuffers =
             new Queue<CommandBuffer>(_maximumInFlightSubmissionCount);
         _submittedCommandBuffers =
@@ -92,7 +95,9 @@ internal unsafe class VkCommandList : CommandList
         _availableStagingInfos =
             new List<StagingResourceInfo>(_maximumInFlightSubmissionCount);
         _availableStagingBuffers =
-            new List<VkBuffer>(RetainedStagingBufferCapacity);
+            new List<VkBuffer>(Math.Max(
+                RetainedStagingBufferCapacity,
+                _maximumInFlightSubmissionCount));
         for (int i = 0; i < _maximumInFlightSubmissionCount; i++)
         {
             _availableStagingInfos.Add(new StagingResourceInfo(
@@ -108,9 +113,36 @@ internal unsafe class VkCommandList : CommandList
         };
         Result result = _gd.Vk.CreateCommandPool(_gd.Device, in poolCI, null, out _pool);
         CheckResult(result);
+        try
+        {
+            int retainedUploadPageCount =
+                _initialStagingUploadPageSize == 0u
+                    ? 0
+                    : Math.Max(1, _maximumInFlightSubmissionCount);
+            for (int i = 0; i < retainedUploadPageCount; i++)
+            {
+                VkBuffer uploadPage =
+                    (VkBuffer)_gd.ResourceFactory.CreateBuffer(
+                        new BufferDescription(
+                            _initialStagingUploadPageSize,
+                            BufferUsage.Staging));
+                _availableStagingBuffers.Add(uploadPage);
+                uploadPage.Name =
+                    $"Retained Upload Page {i} (CommandList {_name})";
+            }
 
-        _cb = GetNextCommandBuffer();
-        RefCount = new ResourceRefCount(DisposeCore);
+            _cb = GetNextCommandBuffer();
+            RefCount = new ResourceRefCount(DisposeCore);
+        }
+        catch
+        {
+            foreach (VkBuffer uploadPage in _availableStagingBuffers)
+                uploadPage.Dispose();
+            _availableStagingBuffers.Clear();
+            _gd.Vk.DestroyCommandPool(_gd.Device, _pool, null);
+            _pool = default;
+            throw;
+        }
     }
 
     private static int ResolveCapacity(uint value, string parameterName)
@@ -149,6 +181,7 @@ internal unsafe class VkCommandList : CommandList
     public void CommandBufferSubmitted(CommandBuffer cb)
     {
         StagingResourceInfo info = _currentStagingInfo;
+        info.ImageLayouts.ValidateSubmissionOrder();
         foreach (VkBuffer buffer in info.Buffers)
         {
             try
@@ -189,6 +222,21 @@ internal unsafe class VkCommandList : CommandList
                 RefCount.Decrement();
             throw;
         }
+    }
+
+    public void CommandBufferSubmissionSucceeded(CommandBuffer cb)
+    {
+        StagingResourceInfo info;
+        lock (_stagingLock)
+        {
+            if (!_submittedStagingInfos.TryGetValue(cb, out info))
+            {
+                throw new NeoVeldridException(
+                    "A successful Vulkan command-buffer submission had no prepared resource transaction.");
+            }
+        }
+
+        info.ImageLayouts.CommitAfterSubmission();
     }
 
     public void CommandBufferSubmissionFailed(CommandBuffer cb)
@@ -271,13 +319,14 @@ internal unsafe class VkCommandList : CommandList
         }
         if (_commandBufferEnded)
         {
-            _commandBufferEnded = false;
             if (_currentStagingInfo != null)
             {
+                _currentStagingInfo.ImageLayouts.Rollback();
                 RecycleAbandonedEndedCommandBuffer(_cb);
                 RecycleStagingInfo(_currentStagingInfo);
             }
 
+            _commandBufferEnded = false;
             _currentStagingInfo = GetStagingResourceInfo();
             _cb = GetNextCommandBuffer();
         }
@@ -514,7 +563,14 @@ internal unsafe class VkCommandList : CommandList
         for (int i = 0; i < sampledTextures.Count; i++)
         {
             VkTexture tex = sampledTextures[i];
-            tex.TransitionImageLayout(_cb, 0, tex.MipLevels, 0, tex.ActualArrayLayers, layout);
+            tex.TransitionImageLayout(
+                _cb,
+                0,
+                tex.MipLevels,
+                0,
+                tex.ActualArrayLayers,
+                layout,
+                _currentStagingInfo.ImageLayouts);
         }
     }
 
@@ -587,8 +643,14 @@ internal unsafe class VkCommandList : CommandList
             DstSubresource = new ImageSubresourceLayers { LayerCount = 1, AspectMask = aspectFlags }
         };
 
-        vkSource.TransitionImageLayout(_cb, 0, 1, 0, 1, ImageLayout.TransferSrcOptimal);
-        vkDestination.TransitionImageLayout(_cb, 0, 1, 0, 1, ImageLayout.TransferDstOptimal);
+        vkSource.TransitionImageLayout(
+            _cb, 0, 1, 0, 1,
+            ImageLayout.TransferSrcOptimal,
+            _currentStagingInfo.ImageLayouts);
+        vkDestination.TransitionImageLayout(
+            _cb, 0, 1, 0, 1,
+            ImageLayout.TransferDstOptimal,
+            _currentStagingInfo.ImageLayouts);
 
         _gd.Vk.CmdResolveImage(
             _cb,
@@ -601,7 +663,10 @@ internal unsafe class VkCommandList : CommandList
 
         if ((vkDestination.Usage & TextureUsage.Sampled) != 0)
         {
-            vkDestination.TransitionImageLayout(_cb, 0, 1, 0, 1, ImageLayout.ShaderReadOnlyOptimal);
+            vkDestination.TransitionImageLayout(
+                _cb, 0, 1, 0, 1,
+                ImageLayout.ShaderReadOnlyOptimal,
+                _currentStagingInfo.ImageLayouts);
         }
     }
 
@@ -622,7 +687,9 @@ internal unsafe class VkCommandList : CommandList
         if (_activeRenderPass.Handle != default)
         {
             EndCurrentRenderPass();
-            _currentFramebuffer.TransitionToFinalLayout(_cb);
+            _currentFramebuffer.TransitionToFinalLayout(
+                _cb,
+                _currentStagingInfo.ImageLayouts);
         }
 
         Result result = _gd.Vk.EndCommandBuffer(_cb);
@@ -648,7 +715,9 @@ internal unsafe class VkCommandList : CommandList
 
         if (_currentFramebuffer != null)
         {
-            _currentFramebuffer.TransitionToFinalLayout(_cb);
+            _currentFramebuffer.TransitionToFinalLayout(
+                _cb,
+                _currentStagingInfo.ImageLayouts);
         }
 
         VkFramebufferBase vkFB = Util.AssertSubtype<Framebuffer, VkFramebufferBase>(fb);
@@ -723,6 +792,12 @@ internal unsafe class VkCommandList : CommandList
             renderPassBI.RenderPass = _newFramebuffer
                 ? _currentFramebuffer.RenderPassNoClear_Init
                 : _currentFramebuffer.RenderPassNoClear_Load;
+            _currentFramebuffer.PrepareForRenderPass(
+                _cb,
+                _newFramebuffer
+                    ? VkRenderPassInitialLayoutKind.FirstUse
+                    : VkRenderPassInitialLayoutKind.Continuation,
+                _currentStagingInfo.ImageLayouts);
             _gd.Vk.CmdBeginRenderPass(_cb, in renderPassBI, SubpassContents.Inline);
             _activeRenderPass = renderPassBI.RenderPass;
 
@@ -754,6 +829,10 @@ internal unsafe class VkCommandList : CommandList
         {
             // We have clear values for every attachment.
             renderPassBI.RenderPass = _currentFramebuffer.RenderPassClear;
+            _currentFramebuffer.PrepareForRenderPass(
+                _cb,
+                VkRenderPassInitialLayoutKind.Discard,
+                _currentStagingInfo.ImageLayouts);
             fixed (ClearValue* clearValuesPtr = &_clearValues[0])
             {
                 renderPassBI.ClearValueCount = attachmentCount;
@@ -776,7 +855,9 @@ internal unsafe class VkCommandList : CommandList
     {
         Debug.Assert(_activeRenderPass.Handle != default);
         _gd.Vk.CmdEndRenderPass(_cb);
-        _currentFramebuffer.TransitionToIntermediateLayout(_cb);
+        _currentFramebuffer.TransitionToIntermediateLayout(
+            _cb,
+            _currentStagingInfo.ImageLayouts);
         _activeRenderPass = default;
     }
 
@@ -946,6 +1027,56 @@ internal unsafe class VkCommandList : CommandList
         CopyBuffer(staging.Buffer, staging.Offset, buffer, bufferOffsetInBytes, sizeInBytes);
     }
 
+    private protected override void UpdateTextureCore(
+        Texture texture,
+        IntPtr source,
+        uint sizeInBytes,
+        uint x,
+        uint y,
+        uint z,
+        uint width,
+        uint height,
+        uint depth,
+        uint mipLevel,
+        uint arrayLayer)
+    {
+        EnsureNoRenderPass();
+
+        // Reuse the command list's submission-owned staging pages. The page is
+        // retained until this exact command buffer completes, so later frames
+        // cannot overwrite bytes which Vulkan is still reading.
+        uint stagingAlignment =
+            VkTextureUploadRecorder.GetRequiredStagingAlignment(
+                texture.Format);
+        StagingBufferAllocation staging = AllocateStagingBuffer(
+            sizeInBytes,
+            stagingAlignment);
+        _gd.UpdateBuffer(
+            staging.Buffer,
+            staging.Offset,
+            source,
+            sizeInBytes);
+        TrackBuffer(staging.Buffer);
+
+        VkTexture destination = Util.AssertSubtype<Texture, VkTexture>(texture);
+        _currentStagingInfo.Resources.Add(destination.RefCount);
+        VkTextureUploadRecorder.Record(
+            _gd,
+            _cb,
+            staging.Buffer,
+            staging.Offset,
+            destination,
+            x,
+            y,
+            z,
+            width,
+            height,
+            depth,
+            mipLevel,
+            arrayLayer,
+            _currentStagingInfo.ImageLayouts);
+    }
+
     private protected override void CopyBufferCore(
         DeviceBuffer source,
         uint sourceOffset,
@@ -988,7 +1119,8 @@ internal unsafe class VkCommandList : CommandList
             _cb,
             source, srcX, srcY, srcZ, srcMipLevel, srcBaseArrayLayer,
             destination, dstX, dstY, dstZ, dstMipLevel, dstBaseArrayLayer,
-            width, height, depth, layerCount);
+            width, height, depth, layerCount,
+            _currentStagingInfo.ImageLayouts);
 
         VkTexture srcVkTexture = Util.AssertSubtype<Texture, VkTexture>(source);
         _currentStagingInfo.Resources.Add(srcVkTexture.RefCount);
@@ -1008,7 +1140,8 @@ internal unsafe class VkCommandList : CommandList
         uint dstMipLevel,
         uint dstBaseArrayLayer,
         uint width, uint height, uint depth,
-        uint layerCount)
+        uint layerCount,
+        VkImageLayoutTransaction transaction = null)
     {
         VkTexture srcVkTexture = Util.AssertSubtype<Texture, VkTexture>(source);
         VkTexture dstVkTexture = Util.AssertSubtype<Texture, VkTexture>(destination);
@@ -1048,21 +1181,26 @@ internal unsafe class VkCommandList : CommandList
                 Extent = new Extent3D { Width = width, Height = height, Depth = depth }
             };
 
-            srcVkTexture.TransitionImageLayout(
+            VkTextureUploadRecorder.ImageLayoutSnapshot sourceLayouts =
+                VkTextureUploadRecorder.PrepareImageForTransferRead(
                 cb,
+                srcVkTexture,
                 srcMipLevel,
                 1,
                 srcBaseArrayLayer,
                 layerCount,
-                ImageLayout.TransferSrcOptimal);
+                transaction);
 
-            dstVkTexture.TransitionImageLayout(
+            VkTextureUploadRecorder.ImageLayoutSnapshot destinationLayouts =
+                VkTextureUploadRecorder.PrepareImageForTransferWrite(
+                vk,
                 cb,
+                dstVkTexture,
                 dstMipLevel,
                 1,
                 dstBaseArrayLayer,
                 layerCount,
-                ImageLayout.TransferDstOptimal);
+                transaction);
 
             vk.CmdCopyImage(
                 cb,
@@ -1073,27 +1211,14 @@ internal unsafe class VkCommandList : CommandList
                 1,
                 in region);
 
-            if ((srcVkTexture.Usage & TextureUsage.Sampled) != 0)
-            {
-                srcVkTexture.TransitionImageLayout(
-                    cb,
-                    srcMipLevel,
-                    1,
-                    srcBaseArrayLayer,
-                    layerCount,
-                    ImageLayout.ShaderReadOnlyOptimal);
-            }
-
-            if ((dstVkTexture.Usage & TextureUsage.Sampled) != 0)
-            {
-                dstVkTexture.TransitionImageLayout(
-                    cb,
-                    dstMipLevel,
-                    1,
-                    dstBaseArrayLayer,
-                    layerCount,
-                    ImageLayout.ShaderReadOnlyOptimal);
-            }
+            VkTextureUploadRecorder.RestoreImageAfterTransferRead(
+                cb,
+                sourceLayouts,
+                transaction);
+            VkTextureUploadRecorder.RestoreImageAfterTransferWrite(
+                cb,
+                destinationLayouts,
+                transaction);
         }
         else if (sourceIsStaging && !destIsStaging)
         {
@@ -1101,13 +1226,16 @@ internal unsafe class VkCommandList : CommandList
             SubresourceLayout srcLayout = srcVkTexture.GetSubresourceLayout(
                 srcVkTexture.CalculateSubresource(srcMipLevel, srcBaseArrayLayer));
             VkImageHandle dstImage = dstVkTexture.OptimalDeviceImage;
-            dstVkTexture.TransitionImageLayout(
+            VkTextureUploadRecorder.ImageLayoutSnapshot destinationLayouts =
+                VkTextureUploadRecorder.PrepareImageForTransferWrite(
+                vk,
                 cb,
+                dstVkTexture,
                 dstMipLevel,
                 1,
                 dstBaseArrayLayer,
                 layerCount,
-                ImageLayout.TransferDstOptimal);
+                transaction);
 
             ImageSubresourceLayers dstSubresource = new ImageSubresourceLayers
             {
@@ -1144,27 +1272,23 @@ internal unsafe class VkCommandList : CommandList
 
             vk.CmdCopyBufferToImage(cb, srcBuffer, dstImage, ImageLayout.TransferDstOptimal, 1, in regions);
 
-            if ((dstVkTexture.Usage & TextureUsage.Sampled) != 0)
-            {
-                dstVkTexture.TransitionImageLayout(
-                    cb,
-                    dstMipLevel,
-                    1,
-                    dstBaseArrayLayer,
-                    layerCount,
-                    ImageLayout.ShaderReadOnlyOptimal);
-            }
+            VkTextureUploadRecorder.RestoreImageAfterTransferWrite(
+                cb,
+                destinationLayouts,
+                transaction);
         }
         else if (!sourceIsStaging && destIsStaging)
         {
             VkImageHandle srcImage = srcVkTexture.OptimalDeviceImage;
-            srcVkTexture.TransitionImageLayout(
+            VkTextureUploadRecorder.ImageLayoutSnapshot sourceLayouts =
+                VkTextureUploadRecorder.PrepareImageForTransferRead(
                 cb,
+                srcVkTexture,
                 srcMipLevel,
                 1,
                 srcBaseArrayLayer,
                 layerCount,
-                ImageLayout.TransferSrcOptimal);
+                transaction);
 
             VkBufferHandle dstBuffer = dstVkTexture.StagingBuffer;
 
@@ -1216,16 +1340,10 @@ internal unsafe class VkCommandList : CommandList
 
             vk.CmdCopyImageToBuffer(cb, srcImage, ImageLayout.TransferSrcOptimal, dstBuffer, layerCount, layers);
 
-            if ((srcVkTexture.Usage & TextureUsage.Sampled) != 0)
-            {
-                srcVkTexture.TransitionImageLayout(
-                    cb,
-                    srcMipLevel,
-                    1,
-                    srcBaseArrayLayer,
-                    layerCount,
-                    ImageLayout.ShaderReadOnlyOptimal);
-            }
+            VkTextureUploadRecorder.RestoreImageAfterTransferRead(
+                cb,
+                sourceLayouts,
+                transaction);
         }
         else
         {
@@ -1353,8 +1471,22 @@ internal unsafe class VkCommandList : CommandList
         uint depth = vkTex.Depth;
         for (uint level = 1; level < vkTex.MipLevels; level++)
         {
-            vkTex.TransitionImageLayoutNonmatching(_cb, level - 1, 1, 0, layerCount, ImageLayout.TransferSrcOptimal);
-            vkTex.TransitionImageLayoutNonmatching(_cb, level, 1, 0, layerCount, ImageLayout.TransferDstOptimal);
+            vkTex.TransitionImageLayoutNonmatching(
+                _cb,
+                level - 1,
+                1,
+                0,
+                layerCount,
+                ImageLayout.TransferSrcOptimal,
+                _currentStagingInfo.ImageLayouts);
+            vkTex.TransitionImageLayoutNonmatching(
+                _cb,
+                level,
+                1,
+                0,
+                layerCount,
+                ImageLayout.TransferDstOptimal,
+                _currentStagingInfo.ImageLayouts);
 
             VkImageHandle deviceImage = vkTex.OptimalDeviceImage;
             uint mipWidth = Math.Max(width >> 1, 1);
@@ -1397,7 +1529,14 @@ internal unsafe class VkCommandList : CommandList
 
         if ((vkTex.Usage & TextureUsage.Sampled) != 0)
         {
-            vkTex.TransitionImageLayoutNonmatching(_cb, 0, vkTex.MipLevels, 0, layerCount, ImageLayout.ShaderReadOnlyOptimal);
+            vkTex.TransitionImageLayoutNonmatching(
+                _cb,
+                0,
+                vkTex.MipLevels,
+                0,
+                layerCount,
+                ImageLayout.ShaderReadOnlyOptimal,
+                _currentStagingInfo.ImageLayouts);
         }
     }
 
@@ -1460,14 +1599,20 @@ internal unsafe class VkCommandList : CommandList
         }
     }
 
-    private StagingBufferAllocation AllocateStagingBuffer(uint size)
+    private StagingBufferAllocation AllocateStagingBuffer(
+        uint size,
+        uint alignment = BufferCopyAlignment)
     {
         if (size == 0)
             throw new ArgumentOutOfRangeException(nameof(size));
+        if (alignment == 0)
+            throw new ArgumentOutOfRangeException(nameof(alignment));
 
         lock (_stagingLock)
         {
-            uint offset = AlignUp(_currentStagingInfo.CurrentUploadOffset, BufferCopyAlignment);
+            uint offset = AlignUp(
+                _currentStagingInfo.CurrentUploadOffset,
+                alignment);
             VkBuffer current = _currentStagingInfo.CurrentUploadBuffer;
             if (current != null &&
                 offset <= current.SizeInBytes &&
@@ -1477,9 +1622,11 @@ internal unsafe class VkCommandList : CommandList
                 return new StagingBufferAllocation(current, offset);
             }
 
-            uint requiredCapacity = Math.Max(
-                DefaultStagingUploadPageSize,
-                AlignUp(size, BufferCopyAlignment));
+            // A caller-provisioned page is already a retained capacity
+            // decision. Requiring it to meet the lazy-allocation default
+            // defeats small, exact preallocation and leaves that page idle
+            // while allocating a second, much larger page on first use.
+            uint requiredCapacity = AlignUp(size, alignment);
             VkBuffer ret = null;
             foreach (VkBuffer buffer in _availableStagingBuffers)
             {
@@ -1492,8 +1639,13 @@ internal unsafe class VkCommandList : CommandList
             }
             if (ret == null)
             {
+                uint createdCapacity = Math.Max(
+                    Math.Max(
+                        DefaultStagingUploadPageSize,
+                        _initialStagingUploadPageSize),
+                    requiredCapacity);
                 ret = (VkBuffer)_gd.ResourceFactory.CreateBuffer(
-                    new BufferDescription(requiredCapacity, BufferUsage.Staging));
+                    new BufferDescription(createdCapacity, BufferUsage.Staging));
                 ret.Name = $"Upload Page (CommandList {_name})";
             }
 
@@ -1581,6 +1733,7 @@ internal unsafe class VkCommandList : CommandList
     {
         if (!_destroyed)
         {
+            _currentStagingInfo?.ImageLayouts.Rollback();
             _destroyed = true;
             _gd.Vk.DestroyCommandPool(_gd.Device, _pool, null);
 
@@ -1633,6 +1786,8 @@ internal unsafe class VkCommandList : CommandList
         public VkBuffer CurrentUploadBuffer { get; set; }
         public uint CurrentUploadOffset { get; set; }
         public bool SubmissionReferencesAcquired { get; set; }
+        public VkImageLayoutTransaction ImageLayouts { get; } =
+            new VkImageLayoutTransaction();
 
         public StagingResourceInfo(
             int initialTrackedResourceCapacity,
@@ -1651,6 +1806,7 @@ internal unsafe class VkCommandList : CommandList
 
         public void Clear()
         {
+            ImageLayouts.ResetForReuse();
             BuffersUsed.Clear();
             Resources.Clear();
             Buffers.Clear();
