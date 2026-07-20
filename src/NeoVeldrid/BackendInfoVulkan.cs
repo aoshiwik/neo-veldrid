@@ -78,7 +78,9 @@ public class BackendInfoVulkan
     public string ActiveValidationLayer => _gd.ActiveValidationLayerName;
 
     /// <summary>
-    /// Gets the advertised revision of VK_EXT_validation_features. Synchronization validation requires revision 4.
+    /// Gets the VK_LAYER_KHRONOS_validation-advertised revision of VK_EXT_validation_features.
+    /// This value is diagnostic metadata; use <see cref="IsSynchronizationValidationActive"/>
+    /// for proved synchronization-validation activation.
     /// </summary>
     public uint ValidationFeaturesSpecVersion => _gd.ValidationFeaturesSpecVersion;
 

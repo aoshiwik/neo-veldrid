@@ -60,8 +60,8 @@
       "name": "Vulkan",
       "expectedDiscovered": {
         "algorithm": "sha256-trx-test-name-nul-v1",
-        "count": 571,
-        "sha256": "e29f76c70a41501dd25362dfa7f957f48b460e2940bd9e4d39bf79fd3e528f7a"
+        "count": 577,
+        "sha256": "625b9002631a8c3f74a9ccc2a53b61eea8bca2b22fd0742e155f5221cd9b8d4d"
       },
       "skipRules": [
         {

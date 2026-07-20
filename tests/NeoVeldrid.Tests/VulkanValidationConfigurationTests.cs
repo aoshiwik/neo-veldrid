@@ -47,12 +47,11 @@ public sealed class VulkanValidationConfigurationTests
     }
 
     [Fact]
-    public void RequiredSynchronizationRejectsOldValidationFeaturesRevision()
+    public void RequiredSynchronizationRejectsMissingValidationFeaturesExtension()
     {
         VkValidationCapabilities capabilities = CompleteCapabilities() with
         {
-            ValidationFeaturesSpecVersion =
-                VkValidationConfiguration.MinimumSynchronizationValidationFeaturesSpecVersion - 1,
+            ValidationFeaturesSpecVersion = 0,
         };
 
         NeoVeldridException exception = Assert.Throws<NeoVeldridException>(() =>
@@ -61,7 +60,7 @@ public sealed class VulkanValidationConfigurationTests
                 VulkanValidationMode.RequiredSynchronization,
                 capabilities));
 
-        Assert.Contains("revision 4", exception.Message);
+        Assert.Contains("VK_EXT_validation_features", exception.Message);
     }
 
     [Fact]
@@ -78,10 +77,97 @@ public sealed class VulkanValidationConfigurationTests
         Assert.True(configuration.EnableDebugUtils);
         Assert.True(configuration.EnableSynchronizationValidation);
         Assert.Equal(VkValidationLayer.Khronos, configuration.Layer);
-        Assert.Equal(
-            VkValidationConfiguration.MinimumSynchronizationValidationFeaturesSpecVersion,
-            configuration.ValidationFeaturesSpecVersion);
+        Assert.Equal(2u, configuration.ValidationFeaturesSpecVersion);
         Assert.Empty(configuration.InactiveReason);
+    }
+
+    [Fact]
+    public void RequiredSynchronizationDoesNotInferActivationFromAdvertisedRevision()
+    {
+        VkValidationConfiguration configuration =
+            VkValidationConfiguration.Resolve(
+                true,
+                VulkanValidationMode.RequiredSynchronization,
+                CompleteCapabilities() with { ValidationFeaturesSpecVersion = 1 });
+
+        Assert.True(configuration.EnableSynchronizationValidation);
+        Assert.Equal(1u, configuration.ValidationFeaturesSpecVersion);
+    }
+
+    [Theory]
+    [InlineData("WARNING-CreateInstance-status-message")]
+    [InlineData("UNASSIGNED-CreateInstance-status-message")]
+    [InlineData("UNASSIGNED-khronos-validation-createinstance-status-message")]
+    public void KhronosStatusMessageProvesSynchronizationActivation(string messageId)
+    {
+        GraphicsDeviceValidationMessage message = StatusMessage(
+            messageId,
+            "VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION");
+
+        Assert.True(
+            VkValidationConfiguration.IsSynchronizationValidationActivationEvidence(message));
+    }
+
+    [Fact]
+    public void CurrentKhronosStatusMessageProvesSynchronizationActivation()
+    {
+        GraphicsDeviceValidationMessage message = new GraphicsDeviceValidationMessage(
+            1,
+            GraphicsBackend.Vulkan,
+            GraphicsDeviceValidationSeverity.Information,
+            "VK_EXT_debug_utils",
+            "GeneralBitExt",
+            "CURRENT-VALIDATION-ENABLED",
+            "Current Validaiton Enabled:\n"
+                + "  - Core Checks\n"
+                + "  - Synchronization\n"
+                + "  - Stateless Parameter\n");
+
+        Assert.True(
+            VkValidationConfiguration.IsSynchronizationValidationActivationEvidence(message));
+    }
+
+    [Fact]
+    public void DisabledOrUnrelatedFeatureTextIsNotActivationEvidence()
+    {
+        GraphicsDeviceValidationMessage disabled = new GraphicsDeviceValidationMessage(
+            1,
+            GraphicsBackend.Vulkan,
+            GraphicsDeviceValidationSeverity.Information,
+            "VK_EXT_debug_utils",
+            "GeneralBitExt",
+            "WARNING-CreateInstance-status-message",
+            "Khronos Validation Layer Active:\n"
+                + "    Current Enables: None.\n"
+                + "    Current Disables: VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION.\n");
+        GraphicsDeviceValidationMessage unrelated = StatusMessage(
+            "NEOVELDRID-VULKAN-VALIDATION-ACTIVATION",
+            "VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION");
+        GraphicsDeviceValidationMessage prefixedFeature = StatusMessage(
+            "WARNING-CreateInstance-status-message",
+            "VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_FAKE");
+        GraphicsDeviceValidationMessage currentWithoutSynchronization =
+            new GraphicsDeviceValidationMessage(
+                1,
+                GraphicsBackend.Vulkan,
+                GraphicsDeviceValidationSeverity.Information,
+                "VK_EXT_debug_utils",
+                "GeneralBitExt",
+                "CURRENT-VALIDATION-ENABLED",
+                "Current Validaiton Enabled:\r\n"
+                    + "  - Core Checks\r\n"
+                    + "  - Stateless Parameter\r\n");
+
+        Assert.False(
+            VkValidationConfiguration.IsSynchronizationValidationActivationEvidence(disabled));
+        Assert.False(
+            VkValidationConfiguration.IsSynchronizationValidationActivationEvidence(unrelated));
+        Assert.False(
+            VkValidationConfiguration.IsSynchronizationValidationActivationEvidence(
+                prefixedFeature));
+        Assert.False(
+            VkValidationConfiguration.IsSynchronizationValidationActivationEvidence(
+                currentWithoutSynchronization));
     }
 
     [Fact]
@@ -123,7 +209,22 @@ public sealed class VulkanValidationConfigurationTests
             HasDebugUtils: true,
             HasStandardValidationLayer: true,
             HasKhronosValidationLayer: true,
-            ValidationFeaturesSpecVersion:
-                VkValidationConfiguration.MinimumSynchronizationValidationFeaturesSpecVersion);
+            // Khronos' own current validation-layer manifest advertises
+            // revision 2 while implementing later validation-feature enums.
+            ValidationFeaturesSpecVersion: 2);
+
+    private static GraphicsDeviceValidationMessage StatusMessage(
+        string messageId,
+        string enabledFeatures) =>
+        new GraphicsDeviceValidationMessage(
+            1,
+            GraphicsBackend.Vulkan,
+            GraphicsDeviceValidationSeverity.Information,
+            "VK_EXT_debug_utils",
+            "GeneralBitExt",
+            messageId,
+            "Khronos Validation Layer Active:\n"
+                + $"    Current Enables: {enabledFeatures}.\n"
+                + "    Current Disables: None.\n");
 }
 #endif

@@ -74,9 +74,11 @@ internal unsafe static class VulkanUtil
             throw new ArgumentNullException(nameof(extensionName));
         }
 
-        // A layer-specific validation feature must be advertised by that
-        // layer. A same-named implementation extension is not evidence that
-        // the selected layer understands the requested feature revision.
+        // A layer-specific validation-feature transport must be advertised by
+        // that layer. A same-named implementation extension is not evidence
+        // that the selected layer accepts the create-info. The advertised
+        // revision is retained for diagnostics; individual feature activation
+        // is proved from the selected validation layer itself.
         return GetInstanceExtensionSpecVersionCore(extensionName, layerName);
     }
 

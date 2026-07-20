@@ -59,8 +59,8 @@ public sealed unsafe class VulkanValidationDebugMessengerTests
             VulkanUtil.GetInstanceExtensionSpecVersion(
                 CommonStrings.VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME.ToString(),
                 khronosLayer)
-                >= VkValidationConfiguration.MinimumSynchronizationValidationFeaturesSpecVersion,
-            "NV-SKIP-VULKAN-SYNC-VALIDATION: VK_EXT_validation_features revision 4 or newer is unavailable on this host.");
+                != 0,
+            "NV-SKIP-VULKAN-SYNC-VALIDATION: VK_EXT_validation_features is unavailable from VK_LAYER_KHRONOS_validation on this host.");
 
         VulkanDeviceOptions options = new VulkanDeviceOptions(
             instanceExtensions: null,
@@ -74,9 +74,7 @@ public sealed unsafe class VulkanValidationDebugMessengerTests
         Assert.True(device.IsDebugActive);
         Assert.True(info.IsSynchronizationValidationActive);
         Assert.Equal(khronosLayer, info.ActiveValidationLayer);
-        Assert.True(
-            info.ValidationFeaturesSpecVersion
-                >= VkValidationConfiguration.MinimumSynchronizationValidationFeaturesSpecVersion);
+        Assert.NotEqual(0u, info.ValidationFeaturesSpecVersion);
         Assert.True(
             info.ValidationStatus.HasFeature(
                 GraphicsDeviceValidationFeatures.SynchronousMessageDelivery));

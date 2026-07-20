@@ -17,6 +17,8 @@ internal unsafe class OpenGLCommandExecutor
     private readonly OpenGLExtensions _extensions;
     private readonly OpenGLPlatformInfo _platformInfo;
     private readonly GraphicsDeviceFeatures _features;
+    private readonly OpenGLTextureCopyConverter _textureCopyConverter;
+    private readonly OpenGLTextureReadbackConverter _textureReadbackConverter;
 
     private Framebuffer _fb;
     private bool _isSwapchainFB;
@@ -48,6 +50,30 @@ internal unsafe class OpenGLCommandExecutor
         _stagingMemoryPool = gd.StagingMemoryPool;
         _platformInfo = platformInfo;
         _features = gd.Features;
+        _textureCopyConverter = new OpenGLTextureCopyConverter(gd, _textureSamplerManager);
+        _textureReadbackConverter = new OpenGLTextureReadbackConverter(gd, _textureSamplerManager);
+    }
+
+    internal void DestroyGLResources()
+    {
+        _textureCopyConverter.DestroyGLResources();
+        _textureReadbackConverter.DestroyGLResources();
+    }
+
+    internal void ReadR16G16UNorm(
+        OpenGLTexture source,
+        uint mipLevel,
+        uint width,
+        uint height,
+        void* destination)
+    {
+        _textureReadbackConverter.ReadR16G16UNorm(
+            source,
+            mipLevel,
+            width,
+            height,
+            destination);
+        InvalidateResourceBindingsAfterBackendProgram();
     }
 
     public void Begin()
@@ -1527,6 +1553,19 @@ internal unsafe class OpenGLCommandExecutor
         srcGLTexture.EnsureResourcesCreated();
         dstGLTexture.EnsureResourcesCreated();
 
+        bool sameLogicalFormatWithDifferentStorage = source.Format == destination.Format
+            && srcGLTexture.GLInternalFormat != dstGLTexture.GLInternalFormat;
+        if (sameLogicalFormatWithDifferentStorage)
+        {
+            CopyAcrossPhysicalFormatBoundary(
+                srcGLTexture,
+                srcX, srcY, srcZ, srcMipLevel, srcBaseArrayLayer,
+                dstGLTexture,
+                dstX, dstY, dstZ, dstMipLevel, dstBaseArrayLayer,
+                width, height, depth, layerCount);
+            return;
+        }
+
         if (_extensions.CopyImage && depth == 1)
         {
             // glCopyImageSubData does not work properly when depth > 1, so use the awful roundabout copy.
@@ -1556,6 +1595,77 @@ internal unsafe class OpenGLCommandExecutor
                     dstX, dstY, dstZ, dstMipLevel, dstLayer,
                     width, height, depth);
             }
+        }
+    }
+
+    private void CopyAcrossPhysicalFormatBoundary(
+        OpenGLTexture source,
+        uint srcX, uint srcY, uint srcZ,
+        uint srcMipLevel,
+        uint srcBaseArrayLayer,
+        OpenGLTexture destination,
+        uint dstX, uint dstY, uint dstZ,
+        uint dstMipLevel,
+        uint dstBaseArrayLayer,
+        uint width, uint height, uint depth,
+        uint layerCount)
+    {
+        bool sourceIsDepth = (source.Usage & TextureUsage.DepthStencil) != 0;
+        bool destinationIsDepth = (destination.Usage & TextureUsage.DepthStencil) != 0;
+        if (sourceIsDepth
+            && !destinationIsDepth
+            && source.Format == PixelFormat.R32_Float
+            && source.Type == TextureType.Texture2D
+            && destination.Type == TextureType.Texture2D
+            && srcZ == 0
+            && dstZ == 0
+            && srcBaseArrayLayer == 0
+            && dstBaseArrayLayer == 0
+            && depth == 1
+            && layerCount == 1)
+        {
+            _textureCopyConverter.CopyDepthToR32Float(
+                source,
+                srcX, srcY, srcMipLevel,
+                destination,
+                dstX, dstY, dstMipLevel,
+                width, height);
+            InvalidateResourceBindingsAfterBackendProgram();
+            return;
+        }
+
+        if (sourceIsDepth)
+        {
+            throw new NeoVeldridException(
+                "This OpenGL texture copy crosses incompatible depth and color storage representations, "
+                + "and no lossless backend conversion exists for the requested format or texture shape.");
+        }
+
+        // Color staging data can be downloaded and uploaded through the depth
+        // texture's transfer format without asking CopyImageSubData to reinterpret
+        // incompatible internal storage.
+        for (uint layer = 0; layer < layerCount; layer++)
+        {
+            CopyRoundabout(
+                source, destination,
+                srcX, srcY, srcZ, srcMipLevel, srcBaseArrayLayer + layer,
+                dstX, dstY, dstZ, dstMipLevel, dstBaseArrayLayer + layer,
+                width, height, depth);
+        }
+    }
+
+    private void InvalidateResourceBindingsAfterBackendProgram()
+    {
+        // The converter restores the caller's program, but image unit zero is
+        // intentionally borrowed. Force either public pipeline to replay its
+        // bindings before its next dispatch/draw.
+        for (int i = 0; i < _newGraphicsResourceSets.Length; i++)
+        {
+            _newGraphicsResourceSets[i] = true;
+        }
+        for (int i = 0; i < _newComputeResourceSets.Length; i++)
+        {
+            _newComputeResourceSets[i] = true;
         }
     }
 

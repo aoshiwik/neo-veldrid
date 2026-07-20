@@ -1871,49 +1871,129 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
                                         uint curOffset = depthSliceSize * layer;
                                         uint readFB = _gd.GL.GenFramebuffer();
                                         CheckLastError();
-                                        _gd.GL.BindFramebuffer(FramebufferTarget.ReadFramebuffer, readFB);
-                                        CheckLastError();
+                                        StagingBlock transferBlock = default;
+                                        bool ownsTransferBlock = false;
+                                        try
+                                        {
+                                            _gd.GL.BindFramebuffer(FramebufferTarget.ReadFramebuffer, readFB);
+                                            CheckLastError();
 
-                                        if (texture.ArrayLayers > 1 || texture.Type == TextureType.Texture3D)
-                                        {
-                                            _gd.GL.FramebufferTextureLayer(
-                                                FramebufferTarget.ReadFramebuffer,
-                                                GLFramebufferAttachment.ColorAttachment0,
-                                                texture.Texture,
-                                                (int)mipLevel,
-                                                (int)curLayer);
-                                            CheckLastError();
-                                        }
-                                        else if (texture.Type == TextureType.Texture1D)
-                                        {
-                                            _gd.GL.FramebufferTexture1D(
-                                                FramebufferTarget.ReadFramebuffer,
-                                                GLFramebufferAttachment.ColorAttachment0,
-                                                TextureTarget.Texture1D,
-                                                texture.Texture,
-                                                (int)mipLevel);
-                                            CheckLastError();
-                                        }
-                                        else
-                                        {
-                                            _gd.GL.FramebufferTexture2D(
-                                                FramebufferTarget.ReadFramebuffer,
-                                                GLFramebufferAttachment.ColorAttachment0,
-                                                TextureTarget.Texture2D,
-                                                texture.Texture,
-                                                (int)mipLevel);
-                                            CheckLastError();
-                                        }
+                                            if (texture.ArrayLayers > 1 || texture.Type == TextureType.Texture3D)
+                                            {
+                                                _gd.GL.FramebufferTextureLayer(
+                                                    FramebufferTarget.ReadFramebuffer,
+                                                    GLFramebufferAttachment.ColorAttachment0,
+                                                    texture.Texture,
+                                                    (int)mipLevel,
+                                                    (int)curLayer);
+                                                CheckLastError();
+                                            }
+                                            else if (texture.Type == TextureType.Texture1D)
+                                            {
+                                                _gd.GL.FramebufferTexture1D(
+                                                    FramebufferTarget.ReadFramebuffer,
+                                                    GLFramebufferAttachment.ColorAttachment0,
+                                                    TextureTarget.Texture1D,
+                                                    texture.Texture,
+                                                    (int)mipLevel);
+                                                CheckLastError();
+                                            }
+                                            else
+                                            {
+                                                _gd.GL.FramebufferTexture2D(
+                                                    FramebufferTarget.ReadFramebuffer,
+                                                    GLFramebufferAttachment.ColorAttachment0,
+                                                    TextureTarget.Texture2D,
+                                                    texture.Texture,
+                                                    (int)mipLevel);
+                                                CheckLastError();
+                                            }
 
-                                        _gd.GL.ReadPixels(
-                                            0, 0,
-                                            mipWidth, mipHeight,
-                                            texture.GLPixelFormat,
-                                            texture.GLPixelType,
-                                            (byte*)block.Data + curOffset);
-                                        CheckLastError();
-                                        _gd.GL.DeleteFramebuffer(readFB);
-                                        CheckLastError();
+                                            FramebufferStatus framebufferStatus = (FramebufferStatus)_gd.GL.CheckFramebufferStatus(
+                                                FramebufferTarget.ReadFramebuffer);
+                                            CheckLastError();
+                                            if (framebufferStatus != FramebufferStatus.Complete)
+                                            {
+                                                throw new NeoVeldridException(
+                                                    "The OpenGL staging readback framebuffer is incomplete: "
+                                                    + framebufferStatus);
+                                            }
+
+                                            OpenGLReadPixelsTransfer transfer = OpenGLReadPixelsTransfer.Select(
+                                                texture.GLPixelFormat,
+                                                texture.GLPixelType,
+                                                texture.GLPixelFormat,
+                                                texture.GLPixelType);
+                                            bool encodedReadback = false;
+                                            if (_gd.BackendType == GraphicsBackend.OpenGLES)
+                                            {
+                                                // ES only guarantees RGBA/UNSIGNED_BYTE plus this
+                                                // framebuffer-specific pair. Prefer that pair when it
+                                                // losslessly widens the component vector (for example,
+                                                // Mesa exposes RG16 as RGBA/UNSIGNED_SHORT).
+                                                _gd.GL.GetInteger(GetPName.ImplementationColorReadFormat, out int implementationFormat);
+                                                CheckLastError();
+                                                _gd.GL.GetInteger(GetPName.ImplementationColorReadType, out int implementationType);
+                                                CheckLastError();
+                                                transfer = OpenGLReadPixelsTransfer.Select(
+                                                    texture.GLPixelFormat,
+                                                    texture.GLPixelType,
+                                                    (GLPixelFormat)implementationFormat,
+                                                    (PixelType)implementationType);
+                                                encodedReadback = texture.Format == PixelFormat.R16_G16_UNorm
+                                                    && transfer.Format == texture.GLPixelFormat
+                                                    && transfer.Type == texture.GLPixelType
+                                                    && (implementationFormat != (int)texture.GLPixelFormat
+                                                        || implementationType != (int)texture.GLPixelType);
+                                            }
+
+                                            void* transferDestination = (byte*)block.Data + curOffset;
+                                            if (encodedReadback)
+                                            {
+                                                _gd._commandExecutor.ReadR16G16UNorm(
+                                                    texture,
+                                                    mipLevel,
+                                                    mipWidth,
+                                                    mipHeight,
+                                                    transferDestination);
+                                            }
+                                            else if (transfer.RequiresCompaction)
+                                            {
+                                                uint transferSize = checked(
+                                                    mipWidth * mipHeight * transfer.SourcePixelSize);
+                                                transferBlock = _gd._stagingMemoryPool.GetStagingBlock(transferSize);
+                                                transferDestination = transferBlock.Data;
+                                                ownsTransferBlock = true;
+                                            }
+
+                                            if (!encodedReadback)
+                                            {
+                                                _gd.GL.ReadPixels(
+                                                    0, 0,
+                                                    mipWidth, mipHeight,
+                                                    transfer.Format,
+                                                    transfer.Type,
+                                                    transferDestination);
+                                                CheckLastError();
+
+                                                if (transfer.RequiresCompaction)
+                                                {
+                                                    transfer.Compact(
+                                                        transferBlock.Data,
+                                                        (byte*)block.Data + curOffset,
+                                                        checked(mipWidth * mipHeight));
+                                                }
+                                            }
+                                        }
+                                        finally
+                                        {
+                                            if (ownsTransferBlock)
+                                            {
+                                                _gd._stagingMemoryPool.Free(transferBlock);
+                                            }
+                                            _gd.GL.DeleteFramebuffer(readFB);
+                                            CheckLastError();
+                                        }
                                     }
                                 }
                             }
@@ -2796,6 +2876,10 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
                             _gd.GL.Flush();
                             _gd.GL.Finish();
                         },
+                        ignoreContextUnavailable: true,
+                        ref failures);
+                    AttemptPlatformCleanup(
+                        _gd._commandExecutor.DestroyGLResources,
                         ignoreContextUnavailable: true,
                         ref failures);
                     AttemptPlatformCleanup(

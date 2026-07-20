@@ -1017,6 +1017,8 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
                 AllocateValidationCallbackTarget();
             }
 
+            long instanceCreationValidationSequence = Validation.NextSequence;
+
             instanceCI.EnabledExtensionCount = instanceExtensionCount;
             instanceCI.PpEnabledExtensionNames = (byte**)instanceExtensions;
 
@@ -1060,7 +1062,9 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
 
             if (_validationConfiguration.EnableDebugUtils)
             {
-                ActivateDebugMessenger(in persistentDebugMessengerCI);
+                ActivateDebugMessenger(
+                    in persistentDebugMessengerCI,
+                    instanceCreationValidationSequence);
             }
 
             if (hasDeviceProperties2)
@@ -1126,7 +1130,8 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
     }
 
     private void ActivateDebugMessenger(
-        in DebugUtilsMessengerCreateInfoEXT debugMessengerCI)
+        in DebugUtilsMessengerCreateInfoEXT debugMessengerCI,
+        long instanceCreationValidationSequence)
     {
         if (!_vk.TryGetInstanceExtension(_instance, out _extDebugUtils))
         {
@@ -1148,6 +1153,16 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
             return;
         }
         _debugMessengerHandle = createdDebugMessenger;
+
+        if (_validationConfiguration.EnableSynchronizationValidation
+            && !Validation.HasMessageSince(
+                instanceCreationValidationSequence,
+                VkValidationConfiguration.IsSynchronizationValidationActivationEvidence))
+        {
+            HandleValidationActivationFailure(
+                "VK_LAYER_KHRONOS_validation did not report synchronization validation in its active feature set");
+            return;
+        }
 
         long activationSequence = Validation.NextSequence;
         const string activationMessageId =
