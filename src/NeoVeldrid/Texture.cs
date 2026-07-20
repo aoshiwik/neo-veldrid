@@ -10,6 +10,10 @@ public abstract class Texture : DeviceResource, MappableResource, IDisposable, B
 {
     private readonly object _fullTextureViewLock = new object();
     private TextureView _fullTextureView;
+    private bool _disposeRequested;
+    private bool _disposeInProgress;
+    private bool _disposeCompleted;
+    private bool _fullTextureViewDisposed;
 
     /// <summary>
     /// Calculates the subresource index, given a mipmap level and array layer.
@@ -70,12 +74,17 @@ public abstract class Texture : DeviceResource, MappableResource, IDisposable, B
     /// </summary>
     public abstract bool IsDisposed { get; }
 
-    bool BindableResource.IsBindable => !IsDisposed;
+    bool BindableResource.IsBindable => !_disposeRequested && !IsDisposed;
 
     internal TextureView GetFullTextureView(GraphicsDevice gd)
     {
         lock (_fullTextureViewLock)
         {
+            if (_disposeRequested || IsDisposed)
+            {
+                throw new ObjectDisposedException(GetType().Name);
+            }
+
             if (_fullTextureView == null)
             {
                 _fullTextureView = CreateFullTextureView(gd);
@@ -97,12 +106,51 @@ public abstract class Texture : DeviceResource, MappableResource, IDisposable, B
     {
         lock (_fullTextureViewLock)
         {
-            _fullTextureView?.Dispose();
+            if (_disposeCompleted || _disposeInProgress)
+                return;
 
-            // Held through DisposeCore so a concurrent GetFullTextureView can't
-            // build a view on a texture whose device resource is being freed.
-            DisposeCore();
+            // Once disposal starts, the public object remains unusable even
+            // if native cleanup reports a retryable failure.
+            _disposeRequested = true;
+            _disposeInProgress = true;
+            try
+            {
+                DisposeFullTextureViewLocked();
+
+                // Held through DisposeCore so a concurrent GetFullTextureView can't
+                // build a view on a texture whose device resource is being freed.
+                DisposeCore();
+                _disposeCompleted = true;
+            }
+            finally
+            {
+                // A failed backend cleanup leaves _disposeCompleted false, so
+                // another Dispose can resume its committed cleanup stages.
+                _disposeInProgress = false;
+            }
         }
+    }
+
+    /// <summary>
+    /// Releases the cached full view when a backend's retained native owner,
+    /// rather than the public caller, reaches its final release. This must not
+    /// re-enter <see cref="Dispose"/> because reference-counted texture
+    /// backends implement <see cref="DisposeCore"/> as the caller-reference
+    /// decrement.
+    /// </summary>
+    private protected void DisposeFullTextureView()
+    {
+        lock (_fullTextureViewLock)
+            DisposeFullTextureViewLocked();
+    }
+
+    private void DisposeFullTextureViewLocked()
+    {
+        if (_fullTextureViewDisposed)
+            return;
+
+        _fullTextureView?.Dispose();
+        _fullTextureViewDisposed = true;
     }
 
     private protected abstract void DisposeCore();

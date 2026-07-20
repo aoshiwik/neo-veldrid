@@ -33,6 +33,8 @@ public abstract class GraphicsDevice : IDisposable
     private ExceptionDispatchInfo _disposeFailure;
     private bool _deviceCreationComplete;
     private GraphicsDeviceValidation _validation;
+    private readonly object _textureUploadObserverFailureLock = new object();
+    private Queue<ExceptionDispatchInfo> _textureUploadObserverFailures;
     private Action _collectValidationMessages;
 
     internal GraphicsDevice() { }
@@ -112,6 +114,89 @@ public abstract class GraphicsDevice : IDisposable
 
     internal bool RequiresValidationBoundary =>
         _validation?.RequiresBoundaryChecks ?? false;
+
+    /// <summary>
+    /// Optional observer for the actual backend ownership of ordered texture
+    /// upload destinations. Backends invoke it only from the same acquire and
+    /// release boundaries that own the native resource.
+    /// </summary>
+    internal ICommandListTextureUploadLifecycleObserver
+        CommandListTextureUploadLifecycleObserver { get; set; }
+
+    internal void NotifyTextureUploadRetentionAcquired(
+        ICommandListTextureUploadLifecycleObserver observer,
+        CommandList commandList,
+        Texture destination)
+    {
+        try
+        {
+            observer.OnRetentionAcquired(commandList, destination);
+        }
+        catch (Exception exception)
+        {
+            RecordTextureUploadObserverFailure(exception);
+        }
+    }
+
+    internal void NotifyTextureUploadRetentionReleased(
+        ICommandListTextureUploadLifecycleObserver observer,
+        CommandList commandList,
+        int remainingBackendOwnershipCount)
+    {
+        try
+        {
+            observer.OnRetentionReleased(
+                commandList,
+                remainingBackendOwnershipCount);
+        }
+        catch (Exception exception)
+        {
+            RecordTextureUploadObserverFailure(exception);
+        }
+    }
+
+    /// <summary>
+    /// Rethrows failures deferred by the internal lifecycle observer seam.
+    /// Observer callbacks cannot be allowed to strand native ownership or
+    /// prevent backend state from being cleared, so tests inspect failures at
+    /// a safe boundary after the real cleanup has completed.
+    /// </summary>
+    internal void ThrowIfTextureUploadLifecycleObserverFailed()
+    {
+        ExceptionDispatchInfo[] failures;
+        lock (_textureUploadObserverFailureLock)
+        {
+            if (_textureUploadObserverFailures is null
+                || _textureUploadObserverFailures.Count == 0)
+            {
+                return;
+            }
+
+            failures = _textureUploadObserverFailures.ToArray();
+            _textureUploadObserverFailures.Clear();
+        }
+
+        if (failures.Length == 1)
+            failures[0].Throw();
+
+        var exceptions = new Exception[failures.Length];
+        for (int i = 0; i < failures.Length; i++)
+            exceptions[i] = failures[i].SourceException;
+
+        throw new AggregateException(
+            "Texture-upload lifecycle observer callbacks failed.",
+            exceptions);
+    }
+
+    private void RecordTextureUploadObserverFailure(Exception exception)
+    {
+        lock (_textureUploadObserverFailureLock)
+        {
+            (_textureUploadObserverFailures ??=
+                new Queue<ExceptionDispatchInfo>()).Enqueue(
+                    ExceptionDispatchInfo.Capture(exception));
+        }
+    }
 
     /// <summary>
     /// Gets the number of backend work items admitted ahead of the current

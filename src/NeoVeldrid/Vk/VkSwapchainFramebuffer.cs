@@ -19,8 +19,10 @@ internal unsafe class VkSwapchainFramebuffer : VkFramebufferBase
     private Format _scImageFormat;
     private Extent2D _scExtent;
     private FramebufferAttachment[][] _scColorTextures;
+    private bool[] _scColorTextureReleaseRequested;
 
     private FramebufferAttachment? _depthAttachment;
+    private bool _depthAttachmentReleaseRequested;
     private uint _desiredWidth;
     private uint _desiredHeight;
     private bool _destroyed;
@@ -145,7 +147,11 @@ internal unsafe class VkSwapchainFramebuffer : VkFramebufferBase
         (_scImageFormat, other._scImageFormat) = (other._scImageFormat, _scImageFormat);
         (_scExtent, other._scExtent) = (other._scExtent, _scExtent);
         (_scColorTextures, other._scColorTextures) = (other._scColorTextures, _scColorTextures);
+        (_scColorTextureReleaseRequested, other._scColorTextureReleaseRequested) =
+            (other._scColorTextureReleaseRequested, _scColorTextureReleaseRequested);
         (_depthAttachment, other._depthAttachment) = (other._depthAttachment, _depthAttachment);
+        (_depthAttachmentReleaseRequested, other._depthAttachmentReleaseRequested) =
+            (other._depthAttachmentReleaseRequested, _depthAttachmentReleaseRequested);
         (_desiredWidth, other._desiredWidth) = (other._desiredWidth, _desiredWidth);
         (_desiredHeight, other._desiredHeight) = (other._desiredHeight, _desiredHeight);
         (_currentImageIndex, other._currentImageIndex) = (other._currentImageIndex, _currentImageIndex);
@@ -171,6 +177,7 @@ internal unsafe class VkSwapchainFramebuffer : VkFramebufferBase
     {
         _scFramebuffers = new VkFramebuffer[_scImages.Length];
         _scColorTextures = new FramebufferAttachment[_scImages.Length][];
+        _scColorTextureReleaseRequested = new bool[_scImages.Length];
         for (uint i = 0; i < _scImages.Length; i++)
         {
             VkTexture colorTex = new VkTexture(
@@ -183,10 +190,13 @@ internal unsafe class VkSwapchainFramebuffer : VkFramebufferBase
                 TextureUsage.RenderTarget,
                 TextureSampleCount.Count1,
                 _scImages[i]);
+            _scColorTextures[i] = new FramebufferAttachment[]
+            {
+                new FramebufferAttachment(colorTex, 0)
+            };
             FramebufferDescription desc = new FramebufferDescription(_depthAttachment?.Target, colorTex);
             VkFramebuffer fb = new VkFramebuffer(_gd, ref desc, true);
             _scFramebuffers[i] = fb;
-            _scColorTextures[i] = new FramebufferAttachment[] { new FramebufferAttachment(colorTex, 0) };
         }
     }
 
@@ -282,7 +292,49 @@ internal unsafe class VkSwapchainFramebuffer : VkFramebufferBase
             if (framebuffersReleased)
             {
                 _scFramebuffers = null;
+            }
+
+            // Each swapchain color VkTexture starts with one wrapper-owned
+            // reference in addition to any transient command-list references.
+            // Retire that initial reference after the VkFramebuffer image
+            // views are gone, and wait for all transient owners before the
+            // parent swapchain is allowed to destroy the borrowed VkImages.
+            bool colorTexturesReleased = framebuffersReleased;
+            if (framebuffersReleased && _scColorTextures != null)
+            {
+                for (int i = 0; i < _scColorTextures.Length; i++)
+                {
+                    FramebufferAttachment[] colorAttachments = _scColorTextures[i];
+                    if (colorAttachments == null || colorAttachments.Length == 0)
+                        continue;
+
+                    Texture colorTexture = colorAttachments[0].Target;
+                    bool colorTextureReleased = colorTexture.IsDisposed;
+                    if (!colorTextureReleased
+                        && !_scColorTextureReleaseRequested[i])
+                    {
+                        bool releaseRequested = cleanup.Attempt(colorTexture.Dispose);
+                        _scColorTextureReleaseRequested[i] = releaseRequested;
+                        colorTextureReleased = releaseRequested
+                            && colorTexture.IsDisposed;
+                    }
+
+                    if (!colorTextureReleased)
+                    {
+                        colorTexturesReleased = false;
+                        if (_scColorTextureReleaseRequested[i])
+                        {
+                            cleanup.Add(new InvalidOperationException(
+                                "A Vulkan swapchain color texture retained native references during cleanup."));
+                        }
+                    }
+                }
+            }
+
+            if (colorTexturesReleased)
+            {
                 _scColorTextures = null;
+                _scColorTextureReleaseRequested = null;
                 _scImages = Array.Empty<Image>();
             }
 
@@ -291,21 +343,28 @@ internal unsafe class VkSwapchainFramebuffer : VkFramebufferBase
             if (framebuffersReleased && _depthAttachment != null)
             {
                 Texture depthTexture = _depthAttachment.Value.Target;
-                bool depthReleased = depthTexture.IsDisposed
-                    || (cleanup.Attempt(depthTexture.Dispose)
-                        && depthTexture.IsDisposed);
+                bool depthReleased = depthTexture.IsDisposed;
+                if (!depthReleased && !_depthAttachmentReleaseRequested)
+                {
+                    bool releaseRequested = cleanup.Attempt(depthTexture.Dispose);
+                    _depthAttachmentReleaseRequested = releaseRequested;
+                    depthReleased = releaseRequested && depthTexture.IsDisposed;
+                }
                 if (depthReleased)
                 {
                     _depthAttachment = null;
+                    _depthAttachmentReleaseRequested = false;
                 }
-                else if (!depthTexture.IsDisposed)
+                else if (_depthAttachmentReleaseRequested)
                 {
                     cleanup.Add(new InvalidOperationException(
                         "The Vulkan swapchain depth texture retained native resources during cleanup."));
                 }
             }
 
-            _destroyed = framebuffersReleased && _depthAttachment == null;
+            _destroyed = framebuffersReleased
+                && colorTexturesReleased
+                && _depthAttachment == null;
             cleanup.ThrowIfAny(
                 "Vulkan swapchain framebuffer cleanup encountered multiple failures.");
         }

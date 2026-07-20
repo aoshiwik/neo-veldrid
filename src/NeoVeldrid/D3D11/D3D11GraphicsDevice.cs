@@ -25,7 +25,7 @@ internal unsafe class D3D11GraphicsDevice : GraphicsDevice
     private readonly D3D11ResourceFactory _d3d11ResourceFactory;
     private readonly D3D11Swapchain _mainSwapchain;
     private readonly bool _supportsConcurrentResources;
-    private readonly bool _supportsCommandLists;
+    private readonly D3D11CommandListCapabilities _commandListCapabilities;
     private readonly int? _debugLayerProbeHResult;
     private readonly bool _debugDeviceCreated;
     private D3D11ValidationMessageQueue _validationMessages;
@@ -63,7 +63,8 @@ internal unsafe class D3D11GraphicsDevice : GraphicsDevice
 
     public bool SupportsConcurrentResources => _supportsConcurrentResources;
 
-    public bool SupportsCommandLists => _supportsCommandLists;
+    public D3D11CommandListCapabilities CommandListCapabilities =>
+        _commandListCapabilities;
 
     public int DeviceId => _deviceId;
 
@@ -290,7 +291,9 @@ internal unsafe class D3D11GraphicsDevice : GraphicsDevice
                     &threadingData,
                     (uint)sizeof(FeatureDataThreading)));
             _supportsConcurrentResources = threadingData.DriverConcurrentCreates;
-            _supportsCommandLists = threadingData.DriverCommandLists;
+            _commandListCapabilities = new D3D11CommandListCapabilities(
+                threadingData.DriverCommandLists,
+                options.DeferredTextureUploadMode);
 
             // Check double precision support
             FeatureDataDoubles doublesData = default;
@@ -888,6 +891,12 @@ internal unsafe class D3D11GraphicsDevice : GraphicsDevice
                 height,
                 depth,
                 mipLevel);
+            Box* nativeRegion = D3D11Util.IsFullTextureSubresource(
+                d3dTex,
+                mipLevel,
+                in resourceRegion)
+                ? null
+                : &resourceRegion;
 
             uint srcRowPitch = FormatHelpers.GetRowPitch(width, texture.Format);
             uint srcDepthPitch = FormatHelpers.GetDepthPitch(srcRowPitch, height, texture.Format);
@@ -896,7 +905,7 @@ internal unsafe class D3D11GraphicsDevice : GraphicsDevice
                 ((ID3D11DeviceContext*)_immediateContext)->UpdateSubresource(
                     d3dTex.DeviceTexture,
                     (uint)subresource,
-                    &resourceRegion,
+                    nativeRegion,
                     (void*)source,
                     srcRowPitch,
                     srcDepthPitch);

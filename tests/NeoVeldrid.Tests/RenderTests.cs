@@ -988,12 +988,16 @@ public abstract class RenderTests<T> : GraphicsDeviceTestBase<T> where T : Graph
                 1,
                 PixelFormat.R8_G8_B8_A8_UNorm,
                 TextureUsage.Sampled));
-        DeviceBuffer computeOutput = RF.CreateBuffer(new BufferDescription(
+        DeviceBuffer firstSampleOutput = RF.CreateBuffer(new BufferDescription(
+            16,
+            BufferUsage.StructuredBufferReadWrite,
+            16));
+        DeviceBuffer secondSampleOutput = RF.CreateBuffer(new BufferDescription(
             16,
             BufferUsage.StructuredBufferReadWrite,
             16));
         DeviceBuffer readback = RF.CreateBuffer(new BufferDescription(
-            16,
+            32,
             BufferUsage.Staging));
         ResourceLayout layout = RF.CreateResourceLayout(
             new ResourceLayoutDescription(
@@ -1009,12 +1013,18 @@ public abstract class RenderTests<T> : GraphicsDeviceTestBase<T> where T : Graph
                     "OutputBuffer",
                     ResourceKind.StructuredBufferReadWrite,
                     ShaderStages.Compute)));
-        ResourceSet resourceSet = RF.CreateResourceSet(
+        ResourceSet firstSampleSet = RF.CreateResourceSet(
             new ResourceSetDescription(
                 layout,
                 sampledTexture,
                 GD.PointSampler,
-                computeOutput));
+                firstSampleOutput));
+        ResourceSet secondSampleSet = RF.CreateResourceSet(
+            new ResourceSetDescription(
+                layout,
+                sampledTexture,
+                GD.PointSampler,
+                secondSampleOutput));
         Pipeline pipeline = RF.CreateComputePipeline(
             new ComputePipelineDescription(
                 TestShaders.LoadCompute(RF, "ComputeTextureSampler"),
@@ -1033,15 +1043,20 @@ public abstract class RenderTests<T> : GraphicsDeviceTestBase<T> where T : Graph
             1, 1, 1,
             0, 0);
         commandList.SetPipeline(pipeline);
-        commandList.SetComputeResourceSet(0, resourceSet);
+        commandList.SetComputeResourceSet(0, firstSampleSet);
         commandList.Dispatch(1, 1, 1);
         commandList.UpdateTexture(
             sampledTexture, green,
             0, 0, 0,
             1, 1, 1,
             0, 0);
+        commandList.SetComputeResourceSet(0, secondSampleSet);
         commandList.Dispatch(1, 1, 1);
-        commandList.CopyBuffer(computeOutput, 0, readback, 0, 16);
+        // Preserve each sample in a distinct output. If either upload is
+        // omitted or reordered, its corresponding assertion must fail rather
+        // than being hidden by the later dispatch.
+        commandList.CopyBuffer(firstSampleOutput, 0, readback, 0, 16);
+        commandList.CopyBuffer(secondSampleOutput, 0, readback, 16, 16);
         commandList.End();
         GD.SubmitCommands(commandList);
         GD.WaitForIdle();
@@ -1051,8 +1066,12 @@ public abstract class RenderTests<T> : GraphicsDeviceTestBase<T> where T : Graph
         try
         {
             Assert.Equal(
-                RgbaFloat.Green,
+                RgbaFloat.Red,
                 mapped[0],
+                RgbaFloatFuzzyComparer.Instance);
+            Assert.Equal(
+                RgbaFloat.Green,
+                mapped[1],
                 RgbaFloatFuzzyComparer.Instance);
         }
         finally
@@ -1064,7 +1083,9 @@ public abstract class RenderTests<T> : GraphicsDeviceTestBase<T> where T : Graph
     [Fact]
     public void CommandListTextureUpdatePreservesSuspendedFramebufferState()
     {
-        const uint size = 4;
+        const uint size = 6;
+        const uint stripeWidth = size / 3;
+        const uint uploadWidth = size - stripeWidth;
         Texture target = RF.CreateTexture(
             TextureDescription.Texture2D(
                 size,
@@ -1098,18 +1119,21 @@ public abstract class RenderTests<T> : GraphicsDeviceTestBase<T> where T : Graph
                     ShaderStages.Fragment)));
         ResourceSet resourceSet = RF.CreateResourceSet(
             new ResourceSetDescription(layout, input, GD.PointSampler));
+        RasterizerStateDescription rasterizer = RasterizerStateDescription.CullNone;
+        rasterizer.ScissorTestEnabled = true;
         Pipeline pipeline = RF.CreateGraphicsPipeline(
             new GraphicsPipelineDescription(
                 BlendStateDescription.SingleOverrideBlend,
                 DepthStencilStateDescription.Disabled,
-                RasterizerStateDescription.CullNone,
+                rasterizer,
                 PrimitiveTopology.TriangleStrip,
                 new ShaderSetDescription(
                     Array.Empty<VertexLayoutDescription>(),
                     TestShaders.LoadVertexFragment(RF, "FullScreenBlit")),
                 layout,
                 framebuffer.OutputDescription));
-        byte[] redPixel = { 255, 0, 0, 255 };
+        RgbaByte red = RgbaByte.Red;
+        RgbaByte[] redPixels = Enumerable.Repeat(red, checked((int)(uploadWidth * size))).ToArray();
         CommandList commandList = RF.CreateCommandList();
 
         commandList.Begin();
@@ -1117,18 +1141,28 @@ public abstract class RenderTests<T> : GraphicsDeviceTestBase<T> where T : Graph
         commandList.ClearColorTarget(0, RgbaFloat.Black);
         commandList.SetPipeline(pipeline);
         commandList.SetGraphicsResourceSet(0, resourceSet);
+        commandList.SetScissorRect(0, 0, 0, stripeWidth * 2, size);
+
+        // Each operation owns a stripe of the final oracle, and each adjacent
+        // pair overlaps. The first draw leaves the left stripe white. The
+        // ordered upload must overwrite the middle stripe with red.
         commandList.Draw(4);
         commandList.UpdateTexture(
             target,
-            redPixel,
-            1,
-            1,
+            redPixels,
+            stripeWidth,
             0,
-            1,
-            1,
+            0,
+            uploadWidth,
+            size,
             1,
             0,
             0);
+        // Do not rebind the framebuffer, pipeline, or resources. The resumed
+        // render pass must preserve them and restore white only in the right
+        // stripe. Removing or reordering any operation changes at least one
+        // independently asserted stripe.
+        commandList.SetScissorRect(0, stripeWidth * 2, 0, stripeWidth, size);
         commandList.Draw(4);
         commandList.End();
         GD.SubmitCommands(commandList);
@@ -1143,8 +1177,11 @@ public abstract class RenderTests<T> : GraphicsDeviceTestBase<T> where T : Graph
             {
                 for (uint x = 0; x < size; x++)
                 {
+                    RgbaByte expected = x >= stripeWidth && x < stripeWidth * 2
+                        ? red
+                        : RgbaByte.White;
                     Assert.Equal(
-                        new RgbaByte(255, 255, 255, 255),
+                        expected,
                         mapped[x, y]);
                 }
             }

@@ -199,6 +199,18 @@ public abstract class GraphicsDeviceTestBase<T> : IDisposable where T : Graphics
         }
     }
 
+    /// <summary>
+    /// Disposes a fixture-tracked resource at a behaviorally significant point
+    /// and prevents teardown from issuing a second Dispose request. If disposal
+    /// fails, the resource remains tracked so teardown can retry it.
+    /// </summary>
+    protected void DisposeTrackedResource(IDisposable resource)
+    {
+        ArgumentNullException.ThrowIfNull(resource);
+        resource.Dispose();
+        _factory.DisposeCollector.Remove(resource);
+    }
+
     public void Dispose()
     {
         List<Exception> failures = null;

@@ -2279,8 +2279,27 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
     {
         Format vkFormat = VkFormats.VdToVkPixelFormat(format, (usage & TextureUsage.DepthStencil) != 0);
         ImageType vkType = VkFormats.VdToVkTextureType(type);
-        ImageTiling tiling = usage == TextureUsage.Staging ? ImageTiling.Linear : ImageTiling.Optimal;
-        ImageUsageFlags vkUsage = VkFormats.VdToVkTextureUsage(usage);
+        bool isStaging = usage == TextureUsage.Staging;
+        if (isStaging && FormatHelpers.IsStencilFormat(format))
+        {
+            // Buffer-image copies expose one Vulkan aspect at a time. The
+            // public staging layout does not define separate packed depth and
+            // stencil planes, so advertising either combined format would be
+            // a false copy/readback contract.
+            properties = default;
+            return false;
+        }
+
+        // Vulkan staging textures are host-visible buffers, not linear images.
+        // Their format requirement is that a corresponding optimal image can
+        // participate in both directions of a buffer-image transfer. Querying
+        // linear image support here incorrectly rejected compressed staging on
+        // devices whose compressed formats are transfer-capable but cannot use
+        // linear tiling.
+        ImageTiling tiling = ImageTiling.Optimal;
+        ImageUsageFlags vkUsage = isStaging
+            ? ImageUsageFlags.TransferSrcBit | ImageUsageFlags.TransferDstBit
+            : VkFormats.VdToVkTextureUsage(usage);
 
         Result result = _vk.GetPhysicalDeviceImageFormatProperties(
             _physicalDevice,
@@ -2304,7 +2323,9 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
            vkProps.MaxExtent.Depth,
            vkProps.MaxMipLevels,
            vkProps.MaxArrayLayers,
-           (uint)vkProps.SampleCounts);
+           isStaging
+               ? (uint)SampleCountFlags.Count1Bit
+               : (uint)vkProps.SampleCounts);
         return true;
     }
 
@@ -2471,13 +2492,19 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
 
     private VkTexture GetFreeStagingTexture(uint width, uint height, uint depth, PixelFormat format)
     {
-        uint totalSize = FormatHelpers.GetRegionSize(width, height, depth, format);
+        uint totalSize = TextureStagingLayout.Create(
+            width,
+            height,
+            depth,
+            mipLevels: 1,
+            arrayLayers: 1,
+            format).TotalSizeInBytes;
         lock (_stagingResourcesLock)
         {
             for (int i = 0; i < _availableStagingTextures.Count; i++)
             {
                 VkTexture tex = _availableStagingTextures[i];
-                if (tex.Memory.Size >= totalSize)
+                if (tex.StagingBufferCapacity >= totalSize)
                 {
                     _availableStagingTextures.RemoveAt(i);
                     tex.SetStagingDimensions(width, height, depth, format);

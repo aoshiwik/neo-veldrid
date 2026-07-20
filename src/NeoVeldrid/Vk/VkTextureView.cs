@@ -6,7 +6,7 @@ namespace NeoVeldrid.Vk;
 internal unsafe class VkTextureView : TextureView
 {
     private readonly VkGraphicsDevice _gd;
-    private readonly ImageView _imageView;
+    private ImageView _imageView;
     private bool _destroyed;
     private string _name;
 
@@ -100,10 +100,15 @@ internal unsafe class VkTextureView : TextureView
 
     private void DisposeCore()
     {
-        if (!_destroyed)
+        if (_destroyed)
+            return;
+
+        if (_imageView.Handle != 0)
         {
-            _destroyed = true;
-            _gd.Vk.DestroyImageView(_gd.Device, ImageView, null);
+            _gd.Vk.DestroyImageView(_gd.Device, _imageView, null);
+            _imageView = default;
         }
+
+        _destroyed = _imageView.Handle == 0;
     }
 }

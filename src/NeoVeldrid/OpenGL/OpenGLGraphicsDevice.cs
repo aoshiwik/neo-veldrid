@@ -2219,17 +2219,21 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
             bool submitted = false;
             bool countIncremented = false;
             bool fencePrepared = false;
+            bool submissionAdmissionPrepared = false;
+            bool submissionAdmissionAccepted = false;
 
             lock (_gd._commandListDisposalLock)
             {
                 try
                 {
+                    entryList.PrepareSubmissionAdmission();
+                    submissionAdmissionPrepared = true;
                     fence?.BeginSubmission();
                     fencePrepared = fence != null;
                     _gd.IncrementCount(entryList.Parent);
                     countIncremented = true;
-                    submitted = true;
                     entryList.Parent.OnSubmitted(entryList);
+                    submitted = true;
                     if (executeInline)
                     {
                         EnsureAdmissionOpen();
@@ -2238,6 +2242,7 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
                     {
                         QueueWorkItem(workItem);
                     }
+                    submissionAdmissionAccepted = true;
                 }
                 catch (Exception admissionFailure)
                 {
@@ -2245,6 +2250,9 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
                     AddFailure(admissionFailure, ref failures);
                     try
                     {
+                        if (submissionAdmissionPrepared)
+                            entryList.CancelSubmissionAdmission();
+
                         if (countIncremented && submitted)
                         {
                             if (!_gd.CheckCommandListDisposal(entryList.Parent))
@@ -2280,6 +2288,13 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
                         failures);
                 }
             }
+
+            // Publish outside the command-list disposal lock so a blocking
+            // observer can dispose its caller-owned handles. ExecuteAll waits
+            // on the entry-list handshake and therefore cannot overtake this
+            // post-acceptance publication.
+            if (submissionAdmissionAccepted)
+                entryList.CompleteSubmissionAdmission();
 
             if (executeInline)
             {

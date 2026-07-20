@@ -15,6 +15,12 @@ internal class ResourceRefCount
         _refCount = 1;
     }
 
+    /// <summary>
+    /// Gets the currently-held native ownership count. This is an internal
+    /// lifecycle diagnostic; it does not itself acquire a reference.
+    /// </summary>
+    internal int CurrentCount => Volatile.Read(ref _refCount);
+
     public int Increment()
     {
         int ret = Interlocked.Increment(ref _refCount);

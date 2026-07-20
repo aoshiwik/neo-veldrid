@@ -31,6 +31,14 @@ internal interface OpenGLCommandEntryList
         uint x, uint y, uint z,
         uint width, uint height, uint depth,
         uint mipLevel, uint arrayLayer);
+
+    // These three methods form a transactional admission handshake for the
+    // optional lifecycle observer. Prepare prevents the execution thread from
+    // overtaking publication, Complete publishes only after queue acceptance,
+    // and Cancel releases the barrier when admission rolls back.
+    void PrepareSubmissionAdmission();
+    void CompleteSubmissionAdmission();
+    void CancelSubmissionAdmission();
     void ExecuteAll(OpenGLCommandExecutor executor);
     void DispatchIndirect(DeviceBuffer indirectBuffer, uint offset);
     void CopyBuffer(DeviceBuffer source, uint sourceOffset, DeviceBuffer destination, uint destinationOffset, uint sizeInBytes);

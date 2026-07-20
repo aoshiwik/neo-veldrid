@@ -385,7 +385,7 @@ internal static unsafe class VkTextureUploadRecorder
             Image = destination.OptimalDeviceImage,
             SubresourceRange = new ImageSubresourceRange
             {
-                AspectMask = GetImageAspectMask(destination),
+                AspectMask = destination.ImageAspectMask,
                 BaseMipLevel = baseMipLevel,
                 LevelCount = levelCount,
                 BaseArrayLayer = baseArrayLayer,
@@ -405,13 +405,4 @@ internal static unsafe class VkTextureUploadRecorder
             &barrier);
     }
 
-    private static ImageAspectFlags GetImageAspectMask(VkTexture texture)
-    {
-        if ((texture.Usage & TextureUsage.DepthStencil) == 0)
-            return ImageAspectFlags.ColorBit;
-
-        return FormatHelpers.IsStencilFormat(texture.Format)
-            ? ImageAspectFlags.DepthBit | ImageAspectFlags.StencilBit
-            : ImageAspectFlags.DepthBit;
-    }
 }

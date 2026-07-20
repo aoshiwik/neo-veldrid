@@ -87,6 +87,14 @@ internal unsafe class D3D11CommandList : CommandList
 
     private readonly List<D3D11Swapchain> _referencedSwapchains = new List<D3D11Swapchain>();
 
+    // Populated only while the internal lifecycle observer is enabled. The
+    // native ID3D11CommandList owns the corresponding COM resources between
+    // FinishCommandList and ExecuteCommandList/Release; these entries expose
+    // that exact lifetime without adding another resource owner.
+    private List<D3D11Texture> _observedTextureUploadDestinations;
+    private ICommandListTextureUploadLifecycleObserver _textureUploadLifecycleObserver;
+    private int _acquiredTextureUploadRetentionCount;
+
     /// <summary>
     /// Helper to get the raw context pointer for calling D3D11 methods.
     /// </summary>
@@ -125,6 +133,8 @@ internal unsafe class D3D11CommandList : CommandList
 
     public ID3D11CommandList* DeviceCommandList => _commandList;
 
+    internal bool HasDeviceCommandList => _commandList.Handle != null;
+
     internal ID3D11DeviceContext* DeviceContext => _context;
 
     private D3D11Framebuffer D3D11Framebuffer => Util.AssertSubtype<Framebuffer, D3D11Framebuffer>(_framebuffer);
@@ -135,8 +145,7 @@ internal unsafe class D3D11CommandList : CommandList
     {
         if (_commandList.Handle != null)
         {
-            _commandList.Dispose();
-            _commandList = default;
+            ReleaseDeviceCommandList();
         }
         ClearState();
         _begun = true;
@@ -227,6 +236,7 @@ internal unsafe class D3D11CommandList : CommandList
         SilkMarshal.ThrowHResult(Ctx->FinishCommandList(0, &pCmdList));
         _commandList = default;
         _commandList.Handle = pCmdList;
+        AcquireObservedTextureUploadRetentions();
         if (_name != null)
             D3D11Util.SetDebugName((ID3D11DeviceChild*)_commandList.Handle, _name);
         ResetManagedState();
@@ -237,8 +247,7 @@ internal unsafe class D3D11CommandList : CommandList
     {
         if (_commandList.Handle != null)
         {
-            _commandList.Dispose();
-            _commandList = default;
+            ReleaseDeviceCommandList();
         }
         else if (_begun)
         {
@@ -246,6 +255,7 @@ internal unsafe class D3D11CommandList : CommandList
             ID3D11CommandList* pCmdList;
             Ctx->FinishCommandList(0, &pCmdList);
             pCmdList->Release();
+            AbandonObservedTextureUploadDestinations();
         }
 
         ResetManagedState();
@@ -952,7 +962,7 @@ internal unsafe class D3D11CommandList : CommandList
                 else
                 {
                     PackRangeParams(range);
-                    if (!_gd.SupportsCommandLists)
+                    if (_gd.CommandListCapabilities.RequiresSoftwareRuntimeWorkarounds)
                     {
                         ID3D11Buffer* nullBuf = null;
                         Ctx->VSSetConstantBuffers((uint)slot, 1, &nullBuf);
@@ -976,7 +986,7 @@ internal unsafe class D3D11CommandList : CommandList
             else
             {
                 PackRangeParams(range);
-                if (!_gd.SupportsCommandLists)
+                if (_gd.CommandListCapabilities.RequiresSoftwareRuntimeWorkarounds)
                 {
                     ID3D11Buffer* nullBuf = null;
                     Ctx->GSSetConstantBuffers((uint)slot, 1, &nullBuf);
@@ -999,7 +1009,7 @@ internal unsafe class D3D11CommandList : CommandList
             else
             {
                 PackRangeParams(range);
-                if (!_gd.SupportsCommandLists)
+                if (_gd.CommandListCapabilities.RequiresSoftwareRuntimeWorkarounds)
                 {
                     ID3D11Buffer* nullBuf = null;
                     Ctx->HSSetConstantBuffers((uint)slot, 1, &nullBuf);
@@ -1022,7 +1032,7 @@ internal unsafe class D3D11CommandList : CommandList
             else
             {
                 PackRangeParams(range);
-                if (!_gd.SupportsCommandLists)
+                if (_gd.CommandListCapabilities.RequiresSoftwareRuntimeWorkarounds)
                 {
                     ID3D11Buffer* nullBuf = null;
                     Ctx->DSSetConstantBuffers((uint)slot, 1, &nullBuf);
@@ -1060,7 +1070,7 @@ internal unsafe class D3D11CommandList : CommandList
                 else
                 {
                     PackRangeParams(range);
-                    if (!_gd.SupportsCommandLists)
+                    if (_gd.CommandListCapabilities.RequiresSoftwareRuntimeWorkarounds)
                     {
                         ID3D11Buffer* nullBuf = null;
                         Ctx->PSSetConstantBuffers((uint)slot, 1, &nullBuf);
@@ -1084,7 +1094,7 @@ internal unsafe class D3D11CommandList : CommandList
             else
             {
                 PackRangeParams(range);
-                if (!_gd.SupportsCommandLists)
+                if (_gd.CommandListCapabilities.RequiresSoftwareRuntimeWorkarounds)
                 {
                     ID3D11Buffer* nullBuf = null;
                     Ctx->CSSetConstantBuffers((uint)slot, 1, &nullBuf);
@@ -1410,59 +1420,109 @@ internal unsafe class D3D11CommandList : CommandList
             height,
             depth,
             mipLevel);
+        Box* nativeRegion = D3D11Util.IsFullTextureSubresource(
+            destination,
+            mipLevel,
+            in region)
+            ? null
+            : &region;
         uint rowPitch = FormatHelpers.GetRowPitch(width, texture.Format);
         uint depthPitch = FormatHelpers.GetDepthPitch(
             rowPitch,
             height,
             texture.Format);
-        void* adjustedSource = source.ToPointer();
-        if (!_gd.SupportsCommandLists && (x != 0u || y != 0u || z != 0u))
-        {
-            // The D3D11 software command-list path incorrectly reapplies the
-            // destination-box origin to pSrcData during playback. Supply the
-            // inverse byte offset so the runtime lands on the tightly-packed
-            // source region. This is the texture form of the documented
-            // deferred-context UpdateSubresource workaround used below for
-            // partial buffer writes.
-            nuint sourceAdjustment =
-                CalculateDeferredTextureUpdateSourceAdjustment(
-                    texture.Format,
-                    x,
-                    y,
-                    z,
-                    rowPitch,
-                    depthPitch);
-            adjustedSource =
-                (byte*)adjustedSource - checked((nint)sourceAdjustment);
-        }
-        Ctx->UpdateSubresource(
+        D3D11DeferredTextureUploadExecutor uploadExecutor =
+            _gd.CommandListCapabilities.TextureUploadExecutor;
+        D3D11DeferredTextureUploadSource uploadSource =
+            D3D11DeferredTextureUploadSource.Create(
+                source.ToPointer(),
+                sizeInBytes,
+                x,
+                y,
+                z,
+                rowPitch,
+                depthPitch,
+                texture.Format);
+        uploadExecutor.Execute(
+            Ctx,
             destination.DeviceTexture,
             subresource,
-            &region,
-            adjustedSource,
+            nativeRegion,
+            uploadSource,
             rowPitch,
             depthPitch);
+        TrackObservedTextureUploadDestination(destination);
     }
 
-    internal static nuint CalculateDeferredTextureUpdateSourceAdjustment(
-        PixelFormat format,
-        uint x,
-        uint y,
-        uint z,
-        uint sourceRowPitch,
-        uint sourceDepthPitch)
+    private void TrackObservedTextureUploadDestination(D3D11Texture destination)
     {
-        bool compressed = FormatHelpers.IsCompressedFormat(format);
-        ulong blockX = compressed ? x / 4u : x;
-        ulong blockY = compressed ? y / 4u : y;
-        uint bytesPerElement = compressed
-            ? FormatHelpers.GetBlockSizeInBytes(format)
-            : FormatSizeHelpers.GetSizeInBytes(format);
-        ulong adjustment = checked(
-            ((ulong)z * sourceDepthPitch) +
-            (blockY * sourceRowPitch) +
-            (blockX * bytesPerElement));
-        return checked((nuint)adjustment);
+        ICommandListTextureUploadLifecycleObserver observer =
+            _gd.CommandListTextureUploadLifecycleObserver;
+        if (observer is null)
+            return;
+
+        if (_textureUploadLifecycleObserver is not null
+            && !ReferenceEquals(_textureUploadLifecycleObserver, observer))
+        {
+            throw new InvalidOperationException(
+                "The texture-upload lifecycle observer cannot change during a D3D11 command-list recording.");
+        }
+
+        _textureUploadLifecycleObserver = observer;
+        (_observedTextureUploadDestinations ??= new List<D3D11Texture>())
+            .Add(destination);
+    }
+
+    private void AcquireObservedTextureUploadRetentions()
+    {
+        if (_textureUploadLifecycleObserver is null)
+            return;
+
+        Debug.Assert(_acquiredTextureUploadRetentionCount == 0);
+        for (int i = 0; i < _observedTextureUploadDestinations.Count; i++)
+        {
+            _gd.NotifyTextureUploadRetentionAcquired(
+                _textureUploadLifecycleObserver,
+                this,
+                _observedTextureUploadDestinations[i]);
+            _acquiredTextureUploadRetentionCount++;
+        }
+    }
+
+    private void ReleaseObservedTextureUploadRetentions()
+    {
+        if (_textureUploadLifecycleObserver is null)
+            return;
+
+        ICommandListTextureUploadLifecycleObserver observer =
+            _textureUploadLifecycleObserver;
+        int releaseCount = _acquiredTextureUploadRetentionCount;
+        _acquiredTextureUploadRetentionCount = 0;
+        _observedTextureUploadDestinations.Clear();
+        _textureUploadLifecycleObserver = null;
+
+        for (int i = 0; i < releaseCount; i++)
+        {
+            _gd.NotifyTextureUploadRetentionReleased(
+                observer,
+                this,
+                remainingBackendOwnershipCount: 0);
+        }
+    }
+
+    private void AbandonObservedTextureUploadDestinations()
+    {
+        Debug.Assert(_acquiredTextureUploadRetentionCount == 0);
+        _observedTextureUploadDestinations?.Clear();
+        _textureUploadLifecycleObserver = null;
+    }
+
+    private void ReleaseDeviceCommandList()
+    {
+        Debug.Assert(_commandList.Handle != null);
+        _commandList.Dispose();
+        _commandList = default;
+        ReleaseObservedTextureUploadRetentions();
     }
 
     private void UpdateSubresource_Workaround(
@@ -1471,7 +1531,8 @@ internal unsafe class D3D11CommandList : CommandList
         Box region,
         IntPtr data)
     {
-        bool needWorkaround = !_gd.SupportsCommandLists;
+        bool needWorkaround =
+            _gd.CommandListCapabilities.RequiresSoftwareRuntimeWorkarounds;
         void* pAdjustedSrcData = data.ToPointer();
         if (needWorkaround)
         {
@@ -1544,18 +1605,10 @@ internal unsafe class D3D11CommandList : CommandList
             height,
             depth,
             srcMipLevel);
-        D3D11Util.GetTextureSubresourceStorageDimensions(
+        bool useRegion = !D3D11Util.IsFullTextureSubresource(
             srcD3D11Texture,
             srcMipLevel,
-            out uint storageWidth,
-            out uint storageHeight,
-            out uint storageDepth);
-        bool useRegion = region.Left != 0u ||
-            region.Top != 0u ||
-            region.Front != 0u ||
-            region.Right != storageWidth ||
-            region.Bottom != storageHeight ||
-            region.Back != storageDepth;
+            in region);
 
         for (uint i = 0; i < layerCount; i++)
         {
@@ -1595,8 +1648,7 @@ internal unsafe class D3D11CommandList : CommandList
 
     internal void OnCompleted()
     {
-        _commandList.Dispose();
-        _commandList = default;
+        ReleaseDeviceCommandList();
 
         foreach (D3D11Swapchain sc in _referencedSwapchains)
         {
@@ -1641,7 +1693,14 @@ internal unsafe class D3D11CommandList : CommandList
         if (!_disposed)
         {
             if (_uda.Handle != null) _uda.Dispose();
-            if (_commandList.Handle != null) _commandList.Dispose();
+            if (_commandList.Handle != null)
+            {
+                ReleaseDeviceCommandList();
+            }
+            else
+            {
+                AbandonObservedTextureUploadDestinations();
+            }
             if (_context1.Handle != null) _context1.Dispose();
             _context.Dispose();
 

@@ -290,6 +290,9 @@ internal class OpenGLCommandList : CommandList
     {
         lock (_lock)
         {
+            if (_disposed)
+                return;
+
             _currentCommands?.Dispose();
             foreach (OpenGLCommandEntryList list in _availableLists)
             {

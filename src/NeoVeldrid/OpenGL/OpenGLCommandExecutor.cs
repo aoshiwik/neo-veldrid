@@ -1379,7 +1379,7 @@ internal unsafe class OpenGLCommandExecutor
                     height,
                     depth,
                     glTex.GLInternalFormat,
-                    depthPitch * depth,
+                    checked(depthPitch * depth),
                     dataPtr.ToPointer());
                 CheckLastError();
             }
@@ -1553,6 +1553,11 @@ internal unsafe class OpenGLCommandExecutor
         srcGLTexture.EnsureResourcesCreated();
         dstGLTexture.EnsureResourcesCreated();
 
+        Util.ClampCompressedCopyExtentToMipEdges(
+            source, srcX, srcY, srcMipLevel, sourceIsImage: true,
+            destination, dstX, dstY, dstMipLevel, destinationIsImage: true,
+            ref width, ref height);
+
         bool sameLogicalFormatWithDifferentStorage = source.Format == destination.Format
             && srcGLTexture.GLInternalFormat != dstGLTexture.GLInternalFormat;
         if (sameLogicalFormatWithDifferentStorage)
@@ -1572,11 +1577,6 @@ internal unsafe class OpenGLCommandExecutor
             uint srcZOrLayer = Math.Max(srcBaseArrayLayer, srcZ);
             uint dstZOrLayer = Math.Max(dstBaseArrayLayer, dstZ);
             uint depthOrLayerCount = Math.Max(depth, layerCount);
-            // Copy width and height are allowed to be a full compressed block size, even if the mip level only contains a
-            // region smaller than the block size.
-            Util.GetMipDimensions(source, srcMipLevel, out uint mipWidth, out uint mipHeight, out _);
-            width = Math.Min(width, mipWidth);
-            height = Math.Min(height, mipHeight);
             _gl.CopyImageSubData(
                 srcGLTexture.Texture, (CopyImageSubDataTarget)srcGLTexture.TextureTarget, (int)srcMipLevel, (int)srcX, (int)srcY, (int)srcZOrLayer,
                 dstGLTexture.Texture, (CopyImageSubDataTarget)dstGLTexture.TextureTarget, (int)dstMipLevel, (int)dstX, (int)dstY, (int)dstZOrLayer,
@@ -1687,17 +1687,9 @@ internal unsafe class OpenGLCommandExecutor
         TextureTarget srcTarget = srcGLTexture.TextureTarget;
         if (isCompressed)
         {
-            _textureSamplerManager.SetTextureTransient(srcTarget, srcGLTexture.Texture);
-            CheckLastError();
-
-            int compressedSize;
-            _gl.GetTexLevelParameter(
-                srcTarget,
-                (int)srcMipLevel,
-                (GetTextureParameter)GLEnum.TextureCompressedImageSize,
-                &compressedSize);
-            CheckLastError();
-            sizeInBytes = (uint)compressedSize;
+            sizeInBytes = GetCompressedTextureMipSize(
+                srcGLTexture,
+                srcMipLevel);
         }
         else
         {
@@ -1708,74 +1700,134 @@ internal unsafe class OpenGLCommandExecutor
         }
 
         StagingBlock block = _stagingMemoryPool.GetStagingBlock(sizeInBytes);
-
-        if (packAlignment < 4)
+        try
         {
-            _gl.PixelStore(PixelStoreParameter.PackAlignment, (int)packAlignment);
-            CheckLastError();
-        }
-
-        if (isCompressed)
-        {
-            if (_extensions.ARB_DirectStateAccess)
+            if (packAlignment < 4)
             {
-                _gl.GetCompressedTextureImage(
-                    srcGLTexture.Texture,
-                    (int)srcMipLevel,
-                    block.SizeInBytes,
-                    block.Data);
+                _gl.PixelStore(PixelStoreParameter.PackAlignment, (int)packAlignment);
                 CheckLastError();
             }
-            else
-            {
-                _textureSamplerManager.SetTextureTransient(srcTarget, srcGLTexture.Texture);
-                CheckLastError();
 
-                _gl.GetCompressedTexImage(srcTarget, (int)srcMipLevel, block.Data);
-                CheckLastError();
-            }
+            if (isCompressed)
+            {
+            DownloadCompressedTextureMip(
+                srcGLTexture,
+                srcMipLevel,
+                block);
 
             TextureTarget dstTarget = dstGLTexture.TextureTarget;
             _textureSamplerManager.SetTextureTransient(dstTarget, dstGLTexture.Texture);
             CheckLastError();
 
             Util.GetMipDimensions(srcGLTexture, srcMipLevel, out uint mipWidth, out uint mipHeight, out uint mipDepth);
-            uint fullRowPitch = FormatHelpers.GetRowPitch(mipWidth, srcGLTexture.Format);
-            uint fullDepthPitch = FormatHelpers.GetDepthPitch(
-                fullRowPitch,
+            CompressedTextureCopyLayout layout = CompressedTextureCopyLayout.Create(
+                mipWidth,
                 mipHeight,
+                mipDepth,
+                width,
+                height,
+                depth,
+                srcLayer,
                 srcGLTexture.Format);
 
-            uint denseRowPitch = FormatHelpers.GetRowPitch(width, srcGLTexture.Format);
-            uint denseDepthPitch = FormatHelpers.GetDepthPitch(denseRowPitch, height, srcGLTexture.Format);
-            uint numRows = FormatHelpers.GetNumRows(height, srcGLTexture.Format);
-            uint trueCopySize = denseRowPitch * numRows;
-            StagingBlock trueCopySrc = _stagingMemoryPool.GetStagingBlock(trueCopySize);
-
-            uint layerStartOffset = denseDepthPitch * srcLayer;
-
-            Util.CopyTextureRegion(
-                (byte*)block.Data + layerStartOffset,
-                srcX, srcY, srcZ,
-                fullRowPitch, fullDepthPitch,
-                trueCopySrc.Data,
-                0, 0, 0,
-                denseRowPitch,
-                denseDepthPitch,
-                width, height, depth,
-                srcGLTexture.Format);
-
-            UpdateTexture(
+            Util.GetMipDimensions(
                 dstGLTexture,
-                (IntPtr)trueCopySrc.Data,
-                dstX, dstY, dstZ,
-                width, height, 1,
-                dstMipLevel, dstLayer);
+                dstMipLevel,
+                out uint destinationMipWidth,
+                out uint destinationMipHeight,
+                out uint destinationMipDepth);
+            bool requiresFullDestinationUpload =
+                dstGLTexture.Type == TextureType.Texture3D
+                && (dstZ != 0u || depth != destinationMipDepth);
+            if (requiresFullDestinationUpload)
+            {
+                // Desktop GL permits only block-depth-aligned or whole-depth
+                // compressed 3D subimage uploads on affected drivers. Preserve
+                // every untouched destination block in CPU storage, patch the
+                // requested region, and upload the complete logical mip depth.
+                // This is still the roundabout path and therefore favors a
+                // truthful copy contract over an invalid native shortcut.
+                uint destinationSize = GetCompressedTextureMipSize(
+                    dstGLTexture,
+                    dstMipLevel);
+                StagingBlock destinationBlock =
+                    _stagingMemoryPool.GetStagingBlock(destinationSize);
+                try
+                {
+                    DownloadCompressedTextureMip(
+                        dstGLTexture,
+                        dstMipLevel,
+                        destinationBlock);
+                    CompressedTextureCopyLayout destinationLayout =
+                        CompressedTextureCopyLayout.Create(
+                            destinationMipWidth,
+                            destinationMipHeight,
+                            destinationMipDepth,
+                            width,
+                            height,
+                            depth,
+                            dstLayer,
+                            dstGLTexture.Format);
+                    Util.CopyTextureRegion(
+                        (byte*)block.Data + layout.SourceArrayLayerOffset,
+                        srcX, srcY, srcZ,
+                        layout.FullRowPitch, layout.FullDepthPitch,
+                        (byte*)destinationBlock.Data
+                            + destinationLayout.SourceArrayLayerOffset,
+                        dstX, dstY, dstZ,
+                        destinationLayout.FullRowPitch,
+                        destinationLayout.FullDepthPitch,
+                        width, height, depth,
+                        srcGLTexture.Format);
 
-            _stagingMemoryPool.Free(trueCopySrc);
-        }
-        else // !isCompressed
-        {
+                    UpdateTexture(
+                        dstGLTexture,
+                        (IntPtr)((byte*)destinationBlock.Data
+                            + destinationLayout.SourceArrayLayerOffset),
+                        0, 0, 0,
+                        destinationMipWidth,
+                        destinationMipHeight,
+                        destinationMipDepth,
+                        dstMipLevel,
+                        dstLayer);
+                }
+                finally
+                {
+                    _stagingMemoryPool.Free(destinationBlock);
+                }
+
+                return;
+            }
+
+            StagingBlock trueCopySrc = _stagingMemoryPool.GetStagingBlock(
+                layout.DenseCopySizeInBytes);
+            try
+            {
+                Util.CopyTextureRegion(
+                    (byte*)block.Data + layout.SourceArrayLayerOffset,
+                    srcX, srcY, srcZ,
+                    layout.FullRowPitch, layout.FullDepthPitch,
+                    trueCopySrc.Data,
+                    0, 0, 0,
+                    layout.DenseRowPitch,
+                    layout.DenseDepthPitch,
+                    width, height, depth,
+                    srcGLTexture.Format);
+
+                UpdateTexture(
+                    dstGLTexture,
+                    (IntPtr)trueCopySrc.Data,
+                    dstX, dstY, dstZ,
+                    width, height, depth,
+                    dstMipLevel, dstLayer);
+            }
+            finally
+            {
+                _stagingMemoryPool.Free(trueCopySrc);
+            }
+            }
+            else // !isCompressed
+            {
             if (_extensions.ARB_DirectStateAccess)
             {
                 _gl.GetTextureSubImage(
@@ -1845,15 +1897,75 @@ internal unsafe class OpenGLCommandExecutor
                 (IntPtr)block.Data,
                 dstX, dstY, dstZ,
                 width, height, depth, dstMipLevel, dstLayer);
+            }
         }
-
-        if (packAlignment < 4)
+        finally
         {
-            _gl.PixelStore(PixelStoreParameter.PackAlignment, 4);
-            CheckLastError();
+            try
+            {
+                if (packAlignment < 4)
+                {
+                    _gl.PixelStore(PixelStoreParameter.PackAlignment, 4);
+                    CheckLastError();
+                }
+            }
+            finally
+            {
+                _stagingMemoryPool.Free(block);
+            }
+        }
+    }
+
+    private uint GetCompressedTextureMipSize(
+        OpenGLTexture texture,
+        uint mipLevel)
+    {
+        _textureSamplerManager.SetTextureTransient(
+            texture.TextureTarget,
+            texture.Texture);
+        CheckLastError();
+
+        int compressedSize;
+        _gl.GetTexLevelParameter(
+            texture.TextureTarget,
+            (int)mipLevel,
+            (GetTextureParameter)GLEnum.TextureCompressedImageSize,
+            &compressedSize);
+        CheckLastError();
+        if (compressedSize <= 0)
+        {
+            throw new NeoVeldridException(
+                $"OpenGL reported invalid compressed mip storage size {compressedSize} for mip {mipLevel}.");
         }
 
-        _stagingMemoryPool.Free(block);
+        return checked((uint)compressedSize);
+    }
+
+    private void DownloadCompressedTextureMip(
+        OpenGLTexture texture,
+        uint mipLevel,
+        StagingBlock destination)
+    {
+        if (_extensions.ARB_DirectStateAccess)
+        {
+            _gl.GetCompressedTextureImage(
+                texture.Texture,
+                (int)mipLevel,
+                destination.SizeInBytes,
+                destination.Data);
+            CheckLastError();
+            return;
+        }
+
+        _textureSamplerManager.SetTextureTransient(
+            texture.TextureTarget,
+            texture.Texture);
+        CheckLastError();
+        _gl.GetCompressedTexImage(
+            texture.TextureTarget,
+            (int)mipLevel,
+            destination.Data);
+        CheckLastError();
     }
 
     private static void CopyWithFBO(
