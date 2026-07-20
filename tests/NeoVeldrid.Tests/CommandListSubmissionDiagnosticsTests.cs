@@ -201,6 +201,57 @@ public sealed class CommandListSubmissionDiagnosticsTests
     }
 
     [Fact]
+    public void TextureUpdatesExposeByteAndRegionEvidenceWithoutChangingRenderTopology()
+    {
+        var diagnostics = new CommandListSubmissionDiagnostics(
+            initialBufferAccessCapacity: 0);
+        var texture = new StubTexture("atlas");
+
+        diagnostics.BeginRecording();
+        diagnostics.RecordUpdateTexture(
+            texture,
+            sizeInBytes: 128,
+            x: 0,
+            y: 4,
+            z: 0,
+            width: 16,
+            height: 8,
+            depth: 1,
+            mipLevel: 0,
+            arrayLayer: 0);
+        diagnostics.RecordDraw(3, 1, 0, 0);
+        diagnostics.EndRecording();
+        diagnostics.CompleteSuccessfulSubmission();
+
+        CommandListSubmissionMetrics first = diagnostics.LastSubmittedMetrics;
+        Assert.Equal(1, first.UpdateTextureCallCount);
+        Assert.Equal(128UL, first.UpdatedTextureBytes);
+        Assert.Equal(2, first.InstrumentedCommandCount);
+        Assert.Equal(1, first.RenderCommandCount);
+
+        diagnostics.BeginRecording();
+        diagnostics.RecordUpdateTexture(
+            texture,
+            sizeInBytes: 64,
+            x: 0,
+            y: 8,
+            z: 0,
+            width: 16,
+            height: 4,
+            depth: 1,
+            mipLevel: 0,
+            arrayLayer: 0);
+        diagnostics.RecordDraw(3, 1, 0, 0);
+        diagnostics.EndRecording();
+        diagnostics.CompleteSuccessfulSubmission();
+
+        CommandListSubmissionMetrics second = diagnostics.LastSubmittedMetrics;
+        Assert.NotEqual(first.CommandSignature, second.CommandSignature);
+        Assert.Equal(first.RenderCommandCount, second.RenderCommandCount);
+        Assert.Equal(first.RenderCommandSignature, second.RenderCommandSignature);
+    }
+
+    [Fact]
     public void EquivalentFrameVersionedResourceSetsPreserveRenderTopology()
     {
         var graphicsLayout = new StubResourceLayout("graphics-layout");

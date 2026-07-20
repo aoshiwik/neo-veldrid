@@ -173,6 +173,12 @@ internal unsafe class OpenGLTexture : Texture, OpenGLDeferredResource
 
     public override bool IsDisposed => _disposeRequested;
 
+    /// <summary>
+    /// Gets whether the execution thread has actually deleted the native GL
+    /// objects, as distinct from the public disposal-request state.
+    /// </summary>
+    internal bool NativeResourcesDestroyed => _disposed;
+
     public GLPixelFormat GLPixelFormat { get; }
     public PixelType GLPixelType { get; }
     public InternalFormat GLInternalFormat { get; }

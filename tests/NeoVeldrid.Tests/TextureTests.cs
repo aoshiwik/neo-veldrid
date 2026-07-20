@@ -9,6 +9,1062 @@ namespace NeoVeldrid.Tests;
 public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> where T : GraphicsDeviceCreator
 {
     [Fact]
+    public void CommandListTextureUpdateValidationIsBackendIndependent()
+    {
+        Texture texture = RF.CreateTexture(
+            TextureDescription.Texture2D(
+                4,
+                4,
+                1,
+                1,
+                PixelFormat.R8_UNorm,
+                TextureUsage.Sampled));
+        CommandList commandList = RF.CreateCommandList();
+        byte[] undersizedSource = new byte[15];
+
+        NeoVeldridException exception = Assert.Throws<NeoVeldridException>(
+            () => commandList.UpdateTexture(
+                texture,
+                undersizedSource,
+                0,
+                0,
+                0,
+                4,
+                4,
+                1,
+                0,
+                0));
+
+        Assert.Contains("exactly match", exception.Message);
+    }
+
+    [Fact]
+    public unsafe void CommandListTextureUpdatesAreOrderedInSingleSubmission()
+    {
+        const uint textureSize = 8;
+        Texture destination = RF.CreateTexture(
+            TextureDescription.Texture2D(
+                textureSize,
+                textureSize,
+                1,
+                1,
+                PixelFormat.R8_UNorm,
+                TextureUsage.Sampled));
+        Texture capture = RF.CreateTexture(
+            TextureDescription.Texture2D(
+                textureSize,
+                textureSize,
+                1,
+                1,
+                PixelFormat.R8_UNorm,
+                TextureUsage.Staging));
+        byte[] initial = new byte[checked((int)(textureSize * textureSize))];
+        byte[] patch = { 11, 22, 33, 44, 55, 66 };
+        CommandList commandList = RF.CreateCommandList();
+        commandList.EnableSubmissionDiagnostics(
+            initialBufferAccessCapacity: 2);
+
+        commandList.Begin();
+        commandList.UpdateTexture(
+            destination,
+            initial,
+            0,
+            0,
+            0,
+            textureSize,
+            textureSize,
+            1,
+            0,
+            0);
+        commandList.UpdateTexture(
+            destination,
+            patch,
+            x: 2,
+            y: 3,
+            z: 0,
+            width: 3,
+            height: 2,
+            depth: 1,
+            mipLevel: 0,
+            arrayLayer: 0);
+        commandList.CopyTexture(destination, capture);
+        commandList.End();
+
+        GD.SubmitCommands(commandList);
+        GD.WaitForIdle();
+
+        Assert.True(commandList.TryGetLastSubmissionMetrics(
+            out CommandListSubmissionMetrics metrics));
+        Assert.Equal(1L, metrics.SubmissionSequence);
+        Assert.Equal(2, metrics.UpdateTextureCallCount);
+        Assert.Equal(70UL, metrics.UpdatedTextureBytes);
+        Assert.Equal(1, metrics.CopyTextureCallCount);
+
+        MappedResource mapped = GD.Map(capture, MapMode.Read);
+        try
+        {
+            byte* basePointer = (byte*)mapped.Data;
+            for (uint y = 0; y < textureSize; y++)
+            {
+                for (uint x = 0; x < textureSize; x++)
+                {
+                    int patchX = checked((int)x - 2);
+                    int patchY = checked((int)y - 3);
+                    byte expected =
+                        patchX >= 0 && patchX < 3 &&
+                        patchY >= 0 && patchY < 2
+                            ? patch[(patchY * 3) + patchX]
+                            : (byte)0;
+                    nuint byteOffset = checked(
+                        ((nuint)y * mapped.RowPitch) + x);
+                    byte actual = *(basePointer + checked((nint)byteOffset));
+                    Assert.Equal(expected, actual);
+                }
+            }
+        }
+        finally
+        {
+            GD.Unmap(capture);
+        }
+    }
+
+    [Fact]
+    public unsafe void CommandListTextureUpdateRetainsArrayMipPayloadAtRecordTime()
+    {
+        const uint textureSize = 8;
+        const uint mipLevel = 1;
+        const uint arrayLayer = 1;
+        const uint mipSize = textureSize >> (int)mipLevel;
+        TextureDescription description = TextureDescription.Texture2D(
+            textureSize,
+            textureSize,
+            3,
+            2,
+            PixelFormat.R8_UNorm,
+            TextureUsage.Sampled);
+        Texture destination = RF.CreateTexture(description);
+        description.Usage = TextureUsage.Staging;
+        Texture capture = RF.CreateTexture(description);
+        byte[] source = new byte[checked((int)(mipSize * mipSize))];
+        for (int i = 0; i < source.Length; i++)
+            source[i] = checked((byte)(31 + i));
+        byte[] expected = source.ToArray();
+        CommandList commandList = RF.CreateCommandList();
+
+        commandList.Begin();
+        commandList.UpdateTexture(
+            destination,
+            source,
+            0,
+            0,
+            0,
+            mipSize,
+            mipSize,
+            1,
+            mipLevel,
+            arrayLayer);
+        Array.Fill(source, (byte)0xEE);
+        commandList.CopyTexture(
+            destination, 0, 0, 0, mipLevel, arrayLayer,
+            capture, 0, 0, 0, mipLevel, arrayLayer,
+            mipSize, mipSize, 1, 1);
+        commandList.End();
+        GD.SubmitCommands(commandList);
+        GD.WaitForIdle();
+
+        uint subresource = capture.CalculateSubresource(mipLevel, arrayLayer);
+        MappedResource mapped = GD.Map(capture, MapMode.Read, subresource);
+        try
+        {
+            byte* basePointer = (byte*)mapped.Data;
+            for (uint y = 0; y < mipSize; y++)
+            {
+                for (uint x = 0; x < mipSize; x++)
+                {
+                    byte actual = *(basePointer + checked((nint)(y * mapped.RowPitch + x)));
+                    Assert.Equal(expected[checked((int)(y * mipSize + x))], actual);
+                }
+            }
+        }
+        finally
+        {
+            GD.Unmap(capture, subresource);
+        }
+    }
+
+    [SkippableFact]
+    public unsafe void CommandListCompressedEdgeMipUploadRetainsPayload()
+    {
+        const PixelFormat format = PixelFormat.BC1_Rgba_UNorm;
+        Skip.IfNot(
+            GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Sampled) &&
+            GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Staging),
+            $"NV-SKIP-COMPRESSED-STAGING: {format} compressed staging readback is unavailable on {GD.BackendType}.");
+
+        TextureDescription description = TextureDescription.Texture2D(
+            7,
+            5,
+            2,
+            1,
+            format,
+            TextureUsage.Sampled);
+        Texture destination = RF.CreateTexture(description);
+        description.Usage = TextureUsage.Staging;
+        Texture capture = RF.CreateTexture(description);
+        byte[] source = { 3, 5, 8, 13, 21, 34, 55, 89 };
+        byte[] expected = source.ToArray();
+        CommandList commandList = RF.CreateCommandList();
+
+        commandList.Begin();
+        commandList.UpdateTexture(
+            destination,
+            source,
+            0,
+            0,
+            0,
+            3,
+            2,
+            1,
+            1,
+            0);
+        Array.Fill(source, (byte)0xCC);
+        commandList.CopyTexture(
+            destination, 0, 0, 0, 1, 0,
+            capture, 0, 0, 0, 1, 0,
+            3, 2, 1, 1);
+        commandList.End();
+        GD.SubmitCommands(commandList);
+        GD.WaitForIdle();
+
+        uint subresource = capture.CalculateSubresource(1, 0);
+        MappedResourceView<byte> mapped = GD.Map<byte>(capture, MapMode.Read, subresource);
+        try
+        {
+            for (uint i = 0; i < expected.Length; i++)
+                Assert.Equal(expected[i], mapped[i]);
+        }
+        finally
+        {
+            GD.Unmap(capture, subresource);
+        }
+    }
+
+    [SkippableFact]
+    public unsafe void CommandListCompressedOffsetEdgeUploadRetainsPayload()
+    {
+        const PixelFormat format = PixelFormat.BC1_Rgba_UNorm;
+        Skip.IfNot(
+            GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Sampled) &&
+            GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Staging),
+            $"NV-SKIP-COMPRESSED-STAGING: {format} compressed staging readback is unavailable on {GD.BackendType}.");
+
+        TextureDescription description = TextureDescription.Texture2D(
+            10,
+            10,
+            1,
+            1,
+            format,
+            TextureUsage.Sampled);
+        Texture destination = RF.CreateTexture(description);
+        description.Usage = TextureUsage.Staging;
+        Texture capture = RF.CreateTexture(description);
+        byte[] initial = new byte[3 * 3 * 8];
+        byte[] source = Enumerable.Range(0, 4 * 8)
+            .Select(index => checked((byte)(17 + index)))
+            .ToArray();
+        byte[] expected = source.ToArray();
+        CommandList commandList = RF.CreateCommandList();
+
+        commandList.Begin();
+        commandList.UpdateTexture(
+            destination,
+            initial,
+            0, 0, 0,
+            10, 10, 1,
+            0, 0);
+        commandList.UpdateTexture(
+            destination,
+            source,
+            4, 4, 0,
+            6, 6, 1,
+            0, 0);
+        Array.Fill(source, (byte)0xCC);
+        commandList.CopyTexture(destination, capture);
+        commandList.End();
+        GD.SubmitCommands(commandList);
+        GD.WaitForIdle();
+
+        MappedResource mapped = GD.Map(capture, MapMode.Read);
+        try
+        {
+            byte* basePointer = (byte*)mapped.Data;
+            for (uint blockY = 0; blockY < 2; blockY++)
+            {
+                for (uint blockX = 0; blockX < 2; blockX++)
+                {
+                    for (uint byteInBlock = 0; byteInBlock < 8; byteInBlock++)
+                    {
+                        uint expectedOffset =
+                            ((blockY * 2u + blockX) * 8u) + byteInBlock;
+                        nuint actualOffset = checked(
+                            ((nuint)(blockY + 1u) * mapped.RowPitch) +
+                            ((nuint)(blockX + 1u) * 8u) +
+                            byteInBlock);
+                        Assert.Equal(
+                            expected[expectedOffset],
+                            *(basePointer + checked((nint)actualOffset)));
+                    }
+                }
+            }
+        }
+        finally
+        {
+            GD.Unmap(capture);
+        }
+    }
+
+    [SkippableTheory]
+    [InlineData(PixelFormat.BC1_Rgba_UNorm, 8u)]
+    [InlineData(PixelFormat.BC3_UNorm, 16u)]
+    public unsafe void Copy_Compressed_StagingDirectionsHaveIndependentOracles(
+        PixelFormat format,
+        uint blockSizeInBytes)
+    {
+        Skip.IfNot(
+            GD.GetPixelFormatSupport(
+                format,
+                TextureType.Texture2D,
+                TextureUsage.Sampled),
+            $"NV-SKIP-COMPRESSED-SAMPLING: {format} sampling is unavailable on {GD.BackendType}.");
+        Skip.IfNot(
+            GD.GetPixelFormatSupport(
+                format,
+                TextureType.Texture2D,
+                TextureUsage.Staging),
+            $"NV-SKIP-COMPRESSED-STAGING: {format} staging-to-device and device-to-staging copies are unavailable on {GD.BackendType} because compressed staging textures are unsupported.");
+
+        CompressedCopyRegion[] regions =
+        {
+            // The top-level dimensions are intentionally odd. The region is
+            // block-aligned at a nonzero offset and ends at the logical edge.
+            new CompressedCopyRegion(
+                mipLevel: 0,
+                arrayLayer: 1,
+                x: 4,
+                y: 4,
+                width: 9,
+                height: 7,
+                patternSeed: 0x31),
+            // Mip two is 3x2 logical texels but still occupies one complete
+            // block. Both copies target layer one so broken layer pitches read
+            // or write the untouched layer-zero storage instead.
+            new CompressedCopyRegion(
+                mipLevel: 2,
+                arrayLayer: 1,
+                x: 0,
+                y: 0,
+                width: 3,
+                height: 2,
+                patternSeed: 0xA7),
+        };
+
+        AssertCompressedOptimalToStagingCopy(
+            format,
+            blockSizeInBytes,
+            textureWidth: 13,
+            textureHeight: 11,
+            mipLevels: 4,
+            arrayLayers: 2,
+            regions);
+        AssertCompressedStagingToOptimalCopy(
+            format,
+            blockSizeInBytes,
+            textureWidth: 13,
+            textureHeight: 11,
+            mipLevels: 4,
+            arrayLayers: 2,
+            regions);
+    }
+
+    protected readonly struct CompressedCopyRegion
+    {
+        private const uint BlockExtent = 4;
+
+        public uint MipLevel { get; }
+        public uint ArrayLayer { get; }
+        public uint X { get; }
+        public uint Y { get; }
+        public uint Width { get; }
+        public uint Height { get; }
+        public byte PatternSeed { get; }
+        public uint FirstBlockX => X / BlockExtent;
+        public uint FirstBlockY => Y / BlockExtent;
+        public uint BlockColumns => DivideRoundUp(Width, BlockExtent);
+        public uint BlockRows => DivideRoundUp(Height, BlockExtent);
+
+        public CompressedCopyRegion(
+            uint mipLevel,
+            uint arrayLayer,
+            uint x,
+            uint y,
+            uint width,
+            uint height,
+            byte patternSeed)
+        {
+            MipLevel = mipLevel;
+            ArrayLayer = arrayLayer;
+            X = x;
+            Y = y;
+            Width = width;
+            Height = height;
+            PatternSeed = patternSeed;
+        }
+    }
+
+    protected unsafe void AssertCompressedOptimalToStagingCopy(
+        PixelFormat format,
+        uint blockSizeInBytes,
+        uint textureWidth,
+        uint textureHeight,
+        uint mipLevels,
+        uint arrayLayers,
+        params CompressedCopyRegion[] regions)
+    {
+        const byte untouched = 0xD6;
+        AssertCompressedCopyArguments(format, blockSizeInBytes, regions);
+
+        TextureDescription optimalDescription = TextureDescription.Texture2D(
+            textureWidth,
+            textureHeight,
+            mipLevels,
+            arrayLayers,
+            format,
+            TextureUsage.Sampled);
+        Texture source = RF.CreateTexture(optimalDescription);
+        optimalDescription.Usage = TextureUsage.Staging;
+        Texture capture = RF.CreateTexture(optimalDescription);
+        byte[][] sourceMips = new byte[regions.Length][];
+
+        for (int regionIndex = 0; regionIndex < regions.Length; regionIndex++)
+        {
+            CompressedCopyRegion region = regions[regionIndex];
+            GetAndValidateCompressedRegion(
+                source,
+                region,
+                out uint mipWidth,
+                out uint mipHeight);
+            byte[] sourceMip = CreateCompressedPattern(
+                mipWidth,
+                mipHeight,
+                blockSizeInBytes,
+                region.PatternSeed);
+            sourceMips[regionIndex] = sourceMip;
+            GD.UpdateTexture(
+                source,
+                sourceMip,
+                0,
+                0,
+                0,
+                mipWidth,
+                mipHeight,
+                1,
+                region.MipLevel,
+                region.ArrayLayer);
+
+            uint subresource = capture.CalculateSubresource(
+                region.MipLevel,
+                region.ArrayLayer);
+            MappedResource captureMap = GD.Map(
+                capture,
+                MapMode.Write,
+                subresource);
+            try
+            {
+                FillCompressedMappedMip(
+                    captureMap,
+                    mipWidth,
+                    mipHeight,
+                    blockSizeInBytes,
+                    untouched);
+            }
+            finally
+            {
+                GD.Unmap(capture, subresource);
+            }
+
+            uint layerZeroSubresource = capture.CalculateSubresource(
+                region.MipLevel,
+                0);
+            MappedResource layerZeroMap = GD.Map(
+                capture,
+                MapMode.Write,
+                layerZeroSubresource);
+            try
+            {
+                FillCompressedMappedMip(
+                    layerZeroMap,
+                    mipWidth,
+                    mipHeight,
+                    blockSizeInBytes,
+                    untouched);
+            }
+            finally
+            {
+                GD.Unmap(capture, layerZeroSubresource);
+            }
+        }
+        GD.WaitForIdle();
+
+        CommandList commandList = RF.CreateCommandList();
+        commandList.EnableSubmissionDiagnostics(initialBufferAccessCapacity: 2);
+        commandList.Begin();
+        foreach (CompressedCopyRegion region in regions)
+        {
+            commandList.CopyTexture(
+                source,
+                region.X,
+                region.Y,
+                0,
+                region.MipLevel,
+                region.ArrayLayer,
+                capture,
+                region.X,
+                region.Y,
+                0,
+                region.MipLevel,
+                region.ArrayLayer,
+                region.Width,
+                region.Height,
+                1,
+                1);
+        }
+        commandList.End();
+        GD.SubmitCommands(commandList);
+        GD.WaitForIdle();
+
+        Assert.True(commandList.TryGetLastSubmissionMetrics(
+            out CommandListSubmissionMetrics metrics));
+        Assert.Equal(regions.Length, metrics.CopyTextureCallCount);
+
+        for (int regionIndex = 0; regionIndex < regions.Length; regionIndex++)
+        {
+            AssertCompressedMipEqualsSourceRegionAndSentinel(
+                capture,
+                regions[regionIndex],
+                sourceMips[regionIndex],
+                blockSizeInBytes,
+                untouched,
+                "optimal-to-staging");
+            AssertCompressedMipIsSentinel(
+                capture,
+                regions[regionIndex].MipLevel,
+                arrayLayer: 0,
+                blockSizeInBytes,
+                untouched,
+                "optimal-to-staging layer isolation");
+        }
+    }
+
+    protected unsafe void AssertCompressedStagingToOptimalCopy(
+        PixelFormat format,
+        uint blockSizeInBytes,
+        uint textureWidth,
+        uint textureHeight,
+        uint mipLevels,
+        uint arrayLayers,
+        params CompressedCopyRegion[] regions)
+    {
+        const byte untouched = 0x6D;
+        AssertCompressedCopyArguments(format, blockSizeInBytes, regions);
+
+        TextureDescription stagingDescription = TextureDescription.Texture2D(
+            textureWidth,
+            textureHeight,
+            mipLevels,
+            arrayLayers,
+            format,
+            TextureUsage.Staging);
+        Texture source = RF.CreateTexture(stagingDescription);
+        Texture capture = RF.CreateTexture(stagingDescription);
+        stagingDescription.Usage = TextureUsage.Sampled;
+        Texture destination = RF.CreateTexture(stagingDescription);
+        byte[][] expectedRegions = new byte[regions.Length][];
+
+        for (int regionIndex = 0; regionIndex < regions.Length; regionIndex++)
+        {
+            CompressedCopyRegion region = regions[regionIndex];
+            GetAndValidateCompressedRegion(
+                destination,
+                region,
+                out uint mipWidth,
+                out uint mipHeight);
+            byte[] destinationSentinel = new byte[checked((int)
+                FormatHelpers.GetRegionSize(
+                    mipWidth,
+                    mipHeight,
+                    1,
+                    format))];
+            Array.Fill(destinationSentinel, untouched);
+            GD.UpdateTexture(
+                destination,
+                destinationSentinel,
+                0,
+                0,
+                0,
+                mipWidth,
+                mipHeight,
+                1,
+                region.MipLevel,
+                region.ArrayLayer);
+            GD.UpdateTexture(
+                destination,
+                destinationSentinel,
+                0,
+                0,
+                0,
+                mipWidth,
+                mipHeight,
+                1,
+                region.MipLevel,
+                arrayLayer: 0);
+
+            byte[] expected = CreateCompressedPattern(
+                region.Width,
+                region.Height,
+                blockSizeInBytes,
+                region.PatternSeed);
+            expectedRegions[regionIndex] = expected;
+            uint subresource = source.CalculateSubresource(
+                region.MipLevel,
+                region.ArrayLayer);
+            MappedResource sourceMap = GD.Map(
+                source,
+                MapMode.Write,
+                subresource);
+            try
+            {
+                FillCompressedMappedMip(
+                    sourceMap,
+                    mipWidth,
+                    mipHeight,
+                    blockSizeInBytes,
+                    0xC7);
+                WriteCompressedMappedRegion(
+                    sourceMap,
+                    blockSizeInBytes,
+                    region,
+                    expected);
+            }
+            finally
+            {
+                GD.Unmap(source, subresource);
+            }
+        }
+        GD.WaitForIdle();
+
+        CommandList upload = RF.CreateCommandList();
+        upload.EnableSubmissionDiagnostics(initialBufferAccessCapacity: 2);
+        upload.Begin();
+        foreach (CompressedCopyRegion region in regions)
+        {
+            upload.CopyTexture(
+                source,
+                region.X,
+                region.Y,
+                0,
+                region.MipLevel,
+                region.ArrayLayer,
+                destination,
+                region.X,
+                region.Y,
+                0,
+                region.MipLevel,
+                region.ArrayLayer,
+                region.Width,
+                region.Height,
+                1,
+                1);
+        }
+        upload.End();
+        GD.SubmitCommands(upload);
+        GD.WaitForIdle();
+
+        Assert.True(upload.TryGetLastSubmissionMetrics(
+            out CommandListSubmissionMetrics uploadMetrics));
+        Assert.Equal(regions.Length, uploadMetrics.CopyTextureCallCount);
+
+        // Read back whole mip levels at zero offset in a separate submission.
+        // The optimal-to-staging direction is independently qualified above,
+        // and this deliberately avoids mirroring the upload's region offsets.
+        CommandList readback = RF.CreateCommandList();
+        readback.Begin();
+        foreach (CompressedCopyRegion region in regions)
+        {
+            Util.GetMipDimensions(
+                destination,
+                region.MipLevel,
+                out uint mipWidth,
+                out uint mipHeight,
+                out _);
+            readback.CopyTexture(
+                destination,
+                0,
+                0,
+                0,
+                region.MipLevel,
+                region.ArrayLayer,
+                capture,
+                0,
+                0,
+                0,
+                region.MipLevel,
+                region.ArrayLayer,
+                mipWidth,
+                mipHeight,
+                1,
+                1);
+            readback.CopyTexture(
+                destination,
+                0,
+                0,
+                0,
+                region.MipLevel,
+                0,
+                capture,
+                0,
+                0,
+                0,
+                region.MipLevel,
+                0,
+                mipWidth,
+                mipHeight,
+                1,
+                1);
+        }
+        readback.End();
+        GD.SubmitCommands(readback);
+        GD.WaitForIdle();
+
+        for (int regionIndex = 0; regionIndex < regions.Length; regionIndex++)
+        {
+            AssertCompressedMipEqualsDenseRegionAndSentinel(
+                capture,
+                regions[regionIndex],
+                expectedRegions[regionIndex],
+                blockSizeInBytes,
+                untouched,
+                "staging-to-optimal");
+            AssertCompressedMipIsSentinel(
+                capture,
+                regions[regionIndex].MipLevel,
+                arrayLayer: 0,
+                blockSizeInBytes,
+                untouched,
+                "staging-to-optimal layer isolation");
+        }
+    }
+
+    private static void AssertCompressedCopyArguments(
+        PixelFormat format,
+        uint blockSizeInBytes,
+        CompressedCopyRegion[] regions)
+    {
+        Assert.NotEmpty(regions);
+        Assert.Equal(
+            blockSizeInBytes,
+            FormatHelpers.GetBlockSizeInBytes(format));
+    }
+
+    private static void GetAndValidateCompressedRegion(
+        Texture texture,
+        CompressedCopyRegion region,
+        out uint mipWidth,
+        out uint mipHeight)
+    {
+        Assert.True(region.MipLevel < texture.MipLevels);
+        Assert.True(region.ArrayLayer < texture.ArrayLayers);
+        Assert.Equal(0u, region.X % 4u);
+        Assert.Equal(0u, region.Y % 4u);
+        Util.GetMipDimensions(
+            texture,
+            region.MipLevel,
+            out mipWidth,
+            out mipHeight,
+            out _);
+        Assert.True(checked(region.X + region.Width) <= mipWidth);
+        Assert.True(checked(region.Y + region.Height) <= mipHeight);
+        Assert.True(
+            region.Width % 4u == 0u || region.X + region.Width == mipWidth);
+        Assert.True(
+            region.Height % 4u == 0u || region.Y + region.Height == mipHeight);
+    }
+
+    private static byte[] CreateCompressedPattern(
+        uint width,
+        uint height,
+        uint blockSizeInBytes,
+        byte seed)
+    {
+        uint byteCount = checked(
+            DivideRoundUp(width, 4u) *
+            DivideRoundUp(height, 4u) *
+            blockSizeInBytes);
+        byte[] data = new byte[checked((int)byteCount)];
+        for (uint index = 0; index < data.Length; index++)
+            data[index] = unchecked((byte)(seed + (index * 37u)));
+        return data;
+    }
+
+    private static unsafe void WriteCompressedMappedRegion(
+        MappedResource mapped,
+        uint blockSizeInBytes,
+        CompressedCopyRegion region,
+        byte[] denseData)
+    {
+        AssertCompressedMappedRegionFits(
+            mapped,
+            blockSizeInBytes,
+            region.FirstBlockX,
+            region.FirstBlockY,
+            region.BlockColumns,
+            region.BlockRows);
+        uint denseRowBytes = checked(
+            region.BlockColumns * blockSizeInBytes);
+        byte* mappedBase = (byte*)mapped.Data;
+        for (uint blockRow = 0; blockRow < region.BlockRows; blockRow++)
+        {
+            byte* mappedRow = mappedBase + checked((nint)(
+                ((nuint)(region.FirstBlockY + blockRow) * mapped.RowPitch) +
+                ((nuint)region.FirstBlockX * blockSizeInBytes)));
+            denseData.AsSpan(
+                checked((int)(blockRow * denseRowBytes)),
+                checked((int)denseRowBytes)).CopyTo(
+                new Span<byte>(mappedRow, checked((int)denseRowBytes)));
+        }
+    }
+
+    private static unsafe void FillCompressedMappedMip(
+        MappedResource mapped,
+        uint width,
+        uint height,
+        uint blockSizeInBytes,
+        byte value)
+    {
+        uint blockColumns = DivideRoundUp(width, 4u);
+        uint blockRows = DivideRoundUp(height, 4u);
+        AssertCompressedMappedRegionFits(
+            mapped,
+            blockSizeInBytes,
+            0,
+            0,
+            blockColumns,
+            blockRows);
+        int rowSize = checked((int)(blockColumns * blockSizeInBytes));
+        byte* mappedBase = (byte*)mapped.Data;
+        for (uint blockRow = 0; blockRow < blockRows; blockRow++)
+        {
+            new Span<byte>(
+                mappedBase + checked((nint)((nuint)blockRow * mapped.RowPitch)),
+                rowSize).Fill(value);
+        }
+    }
+
+    private unsafe void AssertCompressedMipEqualsSourceRegionAndSentinel(
+        Texture capture,
+        CompressedCopyRegion region,
+        byte[] sourceMip,
+        uint blockSizeInBytes,
+        byte untouched,
+        string direction)
+    {
+        Util.GetMipDimensions(
+            capture,
+            region.MipLevel,
+            out uint mipWidth,
+            out uint mipHeight,
+            out _);
+        uint mipBlockColumns = DivideRoundUp(mipWidth, 4u);
+        AssertCompressedMappedMip(
+            capture,
+            region,
+            blockSizeInBytes,
+            untouched,
+            direction,
+            (blockX, blockY, byteInBlock) =>
+            {
+                uint sourceOffset = checked(
+                    ((blockY * mipBlockColumns + blockX) * blockSizeInBytes) +
+                    byteInBlock);
+                return sourceMip[checked((int)sourceOffset)];
+            });
+    }
+
+    private unsafe void AssertCompressedMipEqualsDenseRegionAndSentinel(
+        Texture capture,
+        CompressedCopyRegion region,
+        byte[] denseRegion,
+        uint blockSizeInBytes,
+        byte untouched,
+        string direction)
+    {
+        AssertCompressedMappedMip(
+            capture,
+            region,
+            blockSizeInBytes,
+            untouched,
+            direction,
+            (blockX, blockY, byteInBlock) =>
+            {
+                uint relativeBlockX = blockX - region.FirstBlockX;
+                uint relativeBlockY = blockY - region.FirstBlockY;
+                uint sourceOffset = checked(
+                    ((relativeBlockY * region.BlockColumns + relativeBlockX) *
+                        blockSizeInBytes) +
+                    byteInBlock);
+                return denseRegion[checked((int)sourceOffset)];
+            });
+    }
+
+    private unsafe void AssertCompressedMipIsSentinel(
+        Texture capture,
+        uint mipLevel,
+        uint arrayLayer,
+        uint blockSizeInBytes,
+        byte sentinel,
+        string direction)
+    {
+        Util.GetMipDimensions(
+            capture,
+            mipLevel,
+            out uint mipWidth,
+            out uint mipHeight,
+            out _);
+        uint blockColumns = DivideRoundUp(mipWidth, 4u);
+        uint blockRows = DivideRoundUp(mipHeight, 4u);
+        uint subresource = capture.CalculateSubresource(mipLevel, arrayLayer);
+        MappedResource mapped = GD.Map(capture, MapMode.Read, subresource);
+        try
+        {
+            AssertCompressedMappedRegionFits(
+                mapped,
+                blockSizeInBytes,
+                0,
+                0,
+                blockColumns,
+                blockRows);
+            byte* mappedBase = (byte*)mapped.Data;
+            for (uint blockY = 0; blockY < blockRows; blockY++)
+            {
+                for (uint blockX = 0; blockX < blockColumns; blockX++)
+                {
+                    for (uint byteInBlock = 0;
+                        byteInBlock < blockSizeInBytes;
+                        byteInBlock++)
+                    {
+                        nuint offset = checked(
+                            ((nuint)blockY * mapped.RowPitch) +
+                            ((nuint)blockX * blockSizeInBytes) +
+                            byteInBlock);
+                        byte actual = *(mappedBase + checked((nint)offset));
+                        Assert.True(
+                            actual == sentinel,
+                            $"The {direction} check found 0x{actual:X2} instead of 0x{sentinel:X2} at mip {mipLevel}, layer {arrayLayer}, block ({blockX}, {blockY}), byte {byteInBlock}.");
+                    }
+                }
+            }
+        }
+        finally
+        {
+            GD.Unmap(capture, subresource);
+        }
+    }
+
+    private unsafe void AssertCompressedMappedMip(
+        Texture capture,
+        CompressedCopyRegion region,
+        uint blockSizeInBytes,
+        byte untouched,
+        string direction,
+        Func<uint, uint, uint, byte> getCopiedByte)
+    {
+        Util.GetMipDimensions(
+            capture,
+            region.MipLevel,
+            out uint mipWidth,
+            out uint mipHeight,
+            out _);
+        uint blockColumns = DivideRoundUp(mipWidth, 4u);
+        uint blockRows = DivideRoundUp(mipHeight, 4u);
+        uint subresource = capture.CalculateSubresource(
+            region.MipLevel,
+            region.ArrayLayer);
+        MappedResource mapped = GD.Map(capture, MapMode.Read, subresource);
+        try
+        {
+            AssertCompressedMappedRegionFits(
+                mapped,
+                blockSizeInBytes,
+                0,
+                0,
+                blockColumns,
+                blockRows);
+            byte* mappedBase = (byte*)mapped.Data;
+            for (uint blockY = 0; blockY < blockRows; blockY++)
+            {
+                for (uint blockX = 0; blockX < blockColumns; blockX++)
+                {
+                    bool copied =
+                        blockX >= region.FirstBlockX &&
+                        blockX < region.FirstBlockX + region.BlockColumns &&
+                        blockY >= region.FirstBlockY &&
+                        blockY < region.FirstBlockY + region.BlockRows;
+                    for (uint byteInBlock = 0;
+                        byteInBlock < blockSizeInBytes;
+                        byteInBlock++)
+                    {
+                        byte expected = copied
+                            ? getCopiedByte(blockX, blockY, byteInBlock)
+                            : untouched;
+                        nuint offset = checked(
+                            ((nuint)blockY * mapped.RowPitch) +
+                            ((nuint)blockX * blockSizeInBytes) +
+                            byteInBlock);
+                        byte actual = *(mappedBase + checked((nint)offset));
+                        Assert.True(
+                            expected == actual,
+                            $"The {direction} copy produced 0x{actual:X2} instead of 0x{expected:X2} at mip {region.MipLevel}, layer {region.ArrayLayer}, block ({blockX}, {blockY}), byte {byteInBlock}.");
+                    }
+                }
+            }
+        }
+        finally
+        {
+            GD.Unmap(capture, subresource);
+        }
+    }
+
+    private static void AssertCompressedMappedRegionFits(
+        MappedResource mapped,
+        uint blockSizeInBytes,
+        uint firstBlockX,
+        uint firstBlockY,
+        uint blockColumns,
+        uint blockRows)
+    {
+        nuint requiredRowBytes = checked(
+            (nuint)(firstBlockX + blockColumns) * blockSizeInBytes);
+        Assert.True(requiredRowBytes <= mapped.RowPitch);
+
+        nuint requiredBytes = checked(
+            ((nuint)(firstBlockY + blockRows - 1) * mapped.RowPitch) +
+            requiredRowBytes);
+        Assert.True(requiredBytes <= mapped.SizeInBytes);
+    }
+
+    private static uint DivideRoundUp(uint value, uint divisor) =>
+        checked((uint)(((ulong)value + divisor - 1u) / divisor));
+
+    [Fact]
     public void Map_Succeeds()
     {
         Texture texture = RF.CreateTexture(
@@ -700,7 +1756,7 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
         Skip.IfNot(
             GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Sampled)
                 && GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Staging),
-            $"{format} does not support compressed staging readback on {GD.BackendType}.");
+            $"NV-SKIP-COMPRESSED-STAGING: {format} compressed staging readback is unavailable on {GD.BackendType}.");
 
         Texture copySrc = RF.CreateTexture(TextureDescription.Texture2D(
             64, 64, 1, 1, format, TextureUsage.Sampled));
@@ -751,7 +1807,7 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
         PixelFormat format = PixelFormat.BC3_UNorm;
         Skip.IfNot(
             GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Sampled),
-            $"{format} sampling is not supported on {GD.BackendType}.");
+            $"NV-SKIP-COMPRESSED-SAMPLING: {format} sampling is unavailable on {GD.BackendType}.");
 
         bool supportsCompressedStaging = GD.GetPixelFormatSupport(
             format,
@@ -774,7 +1830,7 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
             && GD.GetPixelFormatSupport(rawBlockFormat, TextureType.Texture2D, TextureUsage.Staging);
         Skip.IfNot(
             supportsCompressedStaging || useCompatibleRawReadback,
-            $"Exact compressed copy readback is not supported on {GD.BackendType}.");
+            $"NV-SKIP-COMPRESSED-COPY-READBACK: Exact compressed copy readback is unavailable on {GD.BackendType}.");
 
         TextureDescription texDesc = TextureDescription.Texture2D(
             16, 16,
@@ -913,10 +1969,12 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
         GD.Unmap(tex3D);
     }
 
-    [Fact]
+    [SkippableFact]
     public unsafe void Update_ThenMapRead_1D()
     {
-        if (!GD.Features.Texture1D) { return; }
+        Skip.IfNot(
+            GD.Features.Texture1D,
+            $"NV-SKIP-TEXTURE1D: One-dimensional textures are unavailable on {GD.BackendType}.");
 
         Texture tex1D = RF.CreateTexture(
             TextureDescription.Texture1D(100, 1, 1, PixelFormat.R16_UNorm, TextureUsage.Staging));
@@ -934,10 +1992,12 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
         GD.Unmap(tex1D);
     }
 
-    [Fact]
+    [SkippableFact]
     public unsafe void MapWrite_ThenMapRead_1D()
     {
-        if (!GD.Features.Texture1D) { return; }
+        Skip.IfNot(
+            GD.Features.Texture1D,
+            $"NV-SKIP-TEXTURE1D: One-dimensional textures are unavailable on {GD.BackendType}.");
 
         Texture tex1D = RF.CreateTexture(
             TextureDescription.Texture1D(100, 1, 1, PixelFormat.R16_UNorm, TextureUsage.Staging));
@@ -957,10 +2017,12 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
         GD.Unmap(tex1D);
     }
 
-    [Fact]
+    [SkippableFact]
     public unsafe void Copy_1DTo2D()
     {
-        if (!GD.Features.Texture1D) { return; }
+        Skip.IfNot(
+            GD.Features.Texture1D,
+            $"NV-SKIP-TEXTURE1D: One-dimensional textures are unavailable on {GD.BackendType}.");
 
         Texture tex1D = RF.CreateTexture(
             TextureDescription.Texture1D(100, 1, 1, PixelFormat.R16_UNorm, TextureUsage.Staging));
@@ -993,10 +2055,12 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
         GD.Unmap(tex2D);
     }
 
-    [Fact]
+    [SkippableFact]
     public void Update_MultipleMips_1D()
     {
-        if (!GD.Features.Texture1D) { return; }
+        Skip.IfNot(
+            GD.Features.Texture1D,
+            $"NV-SKIP-TEXTURE1D: One-dimensional textures are unavailable on {GD.BackendType}.");
 
         Texture tex1D = RF.CreateTexture(TextureDescription.Texture1D(
             100, 5, 1, PixelFormat.R8_G8_B8_A8_UNorm, TextureUsage.Staging));
@@ -1022,10 +2086,12 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void Copy_DifferentMip_1DTo2D()
     {
-        if (!GD.Features.Texture1D) { return; }
+        Skip.IfNot(
+            GD.Features.Texture1D,
+            $"NV-SKIP-TEXTURE1D: One-dimensional textures are unavailable on {GD.BackendType}.");
 
         Texture tex1D = RF.CreateTexture(
             TextureDescription.Texture1D(200, 2, 1, PixelFormat.R16_UNorm, TextureUsage.Staging));
@@ -1323,7 +2389,7 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
         GD.Unmap(dst);
     }
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(FormatCoverageData))]
     public unsafe void FormatCoverage_CopyThenRead(
         PixelFormat format, int rBits, int gBits, int bBits, int aBits,
@@ -1337,10 +2403,9 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
         uint dstX, uint dstY, uint dstZ,
         uint dstMipLevel, uint dstArrayLayer)
     {
-        if (!GD.GetPixelFormatSupport(format, srcType, TextureUsage.Staging))
-        {
-            return;
-        }
+        Skip.IfNot(
+            GD.GetPixelFormatSupport(format, srcType, TextureUsage.Staging),
+            $"NV-SKIP-STAGING-FORMAT: {format}/{srcType} staging is unavailable on {GD.BackendType}.");
 
         Texture srcTex = RF.CreateTexture(new TextureDescription(
             srcWidth, srcHeight, srcDepth, srcMipLevels, srcArrayLayers,
@@ -1490,7 +2555,7 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
         Skip.IfNot(
             GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Sampled)
                 && GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Staging),
-            $"{format} does not support compressed staging readback on {GD.BackendType}.");
+            $"NV-SKIP-COMPRESSED-STAGING: {format} compressed staging readback is unavailable on {GD.BackendType}.");
 
         Texture src = RF.CreateTexture(TextureDescription.Texture2D(
             16, 16, 4, 1, format, TextureUsage.Sampled));
@@ -1604,15 +2669,683 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
 
 #if TEST_VULKAN
 [Trait("Backend", "Vulkan")]
-public class VulkanTextureTests : TextureTestBase<VulkanDeviceCreator> { }
+public class VulkanTextureTests : TextureTestBase<VulkanDeviceCreator>
+{
+    [Theory]
+    [InlineData(PixelFormat.D24_UNorm_S8_UInt)]
+    [InlineData(PixelFormat.D32_Float_S8_UInt)]
+    public void PackedDepthStencilStagingIsRejected(PixelFormat format)
+    {
+        Assert.False(GD.GetPixelFormatSupport(
+            format,
+            TextureType.Texture2D,
+            TextureUsage.Staging));
+
+        NeoVeldridException exception = Assert.Throws<NeoVeldridException>(
+            () => RF.CreateTexture(TextureDescription.Texture2D(
+                4,
+                4,
+                1,
+                1,
+                format,
+                TextureUsage.Staging)));
+        Assert.Contains("packed depth-stencil plane layout", exception.Message);
+    }
+
+    private const uint MultiLayerCopyWidth = 13;
+    private const uint MultiLayerCopyHeight = 11;
+    private const uint MultiLayerCopyMipLevels = 4;
+    private const uint MultiLayerCopyArrayLayers = 3;
+    private const byte MultiLayerCopySentinel = 0xE3;
+
+    [SkippableTheory]
+    [InlineData(PixelFormat.BC1_Rgba_UNorm)]
+    [InlineData(PixelFormat.BC3_UNorm)]
+    public void CompressedStagingSupportUsesBufferImageTransferCapability(
+        PixelFormat format)
+    {
+        Skip.IfNot(
+            GD.GetPixelFormatSupport(
+                format,
+                TextureType.Texture2D,
+                TextureUsage.Sampled),
+            $"NV-SKIP-COMPRESSED-SAMPLING: {format} sampling is unavailable on {GD.BackendType}.");
+
+        Assert.True(
+            GD.GetPixelFormatSupport(
+                format,
+                TextureType.Texture2D,
+                TextureUsage.Staging,
+                out PixelFormatProperties properties),
+            $"Vulkan exposes sampled {format}, so its buffer-backed staging representation must support transfers to and from an optimal image.");
+        Assert.True(
+            properties.IsSampleCountSupported(TextureSampleCount.Count1));
+        Assert.False(
+            properties.IsSampleCountSupported(TextureSampleCount.Count2));
+    }
+
+    [SkippableTheory]
+    [InlineData(PixelFormat.BC1_Rgba_UNorm, 8u)]
+    [InlineData(PixelFormat.BC3_UNorm, 16u)]
+    public unsafe void Copy_Compressed_StagingToOptimalUsesMipChainArrayStride(
+        PixelFormat format,
+        uint blockSizeInBytes)
+    {
+        AssertCompressedMultiMipMultiLayerCopy(
+            format,
+            blockSizeInBytes,
+            TextureUsage.Staging,
+            TextureUsage.Sampled);
+    }
+
+    [SkippableTheory]
+    [InlineData(PixelFormat.BC1_Rgba_UNorm, 8u)]
+    [InlineData(PixelFormat.BC3_UNorm, 16u)]
+    public unsafe void Copy_Compressed_OptimalToStagingUsesMipChainArrayStride(
+        PixelFormat format,
+        uint blockSizeInBytes)
+    {
+        AssertCompressedMultiMipMultiLayerCopy(
+            format,
+            blockSizeInBytes,
+            TextureUsage.Sampled,
+            TextureUsage.Staging);
+    }
+
+    [SkippableTheory]
+    [InlineData(PixelFormat.BC1_Rgba_UNorm, 8u)]
+    [InlineData(PixelFormat.BC3_UNorm, 16u)]
+    public unsafe void Copy_Compressed_StagingToStagingSeparatesLayerAndDepthStrides(
+        PixelFormat format,
+        uint blockSizeInBytes)
+    {
+        AssertCompressedMultiMipMultiLayerCopy(
+            format,
+            blockSizeInBytes,
+            TextureUsage.Staging,
+            TextureUsage.Staging);
+    }
+
+    private unsafe void AssertCompressedMultiMipMultiLayerCopy(
+        PixelFormat format,
+        uint blockSizeInBytes,
+        TextureUsage sourceUsage,
+        TextureUsage destinationUsage)
+    {
+        Skip.IfNot(
+            GD.GetPixelFormatSupport(
+                format,
+                TextureType.Texture2D,
+                TextureUsage.Sampled),
+            $"NV-SKIP-COMPRESSED-SAMPLING: {format} sampling is unavailable on {GD.BackendType}.");
+        Skip.IfNot(
+            GD.GetPixelFormatSupport(
+                format,
+                TextureType.Texture2D,
+                TextureUsage.Staging),
+            $"NV-SKIP-COMPRESSED-STAGING: {format} compressed staging transfers are unavailable on {GD.BackendType}.");
+        Assert.Equal(
+            blockSizeInBytes,
+            FormatHelpers.GetBlockSizeInBytes(format));
+
+        Texture source = RF.CreateTexture(TextureDescription.Texture2D(
+            MultiLayerCopyWidth,
+            MultiLayerCopyHeight,
+            MultiLayerCopyMipLevels,
+            MultiLayerCopyArrayLayers,
+            format,
+            sourceUsage));
+        Texture destination = RF.CreateTexture(TextureDescription.Texture2D(
+            MultiLayerCopyWidth,
+            MultiLayerCopyHeight,
+            MultiLayerCopyMipLevels,
+            MultiLayerCopyArrayLayers,
+            format,
+            destinationUsage));
+
+        for (uint arrayLayer = 0;
+            arrayLayer < MultiLayerCopyArrayLayers;
+            arrayLayer++)
+        {
+            for (uint mipLevel = 0;
+                mipLevel < MultiLayerCopyMipLevels;
+                mipLevel++)
+            {
+                byte[] sourceData = CreateCompressedSubresourcePattern(
+                    format,
+                    mipLevel,
+                    arrayLayer);
+                WriteCompressedSubresource(
+                    source,
+                    sourceUsage,
+                    mipLevel,
+                    arrayLayer,
+                    sourceData);
+
+                byte[] destinationData = new byte[sourceData.Length];
+                Array.Fill(destinationData, MultiLayerCopySentinel);
+                WriteCompressedSubresource(
+                    destination,
+                    destinationUsage,
+                    mipLevel,
+                    arrayLayer,
+                    destinationData);
+            }
+        }
+        GD.WaitForIdle();
+
+        CommandList copy = RF.CreateCommandList();
+        copy.Begin();
+        CopyCompressedMipLayers(copy, source, destination, mipLevel: 0);
+        CopyCompressedMipLayers(copy, source, destination, mipLevel: 2);
+        copy.End();
+        GD.SubmitCommands(copy);
+        GD.WaitForIdle();
+
+        Texture inspected = destination;
+        if (destinationUsage != TextureUsage.Staging)
+        {
+            inspected = RF.CreateTexture(TextureDescription.Texture2D(
+                MultiLayerCopyWidth,
+                MultiLayerCopyHeight,
+                MultiLayerCopyMipLevels,
+                MultiLayerCopyArrayLayers,
+                format,
+                TextureUsage.Staging));
+            CommandList readback = RF.CreateCommandList();
+            readback.Begin();
+            for (uint arrayLayer = 0;
+                arrayLayer < MultiLayerCopyArrayLayers;
+                arrayLayer++)
+            {
+                for (uint mipLevel = 0;
+                    mipLevel < MultiLayerCopyMipLevels;
+                    mipLevel++)
+                {
+                    Util.GetMipDimensions(
+                        destination,
+                        mipLevel,
+                        out uint mipWidth,
+                        out uint mipHeight,
+                        out _);
+                    readback.CopyTexture(
+                        destination,
+                        0, 0, 0,
+                        mipLevel,
+                        arrayLayer,
+                        inspected,
+                        0, 0, 0,
+                        mipLevel,
+                        arrayLayer,
+                        mipWidth,
+                        mipHeight,
+                        1,
+                        1);
+                }
+            }
+            readback.End();
+            GD.SubmitCommands(readback);
+            GD.WaitForIdle();
+        }
+
+        for (uint arrayLayer = 0;
+            arrayLayer < MultiLayerCopyArrayLayers;
+            arrayLayer++)
+        {
+            for (uint mipLevel = 0;
+                mipLevel < MultiLayerCopyMipLevels;
+                mipLevel++)
+            {
+                bool copiedMip = mipLevel == 0 || mipLevel == 2;
+                byte[] expected = copiedMip && arrayLayer < 2
+                    ? CreateCompressedSubresourcePattern(
+                        format,
+                        mipLevel,
+                        arrayLayer + 1)
+                    : CreateCompressedSubresourceSentinel(format, mipLevel);
+                AssertCompressedSubresourceEquals(
+                    inspected,
+                    mipLevel,
+                    arrayLayer,
+                    expected);
+            }
+        }
+    }
+
+    private static void CopyCompressedMipLayers(
+        CommandList commandList,
+        Texture source,
+        Texture destination,
+        uint mipLevel)
+    {
+        Util.GetMipDimensions(
+            source,
+            mipLevel,
+            out uint mipWidth,
+            out uint mipHeight,
+            out _);
+        commandList.CopyTexture(
+            source,
+            0, 0, 0,
+            mipLevel,
+            srcBaseArrayLayer: 1,
+            destination,
+            0, 0, 0,
+            mipLevel,
+            dstBaseArrayLayer: 0,
+            mipWidth,
+            mipHeight,
+            depth: 1,
+            layerCount: 2);
+    }
+
+    private static byte[] CreateCompressedSubresourcePattern(
+        PixelFormat format,
+        uint mipLevel,
+        uint arrayLayer)
+    {
+        byte[] data = CreateCompressedSubresourceSentinel(format, mipLevel);
+        for (uint index = 0; index < data.Length; index++)
+        {
+            data[index] = unchecked((byte)(
+                0x17u
+                + (arrayLayer * 67u)
+                + (mipLevel * 29u)
+                + (index * 19u)));
+        }
+        return data;
+    }
+
+    private static byte[] CreateCompressedSubresourceSentinel(
+        PixelFormat format,
+        uint mipLevel)
+    {
+        uint mipWidth = Util.GetDimension(MultiLayerCopyWidth, mipLevel);
+        uint mipHeight = Util.GetDimension(MultiLayerCopyHeight, mipLevel);
+        byte[] data = new byte[checked((int)FormatHelpers.GetRegionSize(
+            mipWidth,
+            mipHeight,
+            depth: 1,
+            format: format))];
+        Array.Fill(data, MultiLayerCopySentinel);
+        return data;
+    }
+
+    private unsafe void WriteCompressedSubresource(
+        Texture texture,
+        TextureUsage usage,
+        uint mipLevel,
+        uint arrayLayer,
+        byte[] data)
+    {
+        Util.GetMipDimensions(
+            texture,
+            mipLevel,
+            out uint mipWidth,
+            out uint mipHeight,
+            out _);
+        if (usage != TextureUsage.Staging)
+        {
+            GD.UpdateTexture(
+                texture,
+                data,
+                0, 0, 0,
+                mipWidth,
+                mipHeight,
+                1,
+                mipLevel,
+                arrayLayer);
+            return;
+        }
+
+        uint subresource = texture.CalculateSubresource(mipLevel, arrayLayer);
+        MappedResource mapped = GD.Map(texture, MapMode.Write, subresource);
+        try
+        {
+            CopyDenseCompressedDataToMappedResource(
+                mapped,
+                mipWidth,
+                mipHeight,
+                texture.Format,
+                data);
+        }
+        finally
+        {
+            GD.Unmap(texture, subresource);
+        }
+    }
+
+    private unsafe void AssertCompressedSubresourceEquals(
+        Texture texture,
+        uint mipLevel,
+        uint arrayLayer,
+        byte[] expected)
+    {
+        Util.GetMipDimensions(
+            texture,
+            mipLevel,
+            out uint mipWidth,
+            out uint mipHeight,
+            out _);
+        uint rowSize = FormatHelpers.GetRowPitch(mipWidth, texture.Format);
+        uint rowCount = FormatHelpers.GetNumRows(mipHeight, texture.Format);
+        Assert.Equal(checked((int)(rowSize * rowCount)), expected.Length);
+
+        uint subresource = texture.CalculateSubresource(mipLevel, arrayLayer);
+        MappedResource mapped = GD.Map(texture, MapMode.Read, subresource);
+        try
+        {
+            Assert.True(rowSize <= mapped.RowPitch);
+            byte* mappedBase = (byte*)mapped.Data;
+            for (uint row = 0; row < rowCount; row++)
+            {
+                for (uint column = 0; column < rowSize; column++)
+                {
+                    byte actual = *(mappedBase + checked((nint)(
+                        ((nuint)row * mapped.RowPitch) + column)));
+                    byte expectedByte = expected[checked((int)(
+                        (row * rowSize) + column))];
+                    Assert.True(
+                        expectedByte == actual,
+                        $"Expected 0x{expectedByte:X2} but found 0x{actual:X2} at mip {mipLevel}, layer {arrayLayer}, row {row}, byte {column}.");
+                }
+            }
+        }
+        finally
+        {
+            GD.Unmap(texture, subresource);
+        }
+    }
+
+    private static unsafe void CopyDenseCompressedDataToMappedResource(
+        MappedResource mapped,
+        uint width,
+        uint height,
+        PixelFormat format,
+        byte[] data)
+    {
+        uint rowSize = FormatHelpers.GetRowPitch(width, format);
+        uint rowCount = FormatHelpers.GetNumRows(height, format);
+        Assert.Equal(checked((int)(rowSize * rowCount)), data.Length);
+        Assert.True(rowSize <= mapped.RowPitch);
+
+        byte* mappedBase = (byte*)mapped.Data;
+        for (uint row = 0; row < rowCount; row++)
+        {
+            data.AsSpan(
+                checked((int)(row * rowSize)),
+                checked((int)rowSize)).CopyTo(new Span<byte>(
+                    mappedBase + checked((nint)((nuint)row * mapped.RowPitch)),
+                    checked((int)rowSize)));
+        }
+    }
+}
 #endif
 #if TEST_D3D11
 [Trait("Backend", "D3D11")]
-public class D3D11TextureTests : TextureTestBase<D3D11DeviceCreator> { }
+public class D3D11TextureTests : TextureTestBase<D3D11DeviceCreator>
+{
+    [Fact]
+    public unsafe void Copy_Compressed_OddPhysicalMipEdgeBoxCopiesExactly()
+    {
+        const PixelFormat format = PixelFormat.BC3_UNorm;
+        Assert.True(
+            GD.GetPixelFormatSupport(
+                format,
+                TextureType.Texture2D,
+                TextureUsage.Sampled),
+            "The D3D11 qualification device must support sampled BC3 textures.");
+        Assert.True(
+            GD.GetPixelFormatSupport(
+                format,
+                TextureType.Texture2D,
+                TextureUsage.Staging),
+            "The D3D11 qualification device must support staging BC3 textures.");
+
+        // A 13x11 logical texture is physically 16x12 on D3D11. Its second mip
+        // is therefore physically 4x3 but logically 3x2. This one-block edge
+        // region requires D3D11's copy box to expand to and clamp at (4, 3),
+        // independently of the Vulkan buffer-image stride implementation.
+        AssertCompressedStagingToOptimalCopy(
+            format,
+            blockSizeInBytes: 16,
+            textureWidth: 13,
+            textureHeight: 11,
+            mipLevels: 4,
+            arrayLayers: 2,
+            regions: new[]
+            {
+                new CompressedCopyRegion(
+                    mipLevel: 2,
+                    arrayLayer: 1,
+                    x: 0,
+                    y: 0,
+                    width: 3,
+                    height: 2,
+                    patternSeed: 0xD3),
+            });
+    }
+}
 #endif
 #if TEST_OPENGL
 [Trait("Backend", "OpenGL")]
-public class OpenGLTextureTests : TextureTestBase<OpenGLDeviceCreator> { }
+public class OpenGLTextureTests : TextureTestBase<OpenGLDeviceCreator>
+{
+    [SkippableFact]
+    public unsafe void Copy_Compressed_3DDepthRoundaboutCopiesEverySlice()
+    {
+        const PixelFormat format = PixelFormat.BC1_Rgba_UNorm;
+        Skip.IfNot(
+            GD.GetPixelFormatSupport(
+                format,
+                TextureType.Texture3D,
+                TextureUsage.Sampled)
+            && GD.GetPixelFormatSupport(
+                format,
+                TextureType.Texture3D,
+                TextureUsage.Staging),
+            $"NV-SKIP-COMPRESSED-3D-ROUNDABOUT: {format} compressed 3D copy/readback is unavailable on {GD.BackendType}.");
+
+        AssertCompressed3DRoundaboutCopy(
+            width: 8,
+            height: 8,
+            textureDepth: 4,
+            sourceX: 0,
+            sourceY: 0,
+            sourceZ: 1,
+            destinationX: 0,
+            destinationY: 0,
+            destinationZ: 0,
+            copyWidth: 8,
+            copyHeight: 8,
+            copyDepth: 2,
+            patternSeed: 0x21);
+        AssertCompressed3DRoundaboutCopy(
+            width: 13,
+            height: 11,
+            textureDepth: 4,
+            sourceX: 12,
+            sourceY: 8,
+            sourceZ: 1,
+            destinationX: 12,
+            destinationY: 8,
+            destinationZ: 0,
+            copyWidth: 4,
+            copyHeight: 4,
+            copyDepth: 2,
+            patternSeed: 0x91);
+        AssertCompressed3DRoundaboutCopy(
+            width: 13,
+            height: 11,
+            textureDepth: 4,
+            sourceX: 0,
+            sourceY: 4,
+            sourceZ: 0,
+            destinationX: 8,
+            destinationY: 0,
+            destinationZ: 1,
+            copyWidth: 4,
+            copyHeight: 4,
+            copyDepth: 2,
+            patternSeed: 0xC3);
+    }
+
+    private unsafe void AssertCompressed3DRoundaboutCopy(
+        uint width,
+        uint height,
+        uint textureDepth,
+        uint sourceX,
+        uint sourceY,
+        uint sourceZ,
+        uint destinationX,
+        uint destinationY,
+        uint destinationZ,
+        uint copyWidth,
+        uint copyHeight,
+        uint copyDepth,
+        byte patternSeed)
+    {
+        const PixelFormat format = PixelFormat.BC1_Rgba_UNorm;
+        const uint blockExtent = 4;
+        const uint blockSizeInBytes = 8;
+        const byte untouched = 0xD7;
+        uint rowPitch = FormatHelpers.GetRowPitch(width, format);
+        uint depthPitch = FormatHelpers.GetDepthPitch(
+            rowPitch,
+            height,
+            format);
+        uint blockRows = FormatHelpers.GetNumRows(height, format);
+        uint sourceBlockX = sourceX / blockExtent;
+        uint sourceBlockY = sourceY / blockExtent;
+        uint destinationBlockX = destinationX / blockExtent;
+        uint destinationBlockY = destinationY / blockExtent;
+        uint copyBlockColumns = (copyWidth + blockExtent - 1) / blockExtent;
+        uint copyBlockRows = (copyHeight + blockExtent - 1) / blockExtent;
+
+        TextureDescription description = TextureDescription.Texture3D(
+            width,
+            height,
+            textureDepth,
+            1,
+            format,
+            TextureUsage.Sampled);
+        Texture source = RF.CreateTexture(description);
+        Texture destination = RF.CreateTexture(description);
+        description.Usage = TextureUsage.Staging;
+        Texture capture = RF.CreateTexture(description);
+
+        byte[] sourceData = new byte[checked((int)(depthPitch * textureDepth))];
+        byte[] destinationData = new byte[sourceData.Length];
+        Array.Fill(destinationData, untouched);
+        for (uint slice = 0; slice < textureDepth; slice++)
+        {
+            for (uint index = 0; index < depthPitch; index++)
+            {
+                sourceData[checked((int)(slice * depthPitch + index))] =
+                    unchecked((byte)(patternSeed + slice * 47u + index));
+            }
+        }
+
+        GD.UpdateTexture(
+            source,
+            sourceData,
+            0, 0, 0,
+            width, height, textureDepth,
+            0, 0);
+        GD.UpdateTexture(
+            destination,
+            destinationData,
+            0, 0, 0,
+            width, height, textureDepth,
+            0, 0);
+
+        CommandList copy = RF.CreateCommandList();
+        copy.Begin();
+        copy.CopyTexture(
+            source,
+            sourceX, sourceY, sourceZ,
+            0, 0,
+            destination,
+            destinationX, destinationY, destinationZ,
+            0, 0,
+            copyWidth, copyHeight, copyDepth,
+            1);
+        copy.End();
+        GD.SubmitCommands(copy);
+        GD.WaitForIdle();
+
+        // Read back the complete mip. Affected desktop GL drivers reject
+        // depth-one compressed 3D subimages for the same native alignment
+        // reason as the partial copy under test. The full-depth readback does
+        // not use the partial destination read-modify-write branch, and an
+        // omitted or mispositioned partial copy remains visible in its bytes.
+        CommandList readback = RF.CreateCommandList();
+        readback.Begin();
+        readback.CopyTexture(
+            destination,
+            0, 0, 0,
+            0, 0,
+            capture,
+            0, 0, 0,
+            0, 0,
+            width, height, textureDepth,
+            1);
+        readback.End();
+        GD.SubmitCommands(readback);
+        GD.WaitForIdle();
+
+        MappedResource mapped = GD.Map(capture, MapMode.Read);
+        try
+        {
+            byte* mappedBase = (byte*)mapped.Data;
+            for (uint slice = 0; slice < textureDepth; slice++)
+            {
+                bool copied =
+                    slice >= destinationZ &&
+                    slice < destinationZ + copyDepth;
+                uint sourceSlice = copied
+                    ? sourceZ + slice - destinationZ
+                    : 0;
+                for (uint blockRow = 0; blockRow < blockRows; blockRow++)
+                {
+                    for (uint rowByte = 0; rowByte < rowPitch; rowByte++)
+                    {
+                        uint blockColumn = rowByte / blockSizeInBytes;
+                        bool copiedBlock = copied
+                            && blockRow >= destinationBlockY
+                            && blockRow < destinationBlockY + copyBlockRows
+                            && blockColumn >= destinationBlockX
+                            && blockColumn < destinationBlockX + copyBlockColumns;
+                        byte expected = untouched;
+                        if (copiedBlock)
+                        {
+                            uint byteWithinBlock = rowByte % blockSizeInBytes;
+                            uint sourceBlockRow = sourceBlockY
+                                + blockRow - destinationBlockY;
+                            uint sourceBlockColumn = sourceBlockX
+                                + blockColumn - destinationBlockX;
+                            expected = sourceData[checked((int)(
+                                sourceSlice * depthPitch +
+                                sourceBlockRow * rowPitch +
+                                sourceBlockColumn * blockSizeInBytes +
+                                byteWithinBlock))];
+                        }
+                        nuint mappedOffset = checked(
+                            ((nuint)slice * mapped.DepthPitch) +
+                            ((nuint)blockRow * mapped.RowPitch) +
+                            rowByte);
+                        byte actual = *(mappedBase + checked((nint)mappedOffset));
+                        Assert.Equal(expected, actual);
+                    }
+                }
+            }
+        }
+        finally
+        {
+            GD.Unmap(capture);
+        }
+    }
+}
 #endif
 #if TEST_OPENGLES
 [Trait("Backend", "OpenGLES")]
@@ -1623,11 +3356,6 @@ public class OpenGLESTextureTests : TextureTestBase<OpenGLESDeviceCreator>
     {
         const PixelFormat format = PixelFormat.BC3_UNorm;
         Assert.False(GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Staging));
-
-        if (!GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Sampled))
-        {
-            return;
-        }
 
         Texture texture = RF.CreateTexture(TextureDescription.Texture2D(
             16, 16, 1, 1, format, TextureUsage.Staging));

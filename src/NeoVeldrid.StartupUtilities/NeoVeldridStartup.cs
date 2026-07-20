@@ -9,6 +9,7 @@ namespace NeoVeldrid.StartupUtilities;
 public static unsafe class NeoVeldridStartup
 {
     private static Sdl Sdl => Sdl2Window.SdlInstance;
+    private static readonly object SdlVideoInitializationLock = new object();
 
     public static void CreateWindowAndGraphicsDevice(
         WindowCreateInfo windowCI,
@@ -35,7 +36,7 @@ public static unsafe class NeoVeldridStartup
         out Sdl2Window window,
         out GraphicsDevice gd)
     {
-        Sdl.Init(Silk.NET.SDL.Sdl.InitVideo);
+        EnsureSdlVideoInitialized();
 
 #if !EXCLUDE_OPENGL_BACKEND
         if (preferredBackend == GraphicsBackend.OpenGL || preferredBackend == GraphicsBackend.OpenGLES)
@@ -56,7 +57,53 @@ public static unsafe class NeoVeldridStartup
         }
     }
 
+#if !EXCLUDE_VULKAN_BACKEND
+    /// <summary>
+    /// Creates a window and a Vulkan graphics device with explicit Vulkan validation and extension options.
+    /// </summary>
+    public static void CreateWindowAndVulkanGraphicsDevice(
+        WindowCreateInfo windowCI,
+        GraphicsDeviceOptions deviceOptions,
+        VulkanDeviceOptions vulkanOptions,
+        out Sdl2Window window,
+        out GraphicsDevice gd)
+    {
+        EnsureSdlVideoInitialized();
+        window = CreateWindow(ref windowCI);
+        try
+        {
+            gd = CreateVulkanGraphicsDevice(deviceOptions, window, deviceOptions.SwapchainSrgbFormat, vulkanOptions);
+        }
+        catch
+        {
+            window.Close();
+            throw;
+        }
+    }
+#endif
+
     public static Sdl2Window CreateWindow(WindowCreateInfo windowCI) => CreateWindow(ref windowCI);
+
+    private static void EnsureSdlVideoInitialized()
+    {
+        lock (SdlVideoInitializationLock)
+        {
+            uint video = Silk.NET.SDL.Sdl.InitVideo;
+            if ((Sdl.WasInit(video) & video) != 0)
+            {
+                return;
+            }
+
+            Sdl.ClearError();
+            if (Sdl.InitSubSystem(video) != 0)
+            {
+                string error = Sdl.GetErrorS();
+                throw new NeoVeldridException(
+                    "SDL video-subsystem initialization failed: "
+                    + (string.IsNullOrWhiteSpace(error) ? "unknown SDL error" : error));
+            }
+        }
+    }
 
     public static Sdl2Window CreateWindow(ref WindowCreateInfo windowCI)
     {
@@ -178,6 +225,13 @@ public static unsafe class NeoVeldridStartup
         GraphicsDeviceOptions options,
         Sdl2Window window,
         bool colorSrgb)
+        => CreateVulkanGraphicsDevice(options, window, colorSrgb, new VulkanDeviceOptions());
+
+    public static GraphicsDevice CreateVulkanGraphicsDevice(
+        GraphicsDeviceOptions options,
+        Sdl2Window window,
+        bool colorSrgb,
+        VulkanDeviceOptions vulkanOptions)
     {
         SwapchainDescription scDesc = new SwapchainDescription(
             GetSwapchainSource(window),
@@ -186,7 +240,7 @@ public static unsafe class NeoVeldridStartup
             options.SwapchainDepthFormat,
             options.SyncToVerticalBlank,
             colorSrgb);
-        GraphicsDevice gd = GraphicsDevice.CreateVulkan(options, scDesc);
+        GraphicsDevice gd = GraphicsDevice.CreateVulkan(options, scDesc, vulkanOptions);
 
         return gd;
     }
@@ -217,17 +271,47 @@ public static unsafe class NeoVeldridStartup
         int actualStencilSize;
         sdl.GLGetAttribute(GLattr.StencilSize, &actualStencilSize);
 
+        int actualContextFlags;
+        bool? isDebugContext = sdl.GLGetAttribute(GLattr.ContextFlags, &actualContextFlags) == 0
+            ? (actualContextFlags & (int)GLcontextFlag.DebugFlag) != 0
+            : null;
+
         sdl.GLSetSwapInterval(options.SyncToVerticalBlank ? 1 : 0);
+
+        void MakeCurrent(nint context)
+        {
+            sdl.ClearError();
+            if (sdl.GLMakeCurrent(sdlWindow, (void*)context) != 0)
+            {
+                string error = sdl.GetErrorS();
+                throw new NeoVeldridException(
+                    $"SDL could not make the owned OpenGL context current: "
+                    + $"{(string.IsNullOrWhiteSpace(error) ? "unknown SDL error" : error)}");
+            }
+        }
+
+        void ClearCurrentContext()
+        {
+            sdl.ClearError();
+            if (sdl.GLMakeCurrent((Silk.NET.SDL.Window*)null, (void*)null) != 0)
+            {
+                string error = sdl.GetErrorS();
+                throw new NeoVeldridException(
+                    $"SDL could not clear the current OpenGL context: "
+                    + $"{(string.IsNullOrWhiteSpace(error) ? "unknown SDL error" : error)}");
+            }
+        }
 
         OpenGL.OpenGLPlatformInfo platformInfo = new OpenGL.OpenGLPlatformInfo(
             (nint)contextHandle,
             name => (nint)sdl.GLGetProcAddress(name),
-            context => sdl.GLMakeCurrent(sdlWindow, (void*)context),
+            MakeCurrent,
             () => (nint)sdl.GLGetCurrentContext(),
-            () => sdl.GLMakeCurrent((Silk.NET.SDL.Window*)null, (void*)null),
+            ClearCurrentContext,
             context => sdl.GLDeleteContext((void*)context),
             () => sdl.GLSwapWindow(sdlWindow),
-            sync => sdl.GLSetSwapInterval(sync ? 1 : 0));
+            sync => sdl.GLSetSwapInterval(sync ? 1 : 0),
+            isDebugContext);
 
         return GraphicsDevice.CreateOpenGL(
             options,

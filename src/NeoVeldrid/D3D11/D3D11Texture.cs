@@ -94,66 +94,87 @@ internal unsafe class D3D11Texture : Texture
             roundedHeight = ((roundedHeight + 3) / 4) * 4;
         }
 
-        if (Type == TextureType.Texture1D)
+        ID3D11Resource* nativeTexture = null;
+        try
         {
-            Texture1DDesc desc1D = new Texture1DDesc
+            if (Type == TextureType.Texture1D)
             {
-                Width = (uint)roundedWidth,
-                MipLevels = description.MipLevels,
-                ArraySize = arraySize,
-                Format = TypelessDxgiFormat,
-                BindFlags = (uint)bindFlags,
-                CPUAccessFlags = (uint)cpuFlags,
-                Usage = resourceUsage,
-                MiscFlags = (uint)optionFlags,
-            };
+                Texture1DDesc desc1D = new Texture1DDesc
+                {
+                    Width = (uint)roundedWidth,
+                    MipLevels = description.MipLevels,
+                    ArraySize = arraySize,
+                    Format = TypelessDxgiFormat,
+                    BindFlags = (uint)bindFlags,
+                    CPUAccessFlags = (uint)cpuFlags,
+                    Usage = resourceUsage,
+                    MiscFlags = (uint)optionFlags,
+                };
 
-            ID3D11Texture1D* pTex;
-            SilkMarshal.ThrowHResult(device->CreateTexture1D(in desc1D, null, &pTex));
+                ID3D11Texture1D* texture = null;
+                int creationResult = device->CreateTexture1D(in desc1D, null, &texture);
+                nativeTexture = (ID3D11Resource*)texture;
+                SilkMarshal.ThrowHResult(creationResult);
+            }
+            else if (Type == TextureType.Texture2D)
+            {
+                Texture2DDesc desc2D = new Texture2DDesc
+                {
+                    Width = (uint)roundedWidth,
+                    Height = (uint)roundedHeight,
+                    MipLevels = description.MipLevels,
+                    ArraySize = arraySize,
+                    Format = TypelessDxgiFormat,
+                    BindFlags = (uint)bindFlags,
+                    CPUAccessFlags = (uint)cpuFlags,
+                    Usage = resourceUsage,
+                    SampleDesc = new SampleDesc
+                    {
+                        Count = FormatHelpers.GetSampleCountUInt32(SampleCount),
+                        Quality = 0,
+                    },
+                    MiscFlags = (uint)optionFlags,
+                };
+
+                ID3D11Texture2D* texture = null;
+                int creationResult = device->CreateTexture2D(in desc2D, null, &texture);
+                nativeTexture = (ID3D11Resource*)texture;
+                SilkMarshal.ThrowHResult(creationResult);
+            }
+            else
+            {
+                Debug.Assert(Type == TextureType.Texture3D);
+                Texture3DDesc desc3D = new Texture3DDesc
+                {
+                    Width = (uint)roundedWidth,
+                    Height = (uint)roundedHeight,
+                    Depth = description.Depth,
+                    MipLevels = description.MipLevels,
+                    Format = TypelessDxgiFormat,
+                    BindFlags = (uint)bindFlags,
+                    CPUAccessFlags = (uint)cpuFlags,
+                    Usage = resourceUsage,
+                    MiscFlags = (uint)optionFlags,
+                };
+
+                ID3D11Texture3D* texture = null;
+                int creationResult = device->CreateTexture3D(in desc3D, null, &texture);
+                nativeTexture = (ID3D11Resource*)texture;
+                SilkMarshal.ThrowHResult(creationResult);
+            }
+
             _deviceTexture = default;
-            _deviceTexture.Handle = (ID3D11Resource*)pTex;
+            _deviceTexture.Handle = nativeTexture;
+            nativeTexture = null;
         }
-        else if (Type == TextureType.Texture2D)
+        finally
         {
-            Texture2DDesc desc2D = new Texture2DDesc
+            // Failed COM calls may still populate output pointers. The field
+            // owns only a reference explicitly transferred above.
+            if (nativeTexture != null)
             {
-                Width = (uint)roundedWidth,
-                Height = (uint)roundedHeight,
-                MipLevels = description.MipLevels,
-                ArraySize = arraySize,
-                Format = TypelessDxgiFormat,
-                BindFlags = (uint)bindFlags,
-                CPUAccessFlags = (uint)cpuFlags,
-                Usage = resourceUsage,
-                SampleDesc = new SampleDesc { Count = FormatHelpers.GetSampleCountUInt32(SampleCount), Quality = 0 },
-                MiscFlags = (uint)optionFlags,
-            };
-
-            ID3D11Texture2D* pTex;
-            SilkMarshal.ThrowHResult(device->CreateTexture2D(in desc2D, null, &pTex));
-            _deviceTexture = default;
-            _deviceTexture.Handle = (ID3D11Resource*)pTex;
-        }
-        else
-        {
-            Debug.Assert(Type == TextureType.Texture3D);
-            Texture3DDesc desc3D = new Texture3DDesc
-            {
-                Width = (uint)roundedWidth,
-                Height = (uint)roundedHeight,
-                Depth = description.Depth,
-                MipLevels = description.MipLevels,
-                Format = TypelessDxgiFormat,
-                BindFlags = (uint)bindFlags,
-                CPUAccessFlags = (uint)cpuFlags,
-                Usage = resourceUsage,
-                MiscFlags = (uint)optionFlags,
-            };
-
-            ID3D11Texture3D* pTex;
-            SilkMarshal.ThrowHResult(device->CreateTexture3D(in desc3D, null, &pTex));
-            _deviceTexture = default;
-            _deviceTexture.Handle = (ID3D11Resource*)pTex;
+                nativeTexture->Release();
+            }
         }
     }
 
@@ -162,16 +183,20 @@ internal unsafe class D3D11Texture : Texture
         Texture2DDesc desc;
         existingTexture->GetDesc(&desc);
 
-        ID3D11Device* pDevice;
-        ((ID3D11DeviceChild*)existingTexture)->GetDevice(&pDevice);
-        _device = pDevice;
-        // GetDevice calls AddRef; release since we only store a borrowed pointer.
-        pDevice->Release();
-
-        // AddRef so this D3D11Texture owns its own reference; the caller will Release theirs.
-        existingTexture->AddRef();
-        _deviceTexture = default;
-        _deviceTexture.Handle = (ID3D11Resource*)existingTexture;
+        ID3D11Device* device = null;
+        try
+        {
+            ((ID3D11DeviceChild*)existingTexture)->GetDevice(&device);
+            _device = device;
+        }
+        finally
+        {
+            // GetDevice calls AddRef; this class stores only a borrowed pointer.
+            if (device != null)
+            {
+                device->Release();
+            }
+        }
 
         Width = desc.Width;
         Height = desc.Height;
@@ -190,6 +215,12 @@ internal unsafe class D3D11Texture : Texture
             format,
             (Usage & TextureUsage.DepthStencil) == TextureUsage.DepthStencil);
         TypelessDxgiFormat = D3D11Formats.GetTypelessFormat(DxgiFormat);
+
+        // Acquire the wrapper's native ownership only after every potentially
+        // throwing metadata conversion has completed.
+        existingTexture->AddRef();
+        _deviceTexture = default;
+        _deviceTexture.Handle = (ID3D11Resource*)existingTexture;
     }
 
     private protected override TextureView CreateFullTextureView(GraphicsDevice gd)

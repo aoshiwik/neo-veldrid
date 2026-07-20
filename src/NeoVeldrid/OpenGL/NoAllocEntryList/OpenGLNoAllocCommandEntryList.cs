@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 namespace NeoVeldrid.OpenGL.NoAllocEntryList;
 
@@ -14,6 +15,10 @@ internal unsafe class OpenGLNoAllocCommandEntryList : OpenGLCommandEntryList, ID
     private uint _totalEntries;
     private readonly List<object> _resourceList = new List<object>();
     private readonly List<StagingBlock> _stagingBlocks = new List<StagingBlock>();
+    private List<Tracked<Texture>> _observedTextureUploadDestinations;
+    private ICommandListTextureUploadLifecycleObserver _textureUploadLifecycleObserver;
+    private int _acquiredTextureUploadRetentionCount;
+    private bool _textureUploadSubmissionAdmissionPending;
 
     // Entry IDs
     private const byte BeginEntryID = 1;
@@ -91,6 +96,9 @@ internal unsafe class OpenGLNoAllocCommandEntryList : OpenGLCommandEntryList, ID
     private const byte InsertDebugMarkerEntryID = 26;
     private static readonly uint InsertDebugMarkerEntrySize = Util.USizeOf<NoAllocInsertDebugMarkerEntry>();
 
+    private const byte UpdateTextureEntryID = 27;
+    private static readonly uint UpdateTextureEntrySize = Util.USizeOf<NoAllocUpdateTextureEntry>();
+
     public OpenGLCommandList Parent { get; }
 
     public OpenGLNoAllocCommandEntryList(OpenGLCommandList cl)
@@ -104,7 +112,7 @@ internal unsafe class OpenGLNoAllocCommandEntryList : OpenGLCommandEntryList, ID
     public void Reset()
     {
         FlushStagingBlocks();
-        _resourceList.Clear();
+        ClearTrackedResourcesAndReleaseObservedTextureUploadRetentions();
         _totalEntries = 0;
         _currentBlock = _blocks[0];
         foreach (EntryStorageBlock block in _blocks)
@@ -116,7 +124,7 @@ internal unsafe class OpenGLNoAllocCommandEntryList : OpenGLCommandEntryList, ID
     public void Dispose()
     {
         FlushStagingBlocks();
-        _resourceList.Clear();
+        ClearTrackedResourcesAndReleaseObservedTextureUploadRetentions();
         _totalEntries = 0;
         _currentBlock = _blocks[0];
         foreach (EntryStorageBlock block in _blocks)
@@ -193,6 +201,7 @@ internal unsafe class OpenGLNoAllocCommandEntryList : OpenGLCommandEntryList, ID
 
     public void ExecuteAll(OpenGLCommandExecutor executor)
     {
+        WaitForSubmissionAdmission();
         int currentBlockIndex = 0;
         EntryStorageBlock block = _blocks[currentBlockIndex];
         uint currentOffset = 0;
@@ -333,6 +342,22 @@ internal unsafe class OpenGLNoAllocCommandEntryList : OpenGLCommandEntryList, ID
                         ube.BufferOffsetInBytes,
                         (IntPtr)dataPtr, ube.StagingBlockSize);
                     currentOffset += UpdateBufferEntrySize;
+                    break;
+                case UpdateTextureEntryID:
+                    NoAllocUpdateTextureEntry ute =
+                        Unsafe.ReadUnaligned<NoAllocUpdateTextureEntry>(entryBasePtr);
+                    executor.UpdateTexture(
+                        ute.Texture.Get(_resourceList),
+                        (IntPtr)ute.StagingBlock.Data,
+                        ute.X,
+                        ute.Y,
+                        ute.Z,
+                        ute.Width,
+                        ute.Height,
+                        ute.Depth,
+                        ute.MipLevel,
+                        ute.ArrayLayer);
+                    currentOffset += UpdateTextureEntrySize;
                     break;
                 case CopyBufferEntryID:
                     NoAllocCopyBufferEntry cbe = Unsafe.ReadUnaligned<NoAllocCopyBufferEntry>(entryBasePtr);
@@ -530,6 +555,160 @@ internal unsafe class OpenGLNoAllocCommandEntryList : OpenGLCommandEntryList, ID
         _stagingBlocks.Add(stagingBlock);
         NoAllocUpdateBufferEntry entry = new NoAllocUpdateBufferEntry(Track(buffer), bufferOffsetInBytes, stagingBlock, sizeInBytes);
         AddEntry(UpdateBufferEntryID, ref entry);
+    }
+
+    public void UpdateTexture(
+        Texture texture,
+        IntPtr source,
+        uint sizeInBytes,
+        uint x,
+        uint y,
+        uint z,
+        uint width,
+        uint height,
+        uint depth,
+        uint mipLevel,
+        uint arrayLayer)
+    {
+        StagingBlock stagingBlock = _memoryPool.Stage(source, sizeInBytes);
+        _stagingBlocks.Add(stagingBlock);
+        Tracked<Texture> trackedDestination = Track(texture);
+        TrackObservedTextureUploadDestination(trackedDestination);
+        NoAllocUpdateTextureEntry entry = new NoAllocUpdateTextureEntry(
+            trackedDestination,
+            stagingBlock,
+            x,
+            y,
+            z,
+            width,
+            height,
+            depth,
+            mipLevel,
+            arrayLayer);
+        AddEntry(UpdateTextureEntryID, ref entry);
+    }
+
+    private void TrackObservedTextureUploadDestination(
+        Tracked<Texture> destination)
+    {
+        ICommandListTextureUploadLifecycleObserver observer =
+            Parent.Device.CommandListTextureUploadLifecycleObserver;
+        if (observer is null)
+            return;
+
+        if (_textureUploadLifecycleObserver is not null
+            && !ReferenceEquals(_textureUploadLifecycleObserver, observer))
+        {
+            throw new InvalidOperationException(
+                "The texture-upload lifecycle observer cannot change during an OpenGL command-list recording.");
+        }
+
+        _textureUploadLifecycleObserver = observer;
+        (_observedTextureUploadDestinations ??= new List<Tracked<Texture>>())
+            .Add(destination);
+    }
+
+    public void PrepareSubmissionAdmission()
+    {
+        if (_textureUploadLifecycleObserver is null)
+            return;
+
+        List<Tracked<Texture>> destinations =
+            _observedTextureUploadDestinations;
+        lock (destinations)
+        {
+            if (_textureUploadSubmissionAdmissionPending
+                || _acquiredTextureUploadRetentionCount != 0)
+            {
+                throw new InvalidOperationException(
+                    "The OpenGL command entry list already owns a submitted texture-upload lifecycle.");
+            }
+
+            _textureUploadSubmissionAdmissionPending = true;
+        }
+    }
+
+    public void CompleteSubmissionAdmission()
+    {
+        ICommandListTextureUploadLifecycleObserver observer =
+            _textureUploadLifecycleObserver;
+        if (observer is null)
+            return;
+
+        List<Tracked<Texture>> destinations =
+            _observedTextureUploadDestinations;
+        try
+        {
+            for (int i = 0; i < destinations.Count; i++)
+            {
+                Parent.Device.NotifyTextureUploadRetentionAcquired(
+                    observer,
+                    Parent,
+                    destinations[i].Get(_resourceList));
+                _acquiredTextureUploadRetentionCount++;
+            }
+        }
+        finally
+        {
+            lock (destinations)
+            {
+                _textureUploadSubmissionAdmissionPending = false;
+                Monitor.PulseAll(destinations);
+            }
+        }
+    }
+
+    public void CancelSubmissionAdmission()
+    {
+        List<Tracked<Texture>> destinations =
+            _observedTextureUploadDestinations;
+        if (destinations is null)
+            return;
+
+        lock (destinations)
+        {
+            _textureUploadSubmissionAdmissionPending = false;
+            Monitor.PulseAll(destinations);
+        }
+    }
+
+    private void WaitForSubmissionAdmission()
+    {
+        List<Tracked<Texture>> destinations =
+            _observedTextureUploadDestinations;
+        if (destinations is null)
+            return;
+
+        lock (destinations)
+        {
+            while (_textureUploadSubmissionAdmissionPending)
+                Monitor.Wait(destinations);
+        }
+    }
+
+    private void ClearTrackedResourcesAndReleaseObservedTextureUploadRetentions()
+    {
+        WaitForSubmissionAdmission();
+        ICommandListTextureUploadLifecycleObserver observer =
+            _textureUploadLifecycleObserver;
+        int releaseCount = _acquiredTextureUploadRetentionCount;
+        _acquiredTextureUploadRetentionCount = 0;
+        _textureUploadSubmissionAdmissionPending = false;
+        _observedTextureUploadDestinations?.Clear();
+        _textureUploadLifecycleObserver = null;
+
+        // _resourceList is the real entry-list ownership container. Clear it
+        // before publishing release and do not resolve a Tracked<T> afterward:
+        // doing so would recreate the very resource reference being measured.
+        _resourceList.Clear();
+
+        for (int i = 0; i < releaseCount; i++)
+        {
+            Parent.Device.NotifyTextureUploadRetentionReleased(
+                observer,
+                Parent,
+                _resourceList.Count);
+        }
     }
 
     public void CopyBuffer(DeviceBuffer source, uint sourceOffset, DeviceBuffer destination, uint destinationOffset, uint sizeInBytes)

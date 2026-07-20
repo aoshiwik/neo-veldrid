@@ -14,7 +14,7 @@ internal class VkDescriptorPoolManager
     public VkDescriptorPoolManager(VkGraphicsDevice gd)
     {
         _gd = gd;
-        _pools.Add(CreateNewPool());
+        AddNewPool();
     }
 
     public unsafe DescriptorAllocationToken Allocate(DescriptorResourceCounts counts, DescriptorSetLayout setLayout)
@@ -63,11 +63,33 @@ internal class VkDescriptorPoolManager
                 }
             }
 
-            PoolInfo newPool = CreateNewPool();
-            _pools.Add(newPool);
+            PoolInfo newPool = AddNewPool();
             bool result = newPool.Allocate(counts);
             Debug.Assert(result);
             return newPool.Pool;
+        }
+    }
+
+    private unsafe PoolInfo AddNewPool()
+    {
+        PoolInfo newPool = CreateNewPool();
+        try
+        {
+            _pools.Add(newPool);
+            return newPool;
+        }
+        catch (Exception insertionError)
+        {
+            VulkanCleanupCollector cleanup = new VulkanCleanupCollector();
+            cleanup.Attempt(() =>
+                _gd.Vk.DestroyDescriptorPool(
+                    _gd.Device,
+                    newPool.Pool,
+                    null));
+            cleanup.ThrowWithPrimary(
+                insertionError,
+                "Vulkan descriptor-pool ownership transfer and cleanup both failed.");
+            throw new UnreachableException();
         }
     }
 

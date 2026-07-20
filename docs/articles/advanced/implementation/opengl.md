@@ -67,7 +67,7 @@ As you can imagine, the above approach has a small amount of runtime CPU and mem
 
 ### Synchronization
 
-Although OpenGL command execution is synchronous, it is all done through a separate worker thread. OpenGL Fence objects are actually signaled when the submission that they are attached to is fully processed by the worker thread. This means that, when an OpenGL CommandList is submitted, it will not be completed until a later time. The [Graphicsdevice.WaitForIdle](xref:NeoVeldrid.GraphicsDevice) method blocks until all previously-submitted commands are processed by the worker thread.
+OpenGL commands are issued from a dedicated worker thread, while the GPU completes them asynchronously. A fenced submission performs `glFlush` and `glFinish` before signaling its Fence, so a signaled Fence proves native GPU completion rather than only worker-thread processing. [GraphicsDevice.WaitForIdle](xref:NeoVeldrid.GraphicsDevice) establishes the same full native-completion boundary after all previously accepted work.
 
 Some GraphicsDevice methods need to truly synchronize with the worker thread. For example, if an OpenGL DeviceBuffer is mapped or unmapped, then `glMapBuffer` or `glUnmapBuffer` must be called on the dedicated worker thread before the call returns. To synchronize the calling thread and the worker thread, a `ManualResetEvent` is used. Once the buffer is mapped or unmapped by the worker thread, the reset event is signaled and the calling thread resumes. Because commands are executed in submission order by the worker thread, this means that a call to `GraphicsDevice.Map` will block until all previously-submitted CommandLists, as well as the actual mapping operation, are fully completed.
 

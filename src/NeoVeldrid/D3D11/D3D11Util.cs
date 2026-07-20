@@ -32,6 +32,94 @@ internal static unsafe class D3D11Util
         return (int)((arrayLayer * mipLevelCount) + mipLevel);
     }
 
+    internal static Box GetTextureRegion(
+        D3D11Texture texture,
+        uint x,
+        uint y,
+        uint z,
+        uint width,
+        uint height,
+        uint depth,
+        uint mipLevel)
+    {
+        uint right = checked(x + width);
+        uint bottom = checked(y + height);
+        if (FormatHelpers.IsCompressedFormat(texture.Format))
+        {
+            // D3D11 resources use block-padded top-level dimensions. Tiny and
+            // odd logical mip edges therefore do not necessarily coincide
+            // with the physical resource edge. Expand an edge block to the
+            // block boundary, then clamp it to the physical mip dimension.
+            // Callers identify a resulting whole-subresource region and pass
+            // a null native box; D3D11 otherwise rejects an explicit box whose
+            // tiny physical edge is smaller than one block.
+            GetTextureSubresourceStorageDimensions(
+                texture,
+                mipLevel,
+                out uint physicalMipWidth,
+                out uint physicalMipHeight,
+                out _);
+            right = Math.Min(RoundUpToBlockExtent(right), physicalMipWidth);
+            bottom = Math.Min(RoundUpToBlockExtent(bottom), physicalMipHeight);
+        }
+
+        return new Box
+        {
+            Left = x,
+            Top = y,
+            Front = z,
+            Right = right,
+            Bottom = bottom,
+            Back = checked(z + depth)
+        };
+    }
+
+    internal static void GetTextureSubresourceStorageDimensions(
+        D3D11Texture texture,
+        uint mipLevel,
+        out uint width,
+        out uint height,
+        out uint depth)
+    {
+        uint topLevelWidth = texture.Width;
+        uint topLevelHeight = texture.Height;
+        if (FormatHelpers.IsCompressedFormat(texture.Format))
+        {
+            topLevelWidth = RoundUpToBlockExtent(topLevelWidth);
+            topLevelHeight = RoundUpToBlockExtent(topLevelHeight);
+        }
+
+        width = Util.GetDimension(topLevelWidth, mipLevel);
+        height = Util.GetDimension(topLevelHeight, mipLevel);
+        depth = Util.GetDimension(texture.Depth, mipLevel);
+    }
+
+    internal static bool IsFullTextureSubresource(
+        D3D11Texture texture,
+        uint mipLevel,
+        in Box region)
+    {
+        GetTextureSubresourceStorageDimensions(
+            texture,
+            mipLevel,
+            out uint width,
+            out uint height,
+            out uint depth);
+        return region.Left == 0u
+            && region.Top == 0u
+            && region.Front == 0u
+            && region.Right == width
+            && region.Bottom == height
+            && region.Back == depth;
+    }
+
+    private static uint RoundUpToBlockExtent(uint value)
+    {
+        const ulong blockExtent = 4u;
+        return checked((uint)(((ulong)value + blockExtent - 1u) /
+            blockExtent * blockExtent));
+    }
+
     internal static ShaderResourceViewDesc GetSrvDesc(
         D3D11Texture tex,
         uint baseMipLevel,

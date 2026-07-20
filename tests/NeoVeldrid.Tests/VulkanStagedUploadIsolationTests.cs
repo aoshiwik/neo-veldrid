@@ -3,7 +3,9 @@ using System;
 using System.Collections.Generic;
 using System.Reflection;
 using NeoVeldrid.Vk;
+using Silk.NET.Vulkan;
 using Xunit;
+using Xunit.Sdk;
 
 namespace NeoVeldrid.Tests;
 
@@ -14,6 +16,619 @@ public sealed class VulkanStagedUploadIsolationTests
     private const int BoundedSubmissionCapacity = 8;
     private const int SubmissionCount = BoundedSubmissionCapacity * 3;
     private const int RegionCount = 16;
+
+    [Theory]
+    [InlineData(PixelFormat.R8_UNorm, 1u)]
+    [InlineData(PixelFormat.R8_G8_B8_A8_UNorm, 4u)]
+    [InlineData(PixelFormat.BC1_Rgba_UNorm, 8u)]
+    [InlineData(PixelFormat.BC3_UNorm, 16u)]
+    public void TextureUploadAlignmentFollowsTexelBlockSize(
+        PixelFormat format,
+        uint expectedAlignment)
+    {
+        Assert.Equal(
+            expectedAlignment,
+            VkTextureUploadRecorder.GetRequiredStagingAlignment(format));
+    }
+
+    [Fact]
+    public void AbandonedEndedTextureUploadRestoresOriginalLayout()
+    {
+        const uint size = 4;
+        Texture texture = RF.CreateTexture(
+            TextureDescription.Texture2D(
+                size,
+                size,
+                1,
+                1,
+                PixelFormat.R8_UNorm,
+                TextureUsage.Storage));
+        VkTexture vkTexture = Assert.IsType<VkTexture>(texture);
+        byte[] first = new byte[checked((int)(size * size))];
+        byte[] second = new byte[first.Length];
+        Array.Fill(first, (byte)17);
+        Array.Fill(second, (byte)93);
+        CommandList commandList = RF.CreateCommandList();
+
+        Assert.Equal(ImageLayout.Undefined, vkTexture.GetImageLayout(0, 0));
+
+        commandList.Begin();
+        commandList.UpdateTexture(
+            texture, first,
+            0, 0, 0,
+            size, size, 1,
+            0, 0);
+        commandList.End();
+        Assert.Equal(ImageLayout.General, vkTexture.GetImageLayout(0, 0));
+
+        commandList.Begin();
+        Assert.Equal(ImageLayout.Undefined, vkTexture.GetImageLayout(0, 0));
+        commandList.UpdateTexture(
+            texture, second,
+            0, 0, 0,
+            size, size, 1,
+            0, 0);
+        commandList.End();
+        GD.SubmitCommands(commandList);
+        GD.WaitForIdle();
+
+        Assert.Equal(ImageLayout.General, vkTexture.GetImageLayout(0, 0));
+    }
+
+    [Fact]
+    public void SharedTextureCommandListsMustSubmitInRecordingOrder()
+    {
+        const uint size = 4;
+        Texture texture = RF.CreateTexture(
+            TextureDescription.Texture2D(
+                size,
+                size,
+                1,
+                1,
+                PixelFormat.R8_UNorm,
+                TextureUsage.Storage));
+        byte[] first = new byte[checked((int)(size * size))];
+        byte[] second = new byte[first.Length];
+        Array.Fill(first, (byte)11);
+        Array.Fill(second, (byte)29);
+        CommandList firstCommandList = RF.CreateCommandList();
+        CommandList secondCommandList = RF.CreateCommandList();
+
+        firstCommandList.Begin();
+        firstCommandList.UpdateTexture(
+            texture, first,
+            0, 0, 0,
+            size, size, 1,
+            0, 0);
+        firstCommandList.End();
+
+        secondCommandList.Begin();
+        secondCommandList.UpdateTexture(
+            texture, second,
+            0, 0, 0,
+            size, size, 1,
+            0, 0);
+        secondCommandList.End();
+
+        NeoVeldridException error = Assert.Throws<NeoVeldridException>(
+            () => GD.SubmitCommands(secondCommandList));
+        Assert.Contains("recording order", error.Message);
+
+        GD.SubmitCommands(firstCommandList);
+        GD.SubmitCommands(secondCommandList);
+        GD.WaitForIdle();
+    }
+
+    [Fact]
+    public void OppositeOrderMultiTextureRecordingIsRejectedBeforeDependencyCycle()
+    {
+        const uint size = 4;
+        Texture firstTexture = RF.CreateTexture(
+            TextureDescription.Texture2D(
+                size,
+                size,
+                1,
+                1,
+                PixelFormat.R8_UNorm,
+                TextureUsage.Storage));
+        Texture secondTexture = RF.CreateTexture(
+            TextureDescription.Texture2D(
+                size,
+                size,
+                1,
+                1,
+                PixelFormat.R8_UNorm,
+                TextureUsage.Storage));
+        byte[] pixels = new byte[checked((int)(size * size))];
+        CommandList firstCommandList = RF.CreateCommandList();
+        CommandList secondCommandList = RF.CreateCommandList();
+
+        firstCommandList.Begin();
+        firstCommandList.UpdateTexture(
+            firstTexture, pixels,
+            0, 0, 0,
+            size, size, 1,
+            0, 0);
+
+        secondCommandList.Begin();
+        secondCommandList.UpdateTexture(
+            secondTexture, pixels,
+            0, 0, 0,
+            size, size, 1,
+            0, 0);
+
+        NeoVeldridException error = Assert.Throws<NeoVeldridException>(
+            () => firstCommandList.UpdateTexture(
+                secondTexture, pixels,
+                0, 0, 0,
+                size, size, 1,
+                0, 0));
+        Assert.Contains("cyclic submission dependencies", error.Message);
+
+        // The rejected edge was never registered, so both independent
+        // recordings remain submitable and recyclable.
+        firstCommandList.End();
+        secondCommandList.End();
+        GD.SubmitCommands(firstCommandList);
+        GD.SubmitCommands(secondCommandList);
+        GD.WaitForIdle();
+    }
+
+    [SkippableFact]
+    public void StorageWriteTransitionsToExactRenderPassInitialLayout()
+    {
+        Skip.IfNot(
+            GD.Features.ComputeShader,
+            $"NV-SKIP-COMPUTE-SHADER: Compute shaders are unavailable on {GD.BackendType}.");
+
+        const uint width = 4;
+        const uint height = 1;
+        Texture target = RF.CreateTexture(
+            TextureDescription.Texture2D(
+                width,
+                height,
+                1,
+                1,
+                PixelFormat.R32_G32_B32_A32_Float,
+                TextureUsage.Storage | TextureUsage.RenderTarget));
+        VkTexture vkTarget = Assert.IsType<VkTexture>(target);
+        Framebuffer framebuffer = RF.CreateFramebuffer(
+            new FramebufferDescription(null, target));
+        ResourceLayout computeLayout = RF.CreateResourceLayout(
+            new ResourceLayoutDescription(
+                new ResourceLayoutElementDescription(
+                    "ComputeOutput",
+                    ResourceKind.TextureReadWrite,
+                    ShaderStages.Compute)));
+        ResourceSet computeSet = RF.CreateResourceSet(
+            new ResourceSetDescription(computeLayout, target));
+        Pipeline computePipeline = RF.CreateComputePipeline(
+            new ComputePipelineDescription(
+                TestShaders.LoadCompute(RF, "ComputeTextureGenerator"),
+                computeLayout,
+                4,
+                1,
+                1));
+        CommandList commandList = RF.CreateCommandList();
+
+        commandList.Begin();
+        commandList.SetPipeline(computePipeline);
+        commandList.SetComputeResourceSet(0, computeSet);
+        commandList.Dispatch(1, 1, 1);
+        Assert.Equal(ImageLayout.General, vkTarget.GetImageLayout(0, 0));
+
+        // End emits the framebuffer's otherwise-empty load pass. Its fixed
+        // ColorAttachmentOptimal initial layout must match the explicit
+        // transition from the preceding storage use.
+        commandList.SetFramebuffer(framebuffer);
+        commandList.End();
+        Assert.Equal(
+            ImageLayout.ColorAttachmentOptimal,
+            vkTarget.GetImageLayout(0, 0));
+        GD.SubmitCommands(commandList);
+        GD.WaitForIdle();
+
+        Texture readback = GetReadback(target);
+        MappedResourceView<RgbaFloat> mapped =
+            GD.Map<RgbaFloat>(readback, MapMode.Read);
+        try
+        {
+            Assert.Equal(
+                RgbaFloat.Red,
+                mapped[0, 0],
+                RgbaFloatFuzzyComparer.Instance);
+            Assert.Equal(
+                RgbaFloat.Green,
+                mapped[1, 0],
+                RgbaFloatFuzzyComparer.Instance);
+            Assert.Equal(
+                RgbaFloat.Blue,
+                mapped[2, 0],
+                RgbaFloatFuzzyComparer.Instance);
+            Assert.Equal(
+                RgbaFloat.White,
+                mapped[3, 0],
+                RgbaFloatFuzzyComparer.Instance);
+        }
+        finally
+        {
+            GD.Unmap(readback);
+        }
+    }
+
+    [Theory]
+    [InlineData(
+        TextureUsage.Sampled | TextureUsage.Storage,
+        ImageLayout.General)]
+    [InlineData(
+        TextureUsage.Sampled | TextureUsage.RenderTarget,
+        ImageLayout.ColorAttachmentOptimal)]
+    public void TextureUploadRestoresEstablishedPreTransferLayout(
+        TextureUsage usage,
+        ImageLayout establishedLayout)
+    {
+        const uint size = 4;
+        VkGraphicsDevice graphicsDevice = Assert.IsType<VkGraphicsDevice>(GD);
+        Texture texture = RF.CreateTexture(
+            TextureDescription.Texture2D(
+                size,
+                size,
+                1,
+                1,
+                PixelFormat.R8_G8_B8_A8_UNorm,
+                usage));
+        VkTexture vkTexture = Assert.IsType<VkTexture>(texture);
+        graphicsDevice.TransitionImageLayout(vkTexture, establishedLayout);
+        byte[] pixels = new byte[checked((int)(size * size * 4u))];
+        CommandList commandList = RF.CreateCommandList();
+
+        commandList.Begin();
+        commandList.UpdateTexture(
+            texture,
+            pixels,
+            0,
+            0,
+            0,
+            size,
+            size,
+            1,
+            0,
+            0);
+
+        Assert.Equal(establishedLayout, vkTexture.GetImageLayout(0, 0));
+
+        commandList.End();
+        GD.SubmitCommands(commandList);
+        GD.WaitForIdle();
+        Assert.Equal(establishedLayout, vkTexture.GetImageLayout(0, 0));
+    }
+
+    [Fact]
+    public void RepeatedTransferOnlyTextureWritesPreserveLastPayload()
+    {
+        const uint width = 16;
+        const uint height = 8;
+        const int byteCount = (int)(width * height);
+        Texture destination = RF.CreateTexture(
+            TextureDescription.Texture2D(
+                width,
+                height,
+                1,
+                1,
+                PixelFormat.R8_UNorm,
+                (TextureUsage)0));
+        Texture capture = RF.CreateTexture(
+            TextureDescription.Texture2D(
+                width,
+                height,
+                1,
+                1,
+                PixelFormat.R8_UNorm,
+                TextureUsage.Staging));
+        byte[] first = new byte[byteCount];
+        byte[] second = new byte[byteCount];
+        Array.Fill(first, (byte)17);
+        Array.Fill(second, (byte)93);
+        CommandList commandList = RF.CreateCommandList(
+            new CommandListDescription
+            {
+                MaximumInFlightSubmissionCount = 1,
+                InitialTrackedResourceCapacityPerSubmission = 4,
+                InitialStagingUploadPageSize = (uint)(byteCount * 2)
+            });
+
+        commandList.Begin();
+        commandList.UpdateTexture(
+            destination,
+            first,
+            0,
+            0,
+            0,
+            width,
+            height,
+            1,
+            0,
+            0);
+        commandList.UpdateTexture(
+            destination,
+            second,
+            0,
+            0,
+            0,
+            width,
+            height,
+            1,
+            0,
+            0);
+        commandList.CopyTexture(destination, capture);
+        commandList.End();
+        GD.SubmitCommands(commandList);
+        GD.WaitForIdle();
+
+        MappedResourceView<byte> mapped = GD.Map<byte>(capture, MapMode.Read);
+        try
+        {
+            for (int i = 0; i < byteCount; i++)
+                Assert.Equal((byte)93, mapped[(uint)i]);
+        }
+        finally
+        {
+            GD.Unmap(capture);
+        }
+    }
+
+    [Fact]
+    public void StorageTextureUploadRestoresGeneralLayout()
+    {
+        const uint size = 8;
+        Texture texture = RF.CreateTexture(
+            TextureDescription.Texture2D(
+                size,
+                size,
+                1,
+                1,
+                PixelFormat.R32_Float,
+                TextureUsage.Storage));
+        VkTexture vkTexture = Assert.IsType<VkTexture>(texture);
+        byte[] pixels = new byte[checked((int)(size * size * 4u))];
+        CommandList commandList = RF.CreateCommandList();
+
+        commandList.Begin();
+        commandList.UpdateTexture(
+            texture,
+            pixels,
+            0,
+            0,
+            0,
+            size,
+            size,
+            1,
+            0,
+            0);
+        Assert.Equal(ImageLayout.General, vkTexture.GetImageLayout(0, 0));
+        commandList.End();
+        GD.SubmitCommands(commandList);
+        GD.WaitForIdle();
+    }
+
+    [Fact]
+    public void StorageTextureCopyRestoresGeneralLayouts()
+    {
+        const uint size = 8;
+        Texture source = RF.CreateTexture(
+            TextureDescription.Texture2D(
+                size,
+                size,
+                1,
+                1,
+                PixelFormat.R32_Float,
+                TextureUsage.Storage));
+        Texture destination = RF.CreateTexture(
+            TextureDescription.Texture2D(
+                size,
+                size,
+                1,
+                1,
+                PixelFormat.R32_Float,
+                TextureUsage.Storage));
+        VkTexture vkSource = Assert.IsType<VkTexture>(source);
+        VkTexture vkDestination = Assert.IsType<VkTexture>(destination);
+        CommandList commandList = RF.CreateCommandList();
+
+        commandList.Begin();
+        commandList.CopyTexture(source, destination);
+        Assert.Equal(ImageLayout.General, vkSource.GetImageLayout(0, 0));
+        Assert.Equal(
+            ImageLayout.General,
+            vkDestination.GetImageLayout(0, 0));
+        commandList.End();
+        GD.SubmitCommands(commandList);
+        GD.WaitForIdle();
+    }
+
+    [Fact]
+    public void RepeatedTextureCopiesToTransferOnlyDestinationPreserveLastPayload()
+    {
+        const uint width = 16;
+        const uint height = 8;
+        const int byteCount = (int)(width * height);
+        Texture firstSource = RF.CreateTexture(
+            TextureDescription.Texture2D(
+                width,
+                height,
+                1,
+                1,
+                PixelFormat.R8_UNorm,
+                TextureUsage.Sampled));
+        Texture secondSource = RF.CreateTexture(
+            TextureDescription.Texture2D(
+                width,
+                height,
+                1,
+                1,
+                PixelFormat.R8_UNorm,
+                TextureUsage.Sampled));
+        Texture destination = RF.CreateTexture(
+            TextureDescription.Texture2D(
+                width,
+                height,
+                1,
+                1,
+                PixelFormat.R8_UNorm,
+                (TextureUsage)0));
+        Texture capture = RF.CreateTexture(
+            TextureDescription.Texture2D(
+                width,
+                height,
+                1,
+                1,
+                PixelFormat.R8_UNorm,
+                TextureUsage.Staging));
+        byte[] first = new byte[byteCount];
+        byte[] second = new byte[byteCount];
+        Array.Fill(first, (byte)31);
+        Array.Fill(second, (byte)149);
+        CommandList commandList = RF.CreateCommandList(
+            new CommandListDescription
+            {
+                MaximumInFlightSubmissionCount = 1,
+                InitialTrackedResourceCapacityPerSubmission = 8,
+                InitialStagingUploadPageSize = (uint)(byteCount * 2)
+            });
+
+        commandList.Begin();
+        commandList.UpdateTexture(
+            firstSource,
+            first,
+            0,
+            0,
+            0,
+            width,
+            height,
+            1,
+            0,
+            0);
+        commandList.UpdateTexture(
+            secondSource,
+            second,
+            0,
+            0,
+            0,
+            width,
+            height,
+            1,
+            0,
+            0);
+        commandList.CopyTexture(firstSource, destination);
+        commandList.CopyTexture(secondSource, destination);
+        commandList.CopyTexture(destination, capture);
+        commandList.End();
+        GD.SubmitCommands(commandList);
+        GD.WaitForIdle();
+
+        MappedResourceView<byte> mapped = GD.Map<byte>(capture, MapMode.Read);
+        try
+        {
+            for (int i = 0; i < byteCount; i++)
+                Assert.Equal((byte)149, mapped[(uint)i]);
+        }
+        finally
+        {
+            GD.Unmap(capture);
+        }
+    }
+
+    [Fact]
+    public void RetainedTextureUploadUsesPreallocatedPageAndFrameSubmission()
+    {
+        const uint width = 64;
+        const uint height = 32;
+        const uint byteCount = width * height;
+        VkGraphicsDevice graphicsDevice = Assert.IsType<VkGraphicsDevice>(GD);
+        Texture destination = RF.CreateTexture(TextureDescription.Texture2D(
+            width,
+            height,
+            1,
+            1,
+            PixelFormat.R8_UNorm,
+            TextureUsage.Sampled));
+        Texture capture = RF.CreateTexture(TextureDescription.Texture2D(
+            width,
+            height,
+            1,
+            1,
+            PixelFormat.R8_UNorm,
+            TextureUsage.Staging));
+        byte[] pixels = new byte[checked((int)byteCount)];
+        for (int i = 0; i < pixels.Length; i++)
+            pixels[i] = unchecked((byte)(17 + (i * 29)));
+
+        VkCommandList commandList = Assert.IsType<VkCommandList>(
+            RF.CreateCommandList(new CommandListDescription
+            {
+                MaximumInFlightSubmissionCount = 1,
+                InitialTrackedResourceCapacityPerSubmission = 8,
+                InitialStagingUploadPageSize = byteCount
+            }));
+        commandList.EnableSubmissionDiagnostics(
+            initialBufferAccessCapacity: 2);
+        Assert.Equal(
+            1,
+            commandList
+                .CaptureStagingResourcePoolSnapshot()
+                .AvailableBufferCount);
+
+        GD.WaitForIdle();
+        int trackedBefore = graphicsDevice
+            .CaptureSubmissionResourcePoolSnapshot()
+            .TrackedSubmissionCount;
+        commandList.Begin();
+        long allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
+        commandList.UpdateTexture(
+            destination,
+            pixels,
+            0,
+            0,
+            0,
+            width,
+            height,
+            1,
+            0,
+            0);
+        long allocated =
+            GC.GetAllocatedBytesForCurrentThread() - allocatedBefore;
+        commandList.CopyTexture(destination, capture);
+        commandList.End();
+
+        VkCommandList.StagingResourcePoolSnapshot recordingPool =
+            commandList.CaptureStagingResourcePoolSnapshot();
+        Assert.Equal(0, recordingPool.AvailableBufferCount);
+        Assert.Equal(1, recordingPool.CurrentBufferCount);
+        Assert.InRange(allocated, 0L, 1024L);
+
+        GD.SubmitCommands(commandList);
+        Assert.True(commandList.TryGetLastSubmissionMetrics(
+            out CommandListSubmissionMetrics submissionMetrics));
+        Assert.Equal(1, submissionMetrics.UpdateTextureCallCount);
+        Assert.Equal(byteCount, submissionMetrics.UpdatedTextureBytes);
+        Assert.Equal(
+            trackedBefore + 1,
+            graphicsDevice
+                .CaptureSubmissionResourcePoolSnapshot()
+                .TrackedSubmissionCount);
+        GD.WaitForIdle();
+
+        MappedResourceView<byte> mapped = GD.Map<byte>(capture, MapMode.Read);
+        try
+        {
+            for (uint i = 0; i < byteCount; i++)
+                Assert.Equal(pixels[checked((int)i)], mapped[i]);
+        }
+        finally
+        {
+            GD.Unmap(capture);
+        }
+    }
 
     [Fact]
     public void BoundedSubmissionsPreserveEveryStagedUpdatePayload()
@@ -374,6 +989,46 @@ public sealed class VulkanStagedUploadIsolationTests
         {
             GD.Unmap(capture);
         }
+
+        Texture stagingTexture = RF.CreateTexture(TextureDescription.Texture2D(
+            2,
+            2,
+            1,
+            1,
+            PixelFormat.R8_UNorm,
+            TextureUsage.Staging));
+        Texture deviceTexture = RF.CreateTexture(TextureDescription.Texture2D(
+            2,
+            2,
+            1,
+            1,
+            PixelFormat.R8_UNorm,
+            TextureUsage.Sampled));
+        GD.UpdateTexture(
+            stagingTexture,
+            new byte[] { 1, 2, 3, 4 },
+            0, 0, 0,
+            2, 2, 1,
+            0, 0);
+
+        commandList.Begin();
+        commandList.CopyTexture(stagingTexture, deviceTexture);
+        commandList.End();
+
+        GD.Map(stagingTexture, MapMode.Write);
+        try
+        {
+            NeoVeldridException error = Assert.Throws<NeoVeldridException>(
+                () => GD.SubmitCommands(commandList));
+            Assert.Contains("host access is active", error.Message);
+        }
+        finally
+        {
+            GD.Unmap(stagingTexture);
+        }
+
+        GD.SubmitCommands(commandList);
+        GD.WaitForIdle();
     }
 
     [Fact]

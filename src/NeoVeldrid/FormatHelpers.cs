@@ -1,5 +1,4 @@
 using System;
-using System.Diagnostics;
 
 namespace NeoVeldrid;
 
@@ -125,12 +124,13 @@ internal static class FormatHelpers
             case PixelFormat.ETC2_R8_G8_B8_UNorm:
             case PixelFormat.ETC2_R8_G8_B8_A1_UNorm:
             case PixelFormat.ETC2_R8_G8_B8_A8_UNorm:
-                var blocksPerRow = (width + 3) / 4;
+                uint blocksPerRow = DivideRoundUp(width, 4u);
                 var blockSizeInBytes = GetBlockSizeInBytes(format);
-                return blocksPerRow * blockSizeInBytes;
+                return checked(blocksPerRow * blockSizeInBytes);
 
             default:
-                return width * FormatSizeHelpers.GetSizeInBytes(format);
+                return checked(
+                    width * FormatSizeHelpers.GetSizeInBytes(format));
         }
     }
 
@@ -200,7 +200,7 @@ internal static class FormatHelpers
             case PixelFormat.ETC2_R8_G8_B8_UNorm:
             case PixelFormat.ETC2_R8_G8_B8_A1_UNorm:
             case PixelFormat.ETC2_R8_G8_B8_A8_UNorm:
-                return (height + 3) / 4;
+                return DivideRoundUp(height, 4u);
 
             default:
                 return height;
@@ -209,26 +209,22 @@ internal static class FormatHelpers
 
     internal static uint GetDepthPitch(uint rowPitch, uint height, PixelFormat format)
     {
-        return rowPitch * GetNumRows(height, format);
+        return checked(rowPitch * GetNumRows(height, format));
     }
 
     internal static uint GetRegionSize(uint width, uint height, uint depth, PixelFormat format)
     {
-        uint blockSizeInBytes;
-        if (IsCompressedFormat(format))
-        {
-            Debug.Assert((width % 4 == 0 || width < 4) && (height % 4 == 0 || height < 4));
-            blockSizeInBytes = GetBlockSizeInBytes(format);
-            width /= 4;
-            height /= 4;
-        }
-        else
-        {
-            blockSizeInBytes = FormatSizeHelpers.GetSizeInBytes(format);
-        }
-
-        return width * height * depth * blockSizeInBytes;
+        // Row and depth pitch are the authoritative storage-shape rules. In
+        // particular, compressed dimensions occupy ceiling-divided block rows
+        // and columns; truncating odd logical dimensions here would make mip
+        // offsets disagree with the actual staging allocation.
+        uint rowPitch = GetRowPitch(width, format);
+        uint depthPitch = GetDepthPitch(rowPitch, height, format);
+        return checked(depthPitch * depth);
     }
+
+    private static uint DivideRoundUp(uint value, uint divisor) =>
+        checked((uint)(((ulong)value + divisor - 1u) / divisor));
 
     internal static TextureSampleCount GetSampleCount(uint samples)
     {

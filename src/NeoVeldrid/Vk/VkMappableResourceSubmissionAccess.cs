@@ -3,10 +3,11 @@ using System;
 namespace NeoVeldrid.Vk;
 
 /// <summary>
-/// Coordinates host writes with submitted GPU uses of one Vulkan buffer.
-/// Resource reference counts protect lifetime; this state protects the bytes.
+/// Coordinates host access with submitted GPU uses of one Vulkan mappable
+/// resource. Resource reference counts protect lifetime; this state protects
+/// the bytes from concurrent host and device access.
 /// </summary>
-internal sealed class VkBufferSubmissionAccess
+internal sealed class VkMappableResourceSubmissionAccess
 {
     private readonly object _sync = new object();
     private int _submissionUseCount;
@@ -53,7 +54,7 @@ internal sealed class VkBufferSubmissionAccess
             if (_hostWriteActive || _hostMapCount != 0)
             {
                 throw new NeoVeldridException(
-                    "A Vulkan buffer cannot enter submission use while host access is active.");
+                    "A Vulkan mappable resource cannot enter submission use while host access is active.");
             }
 
             _submissionUseCount = checked(_submissionUseCount + 1);
@@ -67,7 +68,7 @@ internal sealed class VkBufferSubmissionAccess
             if (_submissionUseCount <= 0)
             {
                 throw new NeoVeldridException(
-                    "A Vulkan buffer submission use was released without a matching acquisition.");
+                    "A Vulkan mappable resource submission use was released without a matching acquisition.");
             }
 
             _submissionUseCount--;
@@ -81,22 +82,22 @@ internal sealed class VkBufferSubmissionAccess
             if (_hostWriteActive)
             {
                 throw new NeoVeldridException(
-                    $"Vulkan buffer '{DisplayName(resourceName)}' already has an active direct host write.");
+                    $"Vulkan resource '{DisplayName(resourceName)}' already has an active direct host write.");
             }
 
             if (_hostMapCount != 0)
             {
                 throw new NeoVeldridException(
-                    $"Direct host update of Vulkan buffer '{DisplayName(resourceName)}' was rejected because " +
+                    $"Direct host update of Vulkan resource '{DisplayName(resourceName)}' was rejected because " +
                     $"it has {_hostMapCount} active map(s).");
             }
 
             if (_submissionUseCount != 0)
             {
                 throw new NeoVeldridException(
-                    $"Direct host update of Vulkan buffer '{DisplayName(resourceName)}' was rejected because " +
+                    $"Direct host update of Vulkan resource '{DisplayName(resourceName)}' was rejected because " +
                     $"{_submissionUseCount} submitted GPU use(s) have not completed. Use a frame slot or " +
-                    "CommandList.UpdateBuffer instead.");
+                    "a command-list update instead.");
             }
 
             _hostWriteActive = true;
@@ -110,7 +111,7 @@ internal sealed class VkBufferSubmissionAccess
             if (!_hostWriteActive)
             {
                 throw new NeoVeldridException(
-                    "A Vulkan buffer host write was released without a matching acquisition.");
+                    "A Vulkan mappable resource host write was released without a matching acquisition.");
             }
 
             _hostWriteActive = false;
@@ -124,12 +125,12 @@ internal sealed class VkBufferSubmissionAccess
             if (_hostWriteActive)
             {
                 throw new NeoVeldridException(
-                    $"Vulkan buffer '{DisplayName(resourceName)}' cannot be mapped during a direct host write.");
+                    $"Vulkan resource '{DisplayName(resourceName)}' cannot be mapped during a direct host write.");
             }
             if (_submissionUseCount != 0)
             {
                 throw new NeoVeldridException(
-                    $"Mapping Vulkan buffer '{DisplayName(resourceName)}' was rejected because " +
+                    $"Mapping Vulkan resource '{DisplayName(resourceName)}' was rejected because " +
                     $"{_submissionUseCount} submitted GPU use(s) have not completed.");
             }
 
@@ -144,7 +145,7 @@ internal sealed class VkBufferSubmissionAccess
             if (_hostMapCount <= 0)
             {
                 throw new NeoVeldridException(
-                    "A Vulkan buffer map was released without a matching acquisition.");
+                    "A Vulkan mappable resource map was released without a matching acquisition.");
             }
 
             _hostMapCount--;

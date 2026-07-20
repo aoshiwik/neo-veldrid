@@ -1,28 +1,311 @@
 name: Tests
 
+run-name: >-
+  ${{ github.event_name == 'workflow_dispatch'
+      && format('PR #{0} qualification', inputs.pull_request_number)
+      || github.event_name == 'pull_request'
+      && format('PR #{0} qualification', github.event.pull_request.number)
+      || format('{0} qualification', github.ref_name) }}
+
 on:
   push:
-    branches: [main]
+    branches: [main, 'codex/**']
   pull_request:
     # Validate main-targeted changes and stacked Codex review branches.
     branches: [main, 'codex/**']
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+  workflow_dispatch:
+    inputs:
+      pull_request_number:
+        description: Pull request whose current synthetic merge ref must be validated
+        required: true
+        type: number
+      merge_sha:
+        description: Immutable synthetic merge commit already verified by the dispatcher
+        required: true
+        type: string
 
+# Direct PR events and dispatcher-created qualifications for the same PR share
+# one lane. Runs are serialized so their aggregate publishers cannot overlap;
+# a queued newer run is detected before the older run publishes.
+concurrency:
+  group: >-
+    neoveldrid-ci-${{ github.event_name == 'pull_request'
+        && format('pr-{0}', github.event.pull_request.number)
+        || github.event_name == 'workflow_dispatch'
+        && format('pr-{0}', inputs.pull_request_number)
+        || format('ref-{0}', github.ref) }}
+  cancel-in-progress: false
+
+env:
+  STACKED_STATUS_CONTEXT: NeoVeldrid / stacked qualification
+  # The dispatcher checks this marker on the default branch before attempting
+  # workflow_dispatch. GitHub cannot activate a new dispatch contract until the
+  # workflow containing it has landed on the repository's default branch.
+  STACKED_DISPATCH_CONTRACT_VERSION: '1'
+
+# Trust model: codex/** branches and same-repository PR heads are controlled
+# only by trusted repository writers. Fork PRs run read-only CI and never
+# receive the write-scoped aggregate qualification status.
 jobs:
+  revalidate-downstream-stacks:
+    name: Revalidate downstream stacked pull requests
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/codex/') }}
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: read
+      statuses: write
+    steps:
+      - name: Dispatch current downstream PR merge refs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_BRANCH: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          publish_status() {
+            local merge_sha=$1
+            local state=$2
+            local description=$3
+            gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$merge_sha" \
+              -f state="$state" \
+              -f context="$STACKED_STATUS_CONTEXT" \
+              -f description="$description" \
+              -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+              >/dev/null
+          }
+
+          # A workflow_dispatch trigger is recognized only after its workflow is
+          # present on the default branch. This marker is a safe bootstrap guard,
+          # not a substitute for the dispatch API's own acceptance check.
+          default_workflow=$(gh api \
+            -H "Accept: application/vnd.github.raw+json" \
+            "repos/$GITHUB_REPOSITORY/contents/.github/workflows/ci.yml?ref=$DEFAULT_BRANCH")
+          expected_contract="STACKED_DISPATCH_CONTRACT_VERSION: '$STACKED_DISPATCH_CONTRACT_VERSION'"
+          if ! grep -Fq "$expected_contract" <<< "$default_workflow"; then
+            echo "::notice::Stacked dispatch contract version $STACKED_DISPATCH_CONTRACT_VERSION is not active on $DEFAULT_BRANCH yet; branch and PR qualification remain available."
+            exit 0
+          fi
+
+          downstream_prs=$(gh api --method GET "repos/$GITHUB_REPOSITORY/pulls" \
+            -f state=open \
+            -f base="$BASE_BRANCH" \
+            -f per_page=100 \
+            --paginate \
+            --jq '.[].number')
+
+          if [[ -z "$downstream_prs" ]]; then
+            echo "No open pull requests currently target $BASE_BRANCH."
+            exit 0
+          fi
+
+          dispatch_failed=0
+          while IFS= read -r pull_request_number; do
+            merge_ref_ready=0
+            for attempt in $(seq 1 12); do
+              pull_request=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pull_request_number")
+              head_repository=$(jq -r '.head.repo.full_name // ""' <<< "$pull_request")
+              if [[ "$head_repository" != "$GITHUB_REPOSITORY" ]]; then
+                echo "Skipping fork PR #$pull_request_number from ${head_repository:-an unavailable repository}."
+                merge_ref_ready=2
+                break
+              fi
+
+              read -r pull_request_state base_repository base_sha head_sha merge_sha <<< "$(
+                jq -r '[.state, .base.repo.full_name, .base.sha, .head.sha, (.merge_commit_sha // "")] | @tsv' \
+                  <<< "$pull_request"
+              )"
+              merge_parents=""
+              if [[ -n "$merge_sha" ]]; then
+                merge_parents=$(gh api \
+                  "repos/$GITHUB_REPOSITORY/git/commits/$merge_sha" \
+                  --jq '[.parents[].sha] | @tsv' 2>/dev/null || true)
+              fi
+              read -r first_parent second_parent extra_parent <<< "$merge_parents"
+
+              if [[ "$pull_request_state" == open \
+                && "$base_repository" == "$GITHUB_REPOSITORY" \
+                && "$first_parent" == "$base_sha" \
+                && "$second_parent" == "$head_sha" \
+                && -z "$extra_parent" ]]; then
+                merge_ref_ready=1
+                break
+              fi
+
+              if [[ "$attempt" -lt 12 ]]; then
+                sleep 5
+              fi
+            done
+
+            if [[ "$merge_ref_ready" -eq 2 ]]; then
+              continue
+            fi
+            if [[ "$merge_ref_ready" -ne 1 ]]; then
+              echo "::error::PR #$pull_request_number has no current synthetic merge ref for $BASE_BRANCH."
+              dispatch_failed=1
+              continue
+            fi
+
+            publish_status \
+              "$merge_sha" \
+              pending \
+              "Waiting for aggregate qualification of stacked PR #$pull_request_number."
+
+            if ! gh workflow run ci.yml \
+              --repo "$GITHUB_REPOSITORY" \
+              --ref "$DEFAULT_BRANCH" \
+              --raw-field pull_request_number="$pull_request_number" \
+              --raw-field merge_sha="$merge_sha"; then
+              publish_status \
+                "$merge_sha" \
+                failure \
+                "Unable to dispatch stacked PR #$pull_request_number qualification."
+              dispatch_failed=1
+              continue
+            fi
+            echo "Dispatched validation for PR #$pull_request_number at $merge_sha."
+          done <<< "$downstream_prs"
+
+          exit "$dispatch_failed"
+
+  claim-stacked-qualification:
+    name: Claim aggregate stacked qualification
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch'
+          || (github.event_name == 'pull_request'
+              && github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: ubuntu-24.04
+    outputs:
+      status_id: ${{ steps.claim.outputs.status_id }}
+    permissions:
+      contents: read
+      pull-requests: read
+      statuses: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PULL_REQUEST_NUMBER: >-
+        ${{ github.event_name == 'workflow_dispatch'
+            && inputs.pull_request_number
+            || github.event.pull_request.number }}
+      EXPECTED_MERGE_SHA: >-
+        ${{ github.event_name == 'workflow_dispatch'
+            && inputs.merge_sha
+            || github.sha }}
+    steps:
+      # This no-checkout job is the only early write-scoped job. Publishing a
+      # run-owned pending status prevents an older green aggregate from
+      # remaining authoritative while the current qualification is in flight.
+      - name: Verify merge freshness and claim aggregate status
+        id: claim
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$EXPECTED_MERGE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Expected merge SHA is not a canonical full SHA."
+            exit 1
+          fi
+
+          pull_request=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PULL_REQUEST_NUMBER")
+          read -r pull_request_state base_repository base_sha head_repository head_sha current_merge_sha <<< "$(
+            jq -r '[.state, .base.repo.full_name, .base.sha, (.head.repo.full_name // ""), .head.sha, (.merge_commit_sha // "")] | @tsv' \
+              <<< "$pull_request"
+          )"
+          read -r first_parent second_parent extra_parent <<< "$(
+            gh api "repos/$GITHUB_REPOSITORY/git/commits/$EXPECTED_MERGE_SHA" \
+              --jq '[.parents[].sha] | @tsv'
+          )"
+
+          if [[ "$pull_request_state" != open \
+            || "$base_repository" != "$GITHUB_REPOSITORY" \
+            || "$head_repository" != "$GITHUB_REPOSITORY" \
+            || "$current_merge_sha" != "$EXPECTED_MERGE_SHA" \
+            || "$first_parent" != "$base_sha" \
+            || "$second_parent" != "$head_sha" \
+            || -n "$extra_parent" ]]; then
+            echo "::error::PR #$PULL_REQUEST_NUMBER is not an open same-repository PR at the expected current merge commit."
+            exit 1
+          fi
+
+          claim_response=$(gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$EXPECTED_MERGE_SHA" \
+            -f state=pending \
+            -f context="$STACKED_STATUS_CONTEXT" \
+            -f description="Aggregate qualification is running in workflow run $GITHUB_RUN_NUMBER." \
+            -f target_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")
+          claim_status_id=$(jq -r '.id // empty' <<< "$claim_response")
+          if [[ ! "$claim_status_id" =~ ^[0-9]+$ ]]; then
+            echo "::error::GitHub did not return a canonical aggregate status ID."
+            exit 1
+          fi
+          echo "status_id=$claim_status_id" >> "$GITHUB_OUTPUT"
+
   build-and-test:
+    # Keep the full matrix on codex/** pushes as well as PR events. This lets a
+    # branch validate changes to this workflow before its base branch has the
+    # new workflow_dispatch contract, while the dispatcher protects downstream
+    # stacked PRs after that contract lands.
+    permissions:
+      contents: read
+      pull-requests: read
+    name: >-
+      ${{ github.event_name == 'workflow_dispatch'
+          && format('Stacked dispatch qualification ({0})', matrix.os)
+          || github.event_name == 'pull_request'
+          && format('PR merge qualification ({0})', matrix.os)
+          || format('Branch bootstrap qualification ({0})', matrix.os) }}
     strategy:
       fail-fast: false
       matrix:
         os: [windows-latest, ubuntu-24.04, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    # Linux intentionally continues through up to 105 minutes of bounded test
+    # steps after failures. Leave enough outer budget for setup, validation,
+    # artifact publication, and orderly teardown as well.
+    timeout-minutes: 150
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.merge_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Verify dispatched PR merge ref freshness
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PULL_REQUEST_NUMBER: ${{ inputs.pull_request_number }}
+          EXPECTED_MERGE_SHA: ${{ inputs.merge_sha }}
+        run: |
+          set -euo pipefail
+
+          pull_request=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PULL_REQUEST_NUMBER")
+          read -r pull_request_state base_repository base_sha head_repository head_sha merge_sha <<< "$(
+            jq -r '[.state, .base.repo.full_name, .base.sha, (.head.repo.full_name // ""), .head.sha, (.merge_commit_sha // "")] | @tsv' \
+              <<< "$pull_request"
+          )"
+          checked_out_sha=$(git rev-parse HEAD)
+          read -r first_parent second_parent extra_parent <<< "$(git show --no-patch --format=%P HEAD)"
+
+          test "$pull_request_state" = open
+          test "$base_repository" = "$GITHUB_REPOSITORY"
+          test "$head_repository" = "$GITHUB_REPOSITORY"
+          test "$checked_out_sha" = "$EXPECTED_MERGE_SHA"
+          test "$merge_sha" = "$EXPECTED_MERGE_SHA"
+          test "$first_parent" = "$base_sha"
+          test "$second_parent" = "$head_sha"
+          test -z "$extra_parent"
 
       - name: Setup .NET
-        uses: actions/setup-dotnet@v5
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5
         with:
-          dotnet-version: '10.0.x'
+          # The exact-result validator treats TRX structure as evidence, so the
+          # producer SDK is part of the qualification contract.
+          dotnet-version: '10.0.302'
 
       # Hosted Linux runners do not expose a physical GPU or display. Mesa's
       # llvmpipe/lavapipe drivers plus Xvfb provide deterministic software
@@ -35,6 +318,7 @@ jobs:
             libegl1 \
             libgl1-mesa-dri \
             libgles2 \
+            mesa-utils \
             mesa-vulkan-drivers \
             vulkan-tools \
             vulkan-validationlayers \
@@ -59,54 +343,174 @@ jobs:
       - name: Build
         run: dotnet build NeoVeldrid.slnx -c Release
 
+      - name: Create validation artifact directories
+        shell: pwsh
+        run: >-
+          New-Item -ItemType Directory -Force
+          artifacts/test-results/spirv,
+          artifacts/test-results/d3d11,
+          artifacts/test-results/vulkan,
+          artifacts/test-results/opengl,
+          artifacts/test-results/opengles,
+          artifacts/test-results/non-gpu |
+          Out-Null
+
       - name: Run SPIRV tests
-        run: dotnet test tests/NeoVeldrid.SPIRV.Tests/NeoVeldrid.SPIRV.Tests.csproj -c Release --no-build
+        timeout-minutes: 10
+        run: >-
+          dotnet test tests/NeoVeldrid.SPIRV.Tests/NeoVeldrid.SPIRV.Tests.csproj -c Release --no-build
+          --blame-hang --blame-hang-timeout 5m
+          --logger "trx;LogFileName=spirv.trx"
+          --results-directory artifacts/test-results/spirv
+
+      - name: Validate SPIRV result integrity
+        if: ${{ !cancelled() }}
+        run: >-
+          dotnet run --project eng/NeoVeldrid.TestResultValidator/NeoVeldrid.TestResultValidator.csproj
+          -c Release --no-build --
+          --policy eng/validation/test-result-policy.json
+          --suite SPIRV
+          --results artifacts/test-results/spirv/spirv.trx
+          --output artifacts/test-results/spirv/summary.json
+
+      - name: Run D3D11 GPU tests (Windows)
+        if: ${{ runner.os == 'Windows' && !cancelled() }}
+        timeout-minutes: 20
+        env:
+          NEOVELDRID_REQUIRE_API_VALIDATION: '1'
+          NEOVELDRID_REQUIRE_D3D11_DEBUG: '1'
+        run: >-
+          dotnet test tests/NeoVeldrid.Tests/NeoVeldrid.Tests.csproj -c Release --no-build
+          --filter "Backend=D3D11"
+          --blame-hang --blame-hang-timeout 10m
+          --logger "trx;LogFileName=d3d11.trx"
+          --results-directory artifacts/test-results/d3d11
+
+      - name: Validate D3D11 result and skip integrity
+        if: ${{ runner.os == 'Windows' && !cancelled() }}
+        run: >-
+          dotnet run --project eng/NeoVeldrid.TestResultValidator/NeoVeldrid.TestResultValidator.csproj
+          -c Release --no-build --
+          --policy eng/validation/test-result-policy.json
+          --suite D3D11
+          --results artifacts/test-results/d3d11/d3d11.trx
+          --output artifacts/test-results/d3d11/summary.json
+
+      - name: Capture D3D11 adapter metadata
+        if: ${{ runner.os == 'Windows' && !cancelled() }}
+        shell: pwsh
+        run: >-
+          Get-CimInstance Win32_VideoController |
+          Select-Object Name, AdapterCompatibility, DriverVersion, PNPDeviceID |
+          ConvertTo-Json |
+          Set-Content artifacts/test-results/d3d11/adapter.json
 
       - name: Verify Vulkan software driver (Linux)
-        if: runner.os == 'Linux'
+        if: ${{ runner.os == 'Linux' && !cancelled() }}
+        shell: bash
         env:
           GALLIUM_DRIVER: llvmpipe
           LIBGL_ALWAYS_SOFTWARE: 'true'
-        run: >-
-          xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24"
-          vulkaninfo --summary
+        run: |
+          set -o pipefail
+          xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" \
+            vulkaninfo --summary | tee artifacts/test-results/vulkan-adapter.txt
 
       # xunit.runner.json serializes collections because SDL window creation and
       # graphics-device initialization are process-global operations.
       - name: Run Vulkan GPU tests with Mesa software drivers (Linux)
         if: ${{ runner.os == 'Linux' && !cancelled() }}
+        timeout-minutes: 30
         env:
           GALLIUM_DRIVER: llvmpipe
           LIBGL_ALWAYS_SOFTWARE: 'true'
+          NEOVELDRID_REQUIRE_API_VALIDATION: '1'
+          NEOVELDRID_VULKAN_VALIDATION: RequiredSynchronization
           SDL_VIDEODRIVER: x11
         run: >-
           xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24"
           dotnet test tests/NeoVeldrid.Tests/NeoVeldrid.Tests.csproj -c Release --no-build
           --filter "Backend=Vulkan"
+          --blame-hang --blame-hang-timeout 10m
+          --logger "trx;LogFileName=vulkan.trx"
+          --results-directory artifacts/test-results/vulkan
 
-      - name: Run OpenGL GPU tests with Mesa software drivers (Linux)
+      - name: Validate Vulkan result and skip integrity
         if: ${{ runner.os == 'Linux' && !cancelled() }}
+        run: >-
+          dotnet run --project eng/NeoVeldrid.TestResultValidator/NeoVeldrid.TestResultValidator.csproj
+          -c Release --no-build --
+          --policy eng/validation/test-result-policy.json
+          --suite Vulkan
+          --results artifacts/test-results/vulkan/vulkan.trx
+          --output artifacts/test-results/vulkan/summary.json
+
+      - name: Capture OpenGL adapter metadata (Linux)
+        if: ${{ runner.os == 'Linux' && !cancelled() }}
+        shell: bash
         env:
           GALLIUM_DRIVER: llvmpipe
           LIBGL_ALWAYS_SOFTWARE: 'true'
+        run: |
+          set -o pipefail
+          xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24" \
+            glxinfo -B | tee artifacts/test-results/opengl-adapter.txt
+
+      - name: Run OpenGL GPU tests with Mesa software drivers (Linux)
+        if: ${{ runner.os == 'Linux' && !cancelled() }}
+        timeout-minutes: 20
+        env:
+          GALLIUM_DRIVER: llvmpipe
+          LIBGL_ALWAYS_SOFTWARE: 'true'
+          NEOVELDRID_REQUIRE_API_VALIDATION: '1'
+          NEOVELDRID_REQUIRE_OPENGL_DEBUG: '1'
           SDL_VIDEODRIVER: x11
           SDL_VIDEO_X11_FORCE_EGL: '1'
         run: >-
           xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24"
           dotnet test tests/NeoVeldrid.Tests/NeoVeldrid.Tests.csproj -c Release --no-build
           --filter "Backend=OpenGL"
+          --blame-hang --blame-hang-timeout 10m
+          --logger "trx;LogFileName=opengl.trx"
+          --results-directory artifacts/test-results/opengl
+
+      - name: Validate OpenGL result and skip integrity
+        if: ${{ runner.os == 'Linux' && !cancelled() }}
+        run: >-
+          dotnet run --project eng/NeoVeldrid.TestResultValidator/NeoVeldrid.TestResultValidator.csproj
+          -c Release --no-build --
+          --policy eng/validation/test-result-policy.json
+          --suite OpenGL
+          --results artifacts/test-results/opengl/opengl.trx
+          --output artifacts/test-results/opengl/summary.json
 
       - name: Run OpenGL ES GPU tests with Mesa software drivers (Linux)
         if: ${{ runner.os == 'Linux' && !cancelled() }}
+        timeout-minutes: 20
         env:
           GALLIUM_DRIVER: llvmpipe
           LIBGL_ALWAYS_SOFTWARE: 'true'
+          NEOVELDRID_REQUIRE_API_VALIDATION: '1'
+          NEOVELDRID_REQUIRE_OPENGL_DEBUG: '1'
           SDL_VIDEODRIVER: x11
           SDL_VIDEO_X11_FORCE_EGL: '1'
         run: >-
           xvfb-run --auto-servernum --server-args="-screen 0 1280x1024x24"
           dotnet test tests/NeoVeldrid.Tests/NeoVeldrid.Tests.csproj -c Release --no-build
           --filter "Backend=OpenGLES"
+          --blame-hang --blame-hang-timeout 10m
+          --logger "trx;LogFileName=opengles.trx"
+          --results-directory artifacts/test-results/opengles
+
+      - name: Validate OpenGL ES result and skip integrity
+        if: ${{ runner.os == 'Linux' && !cancelled() }}
+        run: >-
+          dotnet run --project eng/NeoVeldrid.TestResultValidator/NeoVeldrid.TestResultValidator.csproj
+          -c Release --no-build --
+          --policy eng/validation/test-result-policy.json
+          --suite OpenGLES
+          --results artifacts/test-results/opengles/opengles.trx
+          --output artifacts/test-results/opengles/summary.json
 
       # ImageTint exercises bounded submissions, texture upload and sampling,
       # uniform buffers, graphics pipelines, staging readback, and PNG output.
@@ -114,6 +518,7 @@ jobs:
       # outputs, and artifacts make the result inspectable.
       - name: Render cross-backend visual smoke images (Linux)
         if: ${{ runner.os == 'Linux' && !cancelled() }}
+        timeout-minutes: 15
         env:
           GALLIUM_DRIVER: llvmpipe
           LIBGL_ALWAYS_SOFTWARE: 'true'
@@ -150,41 +555,199 @@ jobs:
 
       - name: Publish Vulkan visual smoke image
         if: ${{ runner.os == 'Linux' && !cancelled() }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           path: artifacts/visual/image-tint-vulkan.png
           archive: false
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 14
 
       - name: Publish OpenGL visual smoke image
         if: ${{ runner.os == 'Linux' && !cancelled() }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           path: artifacts/visual/image-tint-opengl.png
           archive: false
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 14
 
       - name: Publish OpenGL ES visual smoke image
         if: ${{ runner.os == 'Linux' && !cancelled() }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           path: artifacts/visual/image-tint-opengles.png
           archive: false
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 14
 
       - name: Run non-GPU tests
-        run: dotnet test tests/NeoVeldrid.Tests/NeoVeldrid.Tests.csproj -c Release -p:ExcludeGPU=true
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        run: >-
+          dotnet test tests/NeoVeldrid.Tests/NeoVeldrid.Tests.csproj -c Release -p:ExcludeGPU=true
+          --blame-hang --blame-hang-timeout 5m
+          --logger "trx;LogFileName=non-gpu.trx"
+          --results-directory artifacts/test-results/non-gpu
+
+      - name: Validate non-GPU result integrity
+        if: ${{ !cancelled() }}
+        run: >-
+          dotnet run --project eng/NeoVeldrid.TestResultValidator/NeoVeldrid.TestResultValidator.csproj
+          -c Release --no-build --
+          --policy eng/validation/test-result-policy.json
+          --suite NonGPU
+          --results artifacts/test-results/non-gpu/non-gpu.trx
+          --output artifacts/test-results/non-gpu/summary.json
 
       - name: Build without D3D11
-        if: runner.os == 'Windows'
+        if: ${{ runner.os == 'Windows' && !cancelled() }}
         run: dotnet build tests/NeoVeldrid.Tests/NeoVeldrid.Tests.csproj -c Release -p:ExcludeD3D11=true
 
       - name: Build without Vulkan
+        if: ${{ !cancelled() }}
         run: dotnet build tests/NeoVeldrid.Tests/NeoVeldrid.Tests.csproj -c Release -p:ExcludeVulkan=true
 
       - name: Build without OpenGL
-        if: runner.os == 'Windows' || runner.os == 'Linux'
+        if: ${{ (runner.os == 'Windows' || runner.os == 'Linux') && !cancelled() }}
         run: dotnet build tests/NeoVeldrid.Tests/NeoVeldrid.Tests.csproj -c Release -p:ExcludeOpenGL=true
+
+      - name: Publish machine-readable test and validation results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: test-results-${{ matrix.os }}
+          path: artifacts/test-results
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-stacked-qualification:
+    name: Publish aggregate stacked qualification
+    if: >-
+      ${{ always()
+          && (github.event_name == 'workflow_dispatch'
+              || (github.event_name == 'pull_request'
+                  && github.event.pull_request.head.repo.full_name == github.repository)) }}
+    needs: [claim-stacked-qualification, build-and-test]
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+      statuses: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PULL_REQUEST_NUMBER: >-
+        ${{ github.event_name == 'workflow_dispatch'
+            && inputs.pull_request_number
+            || github.event.pull_request.number }}
+      EXPECTED_MERGE_SHA: >-
+        ${{ github.event_name == 'workflow_dispatch'
+            && inputs.merge_sha
+            || github.sha }}
+      QUALIFICATION_RESULT: ${{ needs.build-and-test.result }}
+      CLAIM_RESULT: ${{ needs.claim-stacked-qualification.result }}
+      CLAIM_STATUS_ID: ${{ needs.claim-stacked-qualification.outputs.status_id }}
+      QUALIFICATION_RUN_TITLE: >-
+        ${{ github.event_name == 'workflow_dispatch'
+            && format('PR #{0} qualification', inputs.pull_request_number)
+            || github.event_name == 'pull_request'
+            && format('PR #{0} qualification', github.event.pull_request.number)
+            || format('{0} qualification', github.ref_name) }}
+    steps:
+      # This job deliberately performs no checkout and executes only this
+      # inline publisher. It is the sole owner of the write-scoped aggregate status.
+      - name: Verify merge freshness and publish aggregate status
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "$CLAIM_RESULT" != success ]]; then
+            echo "::error::Aggregate ownership was not claimed; refusing terminal publication."
+            exit 1
+          fi
+
+          if [[ ! "$EXPECTED_MERGE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Expected merge SHA is not a canonical full SHA."
+            exit 1
+          fi
+
+          pull_request=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PULL_REQUEST_NUMBER")
+          read -r pull_request_state base_repository base_sha head_repository head_sha current_merge_sha <<< "$(
+            jq -r '[.state, .base.repo.full_name, .base.sha, (.head.repo.full_name // ""), .head.sha, (.merge_commit_sha // "")] | @tsv' \
+              <<< "$pull_request"
+          )"
+
+          if [[ "$pull_request_state" != open \
+            || "$base_repository" != "$GITHUB_REPOSITORY" \
+            || "$head_repository" != "$GITHUB_REPOSITORY" \
+            || "$current_merge_sha" != "$EXPECTED_MERGE_SHA" ]]; then
+            echo "::error::PR #$PULL_REQUEST_NUMBER is not an open same-repository PR at the expected merge SHA."
+            exit 1
+          fi
+
+          read -r first_parent second_parent extra_parent <<< "$(
+            gh api "repos/$GITHUB_REPOSITORY/git/commits/$EXPECTED_MERGE_SHA" \
+              --jq '[.parents[].sha] | @tsv'
+          )"
+          if [[ "$first_parent" != "$base_sha" \
+            || "$second_parent" != "$head_sha" \
+            || -n "$extra_parent" ]]; then
+            echo "::error::PR #$PULL_REQUEST_NUMBER merge parents are not the current base and head commits."
+            exit 1
+          fi
+
+          # A newer run in this serialized PR lane is visible while queued. Its
+          # greater workflow run number supersedes this result even before it
+          # can start and replace the pending status claim.
+          recent_runs=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?per_page=100")
+          latest_run_id=$(jq -r --arg title "$QUALIFICATION_RUN_TITLE" '
+            [.workflow_runs[]
+              | select(.display_title == $title)
+              | select(.conclusion != "cancelled")]
+            | max_by(.run_number)
+            | (.id // empty)' <<< "$recent_runs")
+          if [[ "$latest_run_id" != "$GITHUB_RUN_ID" ]]; then
+            echo "::notice::Workflow run $GITHUB_RUN_ID was superseded by a newer PR qualification; skipping stale aggregate publication."
+            exit 0
+          fi
+
+          # The monotonically increasing commit-status ID is the second
+          # ownership guard: no other run or actor may have replaced this
+          # run's exact pending claim before terminal publication.
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          recent_statuses=$(gh api \
+            "repos/$GITHUB_REPOSITORY/commits/$EXPECTED_MERGE_SHA/statuses?per_page=100")
+          read -r latest_status_id claim_state claim_target_url <<< "$(
+            jq -r --arg context "$STACKED_STATUS_CONTEXT" '
+              [.[] | select(.context == $context)]
+              | max_by(.id)
+              | [(.id // ""), (.state // ""), (.target_url // "")]
+              | @tsv' <<< "$recent_statuses"
+          )"
+          if [[ ! "$CLAIM_STATUS_ID" =~ ^[0-9]+$ \
+            || "$latest_status_id" != "$CLAIM_STATUS_ID" \
+            || "$claim_state" != pending \
+            || "$claim_target_url" != "$run_url" ]]; then
+            echo "::notice::Workflow run $GITHUB_RUN_ID no longer owns the aggregate status claim; skipping stale publication."
+            exit 0
+          fi
+
+          if [[ "$QUALIFICATION_RESULT" == success ]]; then
+            state=success
+            description="Aggregate stacked qualification passed on all required runners."
+            qualification_exit=0
+          else
+            state=failure
+            description="Aggregate stacked qualification failed; matrix result was $QUALIFICATION_RESULT."
+            qualification_exit=1
+          fi
+
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$EXPECTED_MERGE_SHA" \
+            -f state="$state" \
+            -f context="$STACKED_STATUS_CONTEXT" \
+            -f description="$description" \
+            -f target_url="$run_url" \
+            >/dev/null
+
+          exit "$qualification_exit"

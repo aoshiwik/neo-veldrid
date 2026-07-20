@@ -10,11 +10,13 @@ namespace NeoVeldrid.Vk;
 internal unsafe class VkFramebuffer : VkFramebufferBase
 {
     private readonly VkGraphicsDevice _gd;
-    private readonly VkFramebufferHandle _deviceFramebuffer;
-    private readonly RenderPass _renderPassNoClearLoad;
-    private readonly RenderPass _renderPassNoClear;
-    private readonly RenderPass _renderPassClear;
+    private VkFramebufferHandle _deviceFramebuffer;
+    private RenderPass _renderPassNoClearLoad;
+    private RenderPass _renderPassNoClear;
+    private RenderPass _renderPassClear;
     private readonly List<ImageView> _attachmentViews = new List<ImageView>();
+    private readonly ImageLayout[] _firstUseColorLayouts;
+    private readonly ImageLayout? _firstUseDepthLayout;
     private bool _destroyed;
     private string _name;
 
@@ -34,13 +36,15 @@ internal unsafe class VkFramebuffer : VkFramebufferBase
         : base(description.DepthTarget, description.ColorTargets)
     {
         _gd = gd;
-
+        try
+        {
         RenderPassCreateInfo renderPassCI = new RenderPassCreateInfo
         {
             SType = StructureType.RenderPassCreateInfo
         };
 
         uint colorAttachmentCount = (uint)ColorTargets.Count;
+        _firstUseColorLayouts = new ImageLayout[ColorTargets.Count];
         AttachmentDescription* attachments = stackalloc AttachmentDescription[(int)colorAttachmentCount + 1];
         uint attachmentCount = 0;
         AttachmentReference* colorAttachmentRefs = stackalloc AttachmentReference[(int)colorAttachmentCount];
@@ -59,6 +63,7 @@ internal unsafe class VkFramebuffer : VkFramebufferBase
                 : ((vkColorTex.Usage & TextureUsage.Sampled) != 0)
                     ? ImageLayout.ShaderReadOnlyOptimal
                     : ImageLayout.ColorAttachmentOptimal;
+            _firstUseColorLayouts[i] = colorAttachmentDesc.InitialLayout;
             colorAttachmentDesc.FinalLayout = ImageLayout.ColorAttachmentOptimal;
             attachments[attachmentCount++] = colorAttachmentDesc;
 
@@ -85,6 +90,7 @@ internal unsafe class VkFramebuffer : VkFramebufferBase
             depthAttachmentDesc.InitialLayout = ((vkDepthTex.Usage & TextureUsage.Sampled) != 0)
                 ? ImageLayout.ShaderReadOnlyOptimal
                 : ImageLayout.DepthStencilAttachmentOptimal;
+            _firstUseDepthLayout = depthAttachmentDesc.InitialLayout;
             depthAttachmentDesc.FinalLayout = ImageLayout.DepthStencilAttachmentOptimal;
 
             depthAttachmentRef.Attachment = (uint)description.ColorTargets.Length;
@@ -105,11 +111,10 @@ internal unsafe class VkFramebuffer : VkFramebufferBase
             attachments[attachmentCount++] = depthAttachmentDesc;
         }
 
-        SubpassDependency subpassDependency = new SubpassDependency();
-        subpassDependency.SrcSubpass = Silk.NET.Vulkan.Vk.SubpassExternal;
-        subpassDependency.SrcStageMask = PipelineStageFlags.ColorAttachmentOutputBit;
-        subpassDependency.DstStageMask = PipelineStageFlags.ColorAttachmentOutputBit;
-        subpassDependency.DstAccessMask = AccessFlags.ColorAttachmentReadBit | AccessFlags.ColorAttachmentWriteBit;
+        SubpassDependency subpassDependency =
+            CreateRenderPassAttachmentDependency(
+                hasColorAttachments: colorAttachmentCount != 0,
+                hasDepthStencilAttachment: DepthTarget != null);
 
         renderPassCI.AttachmentCount = attachmentCount;
         renderPassCI.PAttachments = attachments;
@@ -118,8 +123,14 @@ internal unsafe class VkFramebuffer : VkFramebufferBase
         renderPassCI.DependencyCount = 1;
         renderPassCI.PDependencies = &subpassDependency;
 
-        Result creationResult = _gd.Vk.CreateRenderPass(_gd.Device, in renderPassCI, null, out _renderPassNoClear);
+        RenderPass createdRenderPass;
+        Result creationResult = _gd.Vk.CreateRenderPass(
+            _gd.Device,
+            in renderPassCI,
+            null,
+            out createdRenderPass);
         CheckResult(creationResult);
+        _renderPassNoClear = createdRenderPass;
 
         for (int i = 0; i < colorAttachmentCount; i++)
         {
@@ -137,8 +148,13 @@ internal unsafe class VkFramebuffer : VkFramebufferBase
             }
 
         }
-        creationResult = _gd.Vk.CreateRenderPass(_gd.Device, in renderPassCI, null, out _renderPassNoClearLoad);
+        creationResult = _gd.Vk.CreateRenderPass(
+            _gd.Device,
+            in renderPassCI,
+            null,
+            out createdRenderPass);
         CheckResult(creationResult);
+        _renderPassNoClearLoad = createdRenderPass;
 
 
         // Load version
@@ -160,8 +176,13 @@ internal unsafe class VkFramebuffer : VkFramebufferBase
             attachments[i].InitialLayout = ImageLayout.Undefined;
         }
 
-        creationResult = _gd.Vk.CreateRenderPass(_gd.Device, in renderPassCI, null, out _renderPassClear);
+        creationResult = _gd.Vk.CreateRenderPass(
+            _gd.Device,
+            in renderPassCI,
+            null,
+            out createdRenderPass);
         CheckResult(creationResult);
+        _renderPassClear = createdRenderPass;
 
         FramebufferCreateInfo fbCI = new FramebufferCreateInfo
         {
@@ -190,10 +211,15 @@ internal unsafe class VkFramebuffer : VkFramebufferBase
                     description.ColorTargets[i].ArrayLayer,
                     1)
             };
-            ImageView* dest = (fbAttachments + i);
-            Result result = _gd.Vk.CreateImageView(_gd.Device, in imageViewCI, null, dest);
+            ImageView createdView = default;
+            Result result = _gd.Vk.CreateImageView(
+                _gd.Device,
+                in imageViewCI,
+                null,
+                &createdView);
             CheckResult(result);
-            _attachmentViews.Add(*dest);
+            fbAttachments[i] = createdView;
+            _attachmentViews.Add(createdView);
         }
 
         // Depth
@@ -216,10 +242,15 @@ internal unsafe class VkFramebuffer : VkFramebufferBase
                     description.DepthTarget.Value.ArrayLayer,
                     1)
             };
-            ImageView* dest = (fbAttachments + (fbAttachmentsCount - 1));
-            Result result = _gd.Vk.CreateImageView(_gd.Device, in depthViewCI, null, dest);
+            ImageView createdView = default;
+            Result result = _gd.Vk.CreateImageView(
+                _gd.Device,
+                in depthViewCI,
+                null,
+                &createdView);
             CheckResult(result);
-            _attachmentViews.Add(*dest);
+            fbAttachments[fbAttachmentsCount - 1] = createdView;
+            _attachmentViews.Add(createdView);
         }
 
         Texture dimTex;
@@ -251,23 +282,114 @@ internal unsafe class VkFramebuffer : VkFramebufferBase
         fbCI.Layers = 1;
         fbCI.RenderPass = _renderPassNoClear;
 
-        creationResult = _gd.Vk.CreateFramebuffer(_gd.Device, in fbCI, null, out _deviceFramebuffer);
+        VkFramebufferHandle createdFramebuffer;
+        creationResult = _gd.Vk.CreateFramebuffer(
+            _gd.Device,
+            in fbCI,
+            null,
+            out createdFramebuffer);
         CheckResult(creationResult);
+        _deviceFramebuffer = createdFramebuffer;
 
         if (DepthTarget != null)
         {
             AttachmentCount += 1;
         }
         AttachmentCount += (uint)ColorTargets.Count;
+        }
+        catch (Exception initializationError)
+        {
+            DestroyNativeResources().ThrowWithPrimary(
+                initializationError,
+                "Vulkan framebuffer initialization and cleanup both failed.");
+        }
     }
 
-    public override void TransitionToIntermediateLayout(CommandBuffer cb)
+    public override void PrepareForRenderPass(
+        CommandBuffer cb,
+        VkRenderPassInitialLayoutKind initialLayoutKind,
+        VkImageLayoutTransaction transaction)
+    {
+        for (int i = 0; i < ColorTargets.Count; i++)
+        {
+            FramebufferAttachment attachment = ColorTargets[i];
+            VkTexture texture =
+                Util.AssertSubtype<Texture, VkTexture>(attachment.Target);
+            PrepareAttachment(
+                cb,
+                texture,
+                attachment.MipLevel,
+                attachment.ArrayLayer,
+                initialLayoutKind,
+                _firstUseColorLayouts[i],
+                ImageLayout.ColorAttachmentOptimal,
+                transaction);
+        }
+
+        if (DepthTarget != null)
+        {
+            FramebufferAttachment attachment = DepthTarget.Value;
+            VkTexture texture =
+                Util.AssertSubtype<Texture, VkTexture>(attachment.Target);
+            PrepareAttachment(
+                cb,
+                texture,
+                attachment.MipLevel,
+                attachment.ArrayLayer,
+                initialLayoutKind,
+                _firstUseDepthLayout!.Value,
+                ImageLayout.DepthStencilAttachmentOptimal,
+                transaction);
+        }
+    }
+
+    private static void PrepareAttachment(
+        CommandBuffer cb,
+        VkTexture texture,
+        uint mipLevel,
+        uint arrayLayer,
+        VkRenderPassInitialLayoutKind initialLayoutKind,
+        ImageLayout firstUseLayout,
+        ImageLayout continuationLayout,
+        VkImageLayoutTransaction transaction)
+    {
+        if (initialLayoutKind == VkRenderPassInitialLayoutKind.Discard)
+        {
+            // A clear render pass intentionally declares Undefined and discards
+            // the previous contents. Observe the attachment without attempting
+            // an invalid transition to Undefined so ordering and rollback still
+            // include this render-pass use.
+            _ = texture.GetImageLayout(mipLevel, arrayLayer, transaction);
+            return;
+        }
+
+        ImageLayout requiredLayout =
+            initialLayoutKind == VkRenderPassInitialLayoutKind.FirstUse
+                ? firstUseLayout
+                : continuationLayout;
+        texture.TransitionImageLayout(
+            cb,
+            mipLevel,
+            1,
+            arrayLayer,
+            1,
+            requiredLayout,
+            transaction);
+    }
+
+    public override void TransitionToIntermediateLayout(
+        CommandBuffer cb,
+        VkImageLayoutTransaction transaction)
     {
         for (int i = 0; i < ColorTargets.Count; i++)
         {
             FramebufferAttachment ca = ColorTargets[i];
             VkTexture vkTex = Util.AssertSubtype<Texture, VkTexture>(ca.Target);
-            vkTex.SetImageLayout(ca.MipLevel, ca.ArrayLayer, ImageLayout.ColorAttachmentOptimal);
+            vkTex.SetImageLayout(
+                ca.MipLevel,
+                ca.ArrayLayer,
+                ImageLayout.ColorAttachmentOptimal,
+                transaction);
         }
         if (DepthTarget != null)
         {
@@ -275,11 +397,14 @@ internal unsafe class VkFramebuffer : VkFramebufferBase
             vkTex.SetImageLayout(
                 DepthTarget.Value.MipLevel,
                 DepthTarget.Value.ArrayLayer,
-                ImageLayout.DepthStencilAttachmentOptimal);
+                ImageLayout.DepthStencilAttachmentOptimal,
+                transaction);
         }
     }
 
-    public override void TransitionToFinalLayout(CommandBuffer cb)
+    public override void TransitionToFinalLayout(
+        CommandBuffer cb,
+        VkImageLayoutTransaction transaction)
     {
         for (int i = 0; i < ColorTargets.Count; i++)
         {
@@ -291,7 +416,8 @@ internal unsafe class VkFramebuffer : VkFramebufferBase
                     cb,
                     ca.MipLevel, 1,
                     ca.ArrayLayer, 1,
-                    ImageLayout.ShaderReadOnlyOptimal);
+                    ImageLayout.ShaderReadOnlyOptimal,
+                    transaction);
             }
         }
         if (DepthTarget != null)
@@ -303,7 +429,8 @@ internal unsafe class VkFramebuffer : VkFramebufferBase
                     cb,
                     DepthTarget.Value.MipLevel, 1,
                     DepthTarget.Value.ArrayLayer, 1,
-                    ImageLayout.ShaderReadOnlyOptimal);
+                    ImageLayout.ShaderReadOnlyOptimal,
+                    transaction);
             }
         }
     }
@@ -322,16 +449,73 @@ internal unsafe class VkFramebuffer : VkFramebufferBase
     {
         if (!_destroyed)
         {
-            _gd.Vk.DestroyFramebuffer(_gd.Device, _deviceFramebuffer, null);
-            _gd.Vk.DestroyRenderPass(_gd.Device, _renderPassNoClear, null);
-            _gd.Vk.DestroyRenderPass(_gd.Device, _renderPassNoClearLoad, null);
-            _gd.Vk.DestroyRenderPass(_gd.Device, _renderPassClear, null);
-            foreach (ImageView view in _attachmentViews)
+            VulkanCleanupCollector cleanup = DestroyNativeResources();
+            _destroyed = NativeResourcesReleased;
+            cleanup.ThrowIfAny(
+                "Vulkan framebuffer cleanup encountered multiple failures.");
+        }
+    }
+
+    private bool NativeResourcesReleased =>
+        _deviceFramebuffer.Handle == 0
+        && _attachmentViews.Count == 0
+        && _renderPassNoClear.Handle == 0
+        && _renderPassNoClearLoad.Handle == 0
+        && _renderPassClear.Handle == 0;
+
+    private VulkanCleanupCollector DestroyNativeResources()
+    {
+        VulkanCleanupCollector cleanup = new VulkanCleanupCollector();
+        bool framebufferReleased = true;
+        if (_deviceFramebuffer.Handle != 0)
+        {
+            framebufferReleased = cleanup.Attempt(() =>
             {
-                _gd.Vk.DestroyImageView(_gd.Device, view, null);
+                _gd.Vk.DestroyFramebuffer(_gd.Device, _deviceFramebuffer, null);
+                _deviceFramebuffer = default;
+            });
+        }
+
+        // Image views and render passes are referenced by VkFramebuffer. Do not
+        // retire them if that child could not be destroyed.
+        if (framebufferReleased)
+        {
+            for (int i = _attachmentViews.Count - 1; i >= 0; i--)
+            {
+                ImageView view = _attachmentViews[i];
+                if (cleanup.Attempt(() =>
+                    _gd.Vk.DestroyImageView(_gd.Device, view, null)))
+                {
+                    _attachmentViews.RemoveAt(i);
+                }
             }
 
-            _destroyed = true;
+            if (_renderPassNoClear.Handle != 0)
+            {
+                cleanup.Attempt(() =>
+                {
+                    _gd.Vk.DestroyRenderPass(_gd.Device, _renderPassNoClear, null);
+                    _renderPassNoClear = default;
+                });
+            }
+            if (_renderPassNoClearLoad.Handle != 0)
+            {
+                cleanup.Attempt(() =>
+                {
+                    _gd.Vk.DestroyRenderPass(_gd.Device, _renderPassNoClearLoad, null);
+                    _renderPassNoClearLoad = default;
+                });
+            }
+            if (_renderPassClear.Handle != 0)
+            {
+                cleanup.Attempt(() =>
+                {
+                    _gd.Vk.DestroyRenderPass(_gd.Device, _renderPassClear, null);
+                    _renderPassClear = default;
+                });
+            }
         }
+
+        return cleanup;
     }
 }

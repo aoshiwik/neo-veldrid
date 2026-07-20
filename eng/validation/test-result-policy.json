@@ -1,0 +1,250 @@
+{
+  "schemaVersion": 3,
+  "suites": [
+    {
+      "name": "SPIRV",
+      "expectedDiscovered": {
+        "algorithm": "sha256-trx-test-name-nul-v1",
+        "count": 82,
+        "sha256": "8786bb3b125cf9fc2f9e855acc8947c1ae84aee5f4afbfcfdacfa3ab7f632c3e"
+      },
+      "skipRules": []
+    },
+    {
+      "name": "NonGPU",
+      "expectedDiscovered": {
+        "algorithm": "sha256-trx-test-name-nul-v1",
+        "count": 144,
+        "sha256": "0107f1bfa76ffa1afe6c71f1a56e15892cc195c7a27868f1f29b304bd2a43888"
+      },
+      "skipRules": []
+    },
+    {
+      "name": "D3D11",
+      "expectedDiscovered": {
+        "algorithm": "sha256-trx-test-name-nul-v1",
+        "count": 497,
+        "sha256": "6b0db8ca3dc59f09cf2a0e722b121b0a7bdfbd172a69e998063ca5c1361987d4"
+      },
+      "skipRules": [
+        {
+          "testMethod": "NeoVeldrid.Tests.D3D11ComputeTests.ComputeCubemapGeneration",
+          "reasonCode": "NV-SKIP-D3D11-STORAGE-CUBEMAP",
+          "classification": "backend-contract",
+          "exitCondition": "Implement a supported D3D11 storage-cubemap view or emulation strategy.",
+          "expectedTestNames": [
+            "NeoVeldrid.Tests.D3D11ComputeTests.ComputeCubemapGeneration"
+          ]
+        },
+        {
+          "testMethod": "NeoVeldrid.Tests.D3D11ComputeTests.ComputeCubemapBindSingleTextureMipLevelOutput",
+          "reasonCode": "NV-SKIP-D3D11-STORAGE-CUBEMAP",
+          "classification": "backend-contract",
+          "exitCondition": "Implement a supported D3D11 storage-cubemap view or emulation strategy.",
+          "expectedTestNames": [
+            "NeoVeldrid.Tests.D3D11ComputeTests.ComputeCubemapBindSingleTextureMipLevelOutput"
+          ]
+        },
+        {
+          "testMethod": "NeoVeldrid.Tests.D3D11BufferTests.BindMappedBuffer_Fails",
+          "reasonCode": "NV-SKIP-GL-MAPPED-BINDING",
+          "classification": "backend-specific-test",
+          "exitCondition": "Replace this test with a backend-neutral mapped-binding contract.",
+          "expectedTestNames": [
+            "NeoVeldrid.Tests.D3D11BufferTests.BindMappedBuffer_Fails"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Vulkan",
+      "expectedDiscovered": {
+        "algorithm": "sha256-trx-test-name-nul-v1",
+        "count": 594,
+        "sha256": "c1a2622e2c0750cab9a6e3578ea917fcc72471d40f9626afa1348f6e4a243c7e"
+      },
+      "skipRules": [
+        {
+          "testMethod": "NeoVeldrid.Tests.VulkanRenderTests.UseBlendFactor",
+          "reasonCode": "NV-SKIP-KNOWN-VULKAN-BLEND-LAYOUT",
+          "classification": "known-defect",
+          "exitCondition": "Correct the Vulkan image-layout contract and pass with synchronization validation active.",
+          "expectedTestNames": [
+            "NeoVeldrid.Tests.VulkanRenderTests.UseBlendFactor"
+          ]
+        },
+        {
+          "testMethod": "NeoVeldrid.Tests.VulkanBufferTests.MapThenUpdate_Fails",
+          "reasonCode": "NV-SKIP-VULKAN-MAPPED-UPDATE",
+          "classification": "known-defect",
+          "exitCondition": "Implement Vulkan mapped-resource update validation.",
+          "expectedTestNames": [
+            "NeoVeldrid.Tests.VulkanBufferTests.MapThenUpdate_Fails"
+          ]
+        },
+        {
+          "testMethod": "NeoVeldrid.Tests.VulkanBufferTests.Map_DifferentMode_Fails",
+          "reasonCode": "NV-SKIP-VULKAN-MAPPED-MODE",
+          "classification": "known-defect",
+          "exitCondition": "Implement Vulkan mapped-resource mode validation.",
+          "expectedTestNames": [
+            "NeoVeldrid.Tests.VulkanBufferTests.Map_DifferentMode_Fails"
+          ]
+        },
+        {
+          "testMethod": "NeoVeldrid.Tests.VulkanBufferTests.BindMappedBuffer_Fails",
+          "reasonCode": "NV-SKIP-GL-MAPPED-BINDING",
+          "classification": "backend-specific-test",
+          "exitCondition": "Replace this test with a backend-neutral mapped-binding contract.",
+          "expectedTestNames": [
+            "NeoVeldrid.Tests.VulkanBufferTests.BindMappedBuffer_Fails"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "OpenGL",
+      "expectedDiscovered": {
+        "algorithm": "sha256-trx-test-name-nul-v1",
+        "count": 500,
+        "sha256": "9289146fd6c84808ed383142e82b5feba4a467ee6b535fc87db9e6c3507f603a"
+      },
+      "skipRules": []
+    },
+    {
+      "name": "OpenGLES",
+      "expectedDiscovered": {
+        "algorithm": "sha256-trx-test-name-nul-v1",
+        "count": 499,
+        "sha256": "48b8d719c5a0f0f5b4915073ac190a4f2d2fc5be79c2f76e45c50c7361f981ac"
+      },
+      "skipRules": [
+        {
+          "testMethod": "NeoVeldrid.Tests.OpenGLESComputeTests.FillBuffer_WithOffsets",
+          "reasonCode": "NV-SKIP-BUFFER-RANGE-BINDING",
+          "classification": "device-capability",
+          "exitCondition": "Provide buffer-range binding on the qualified OpenGL ES device.",
+          "expectedFingerprint": {
+            "algorithm": "sha256-trx-test-name-reason-nul-v1",
+            "count": 160,
+            "sha256": "698be716f03f5936568a2567642907233659a537dfe1cd7acaa21e9b2328a2de"
+          }
+        },
+        {
+          "testMethod": "NeoVeldrid.Tests.OpenGLESTextureTests.Copy_Compressed_Texture",
+          "reasonCode": "NV-SKIP-COMPRESSED-STAGING",
+          "classification": "device-capability",
+          "exitCondition": "Qualify a GLES implementation with compressed staging readback or add a supported readback path.",
+          "expectedFingerprint": {
+            "algorithm": "sha256-trx-test-name-reason-nul-v1",
+            "count": 28,
+            "sha256": "b4064693853ab9b66c1e5173c2aca777d07c270fbcf4f5b95f2697e47183be5b"
+          }
+        },
+        {
+          "testMethod": "NeoVeldrid.Tests.OpenGLESTextureTests.CommandListCompressedEdgeMipUploadRetainsPayload",
+          "reasonCode": "NV-SKIP-COMPRESSED-STAGING",
+          "classification": "device-capability",
+          "exitCondition": "Add a GLES-native positive oracle for compressed edge-mip uploads.",
+          "expectedTestNames": [
+            "NeoVeldrid.Tests.OpenGLESTextureTests.CommandListCompressedEdgeMipUploadRetainsPayload"
+          ]
+        },
+        {
+          "testMethod": "NeoVeldrid.Tests.OpenGLESTextureTests.CommandListCompressedOffsetEdgeUploadRetainsPayload",
+          "reasonCode": "NV-SKIP-COMPRESSED-STAGING",
+          "classification": "device-capability",
+          "exitCondition": "Add a GLES-native positive oracle for compressed offset-edge uploads.",
+          "expectedTestNames": [
+            "NeoVeldrid.Tests.OpenGLESTextureTests.CommandListCompressedOffsetEdgeUploadRetainsPayload"
+          ]
+        },
+        {
+          "testMethod": "NeoVeldrid.Tests.OpenGLESTextureTests.Copy_Compressed_StagingDirectionsHaveIndependentOracles",
+          "reasonCode": "NV-SKIP-COMPRESSED-STAGING",
+          "classification": "device-capability",
+          "exitCondition": "Qualify compressed staging transfers in both directions on the OpenGL ES backend.",
+          "expectedTestNames": [
+            "NeoVeldrid.Tests.OpenGLESTextureTests.Copy_Compressed_StagingDirectionsHaveIndependentOracles(format: BC1_Rgba_UNorm, blockSizeInBytes: 8)",
+            "NeoVeldrid.Tests.OpenGLESTextureTests.Copy_Compressed_StagingDirectionsHaveIndependentOracles(format: BC3_UNorm, blockSizeInBytes: 16)"
+          ]
+        },
+        {
+          "testMethod": "NeoVeldrid.Tests.OpenGLESTextureTests.CopyTexture_SmallCompressed_ToStaging",
+          "reasonCode": "NV-SKIP-COMPRESSED-STAGING",
+          "classification": "device-capability",
+          "exitCondition": "Qualify compressed staging readback on the OpenGL ES backend.",
+          "expectedTestNames": [
+            "NeoVeldrid.Tests.OpenGLESTextureTests.CopyTexture_SmallCompressed_ToStaging"
+          ]
+        },
+        {
+          "testMethod": "NeoVeldrid.Tests.OpenGLESTextureTests.Update_ThenMapRead_1D",
+          "reasonCode": "NV-SKIP-TEXTURE1D",
+          "classification": "backend-contract",
+          "exitCondition": "Retain the GLES exclusion or add a supported one-dimensional texture model.",
+          "expectedTestNames": [
+            "NeoVeldrid.Tests.OpenGLESTextureTests.Update_ThenMapRead_1D"
+          ]
+        },
+        {
+          "testMethod": "NeoVeldrid.Tests.OpenGLESTextureTests.MapWrite_ThenMapRead_1D",
+          "reasonCode": "NV-SKIP-TEXTURE1D",
+          "classification": "backend-contract",
+          "exitCondition": "Retain the GLES exclusion or add a supported one-dimensional texture model.",
+          "expectedTestNames": [
+            "NeoVeldrid.Tests.OpenGLESTextureTests.MapWrite_ThenMapRead_1D"
+          ]
+        },
+        {
+          "testMethod": "NeoVeldrid.Tests.OpenGLESTextureTests.Copy_1DTo2D",
+          "reasonCode": "NV-SKIP-TEXTURE1D",
+          "classification": "backend-contract",
+          "exitCondition": "Retain the GLES exclusion or add a supported one-dimensional texture model.",
+          "expectedTestNames": [
+            "NeoVeldrid.Tests.OpenGLESTextureTests.Copy_1DTo2D"
+          ]
+        },
+        {
+          "testMethod": "NeoVeldrid.Tests.OpenGLESTextureTests.Update_MultipleMips_1D",
+          "reasonCode": "NV-SKIP-TEXTURE1D",
+          "classification": "backend-contract",
+          "exitCondition": "Retain the GLES exclusion or add a supported one-dimensional texture model.",
+          "expectedTestNames": [
+            "NeoVeldrid.Tests.OpenGLESTextureTests.Update_MultipleMips_1D"
+          ]
+        },
+        {
+          "testMethod": "NeoVeldrid.Tests.OpenGLESTextureTests.Copy_DifferentMip_1DTo2D",
+          "reasonCode": "NV-SKIP-TEXTURE1D",
+          "classification": "backend-contract",
+          "exitCondition": "Retain the GLES exclusion or add a supported one-dimensional texture model.",
+          "expectedTestNames": [
+            "NeoVeldrid.Tests.OpenGLESTextureTests.Copy_DifferentMip_1DTo2D"
+          ]
+        },
+        {
+          "testMethod": "NeoVeldrid.Tests.OpenGLESRenderTests.SampleTexture1D",
+          "reasonCode": "NV-SKIP-TEXTURE1D",
+          "classification": "backend-contract",
+          "exitCondition": "Retain the GLES exclusion or add a supported one-dimensional texture model.",
+          "expectedTestNames": [
+            "NeoVeldrid.Tests.OpenGLESRenderTests.SampleTexture1D(arrayTexture: False)",
+            "NeoVeldrid.Tests.OpenGLESRenderTests.SampleTexture1D(arrayTexture: True)"
+          ]
+        },
+        {
+          "testMethod": "NeoVeldrid.Tests.OpenGLESTextureTests.FormatCoverage_CopyThenRead",
+          "reasonCode": "NV-SKIP-STAGING-FORMAT",
+          "classification": "device-capability",
+          "exitCondition": "Qualify staging support for every format in the coverage matrix or add a supported readback path.",
+          "expectedTestNames": [
+            "NeoVeldrid.Tests.OpenGLESTextureTests.FormatCoverage_CopyThenRead(format: B8_G8_R8_A8_UNorm, rBits: 8, gBits: 8, bBits: 8, aBits: 8, srcType: Texture2D, srcWidth: 64, srcHeight: 64, srcDepth: 1, srcMipLevels: 1, srcArrayLayers: 1, dstType: Texture2D, dstWidth: 64, dstHeight: 64, dstDepth: 1, dstMipLevels: 1, dstArrayLayers: 1, copyWidth: 64, copyHeight: 64, copyDepth: 1, srcX: 0, srcY: 0, srcZ: 0, srcMipLevel: 0, srcArrayLayer: 0, dstX: 0, dstY: 0, dstZ: 0, dstMipLevel: 0, dstArrayLayer: 0)",
+            "NeoVeldrid.Tests.OpenGLESTextureTests.FormatCoverage_CopyThenRead(format: R10_G10_B10_A2_UInt, rBits: 10, gBits: 10, bBits: 10, aBits: 2, srcType: Texture2D, srcWidth: 64, srcHeight: 64, srcDepth: 1, srcMipLevels: 1, srcArrayLayers: 1, dstType: Texture2D, dstWidth: 64, dstHeight: 64, dstDepth: 1, dstMipLevels: 1, dstArrayLayers: 1, copyWidth: 64, copyHeight: 64, copyDepth: 1, srcX: 0, srcY: 0, srcZ: 0, srcMipLevel: 0, srcArrayLayer: 0, dstX: 0, dstY: 0, dstZ: 0, dstMipLevel: 0, dstArrayLayer: 0)",
+            "NeoVeldrid.Tests.OpenGLESTextureTests.FormatCoverage_CopyThenRead(format: R10_G10_B10_A2_UNorm, rBits: 10, gBits: 10, bBits: 10, aBits: 2, srcType: Texture2D, srcWidth: 64, srcHeight: 64, srcDepth: 1, srcMipLevels: 1, srcArrayLayers: 1, dstType: Texture2D, dstWidth: 64, dstHeight: 64, dstDepth: 1, dstMipLevels: 1, dstArrayLayers: 1, copyWidth: 64, copyHeight: 64, copyDepth: 1, srcX: 0, srcY: 0, srcZ: 0, srcMipLevel: 0, srcArrayLayer: 0, dstX: 0, dstY: 0, dstZ: 0, dstMipLevel: 0, dstArrayLayer: 0)"
+          ]
+        }
+      ]
+    }
+  ]
+}

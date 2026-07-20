@@ -19,6 +19,8 @@ internal unsafe class OpenGLTextureSamplerManager
     private readonly BoundSamplerStateInfo[] _textureUnitSamplers;
     private uint _currentActiveUnit = 0;
 
+    internal uint TransientTextureUnit => _lastTextureUnit;
+
     public OpenGLTextureSamplerManager(OpenGLGraphicsDevice gd, OpenGLExtensions extensions)
     {
         _gd = gd;
@@ -60,6 +62,19 @@ internal unsafe class OpenGLTextureSamplerManager
     {
         _textureUnitTextures[_lastTextureUnit] = null;
         SetActiveTextureUnit(_lastTextureUnit);
+
+        // The final texture unit is reserved for backend-internal transfers. A
+        // sampler left there by a prior public resource binding can change how
+        // an internal texture is interpreted (most importantly depth-compare
+        // mode), so transient ownership includes the sampler binding as well as
+        // the texture binding.
+        if (_textureUnitSamplers[_lastTextureUnit].Sampler != null)
+        {
+            _gl.BindSampler(_lastTextureUnit, 0);
+            CheckLastError();
+            _textureUnitSamplers[_lastTextureUnit] = default;
+        }
+
         _gl.BindTexture(target, texture);
         CheckLastError();
     }

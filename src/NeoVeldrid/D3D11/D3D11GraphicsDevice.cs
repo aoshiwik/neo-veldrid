@@ -25,8 +25,10 @@ internal unsafe class D3D11GraphicsDevice : GraphicsDevice
     private readonly D3D11ResourceFactory _d3d11ResourceFactory;
     private readonly D3D11Swapchain _mainSwapchain;
     private readonly bool _supportsConcurrentResources;
-    private readonly bool _supportsCommandLists;
-    private readonly bool _debugActive;
+    private readonly D3D11CommandListCapabilities _commandListCapabilities;
+    private readonly int? _debugLayerProbeHResult;
+    private readonly bool _debugDeviceCreated;
+    private D3D11ValidationMessageQueue _validationMessages;
     private readonly object _immediateContextLock = new object();
     private readonly BackendInfoD3D11 _d3d11Info;
 
@@ -53,8 +55,6 @@ internal unsafe class D3D11GraphicsDevice : GraphicsDevice
 
     public override bool IsClipSpaceYInverted => false;
 
-    public override bool IsDebugActive => _debugActive;
-
     public override ResourceFactory ResourceFactory => _d3d11ResourceFactory;
 
     public ID3D11Device* Device => _device;
@@ -63,9 +63,22 @@ internal unsafe class D3D11GraphicsDevice : GraphicsDevice
 
     public bool SupportsConcurrentResources => _supportsConcurrentResources;
 
-    public bool SupportsCommandLists => _supportsCommandLists;
+    public D3D11CommandListCapabilities CommandListCapabilities =>
+        _commandListCapabilities;
 
     public int DeviceId => _deviceId;
+
+    internal int? DebugLayerProbeHResult => _debugLayerProbeHResult;
+
+    internal bool DebugDeviceCreated => _debugDeviceCreated;
+
+    internal bool ValidationInfoQueueActivated => _validationMessages != null;
+
+    internal ulong CollectedValidationMessageCount =>
+        _validationMessages?.CollectedMessageCount ?? 0;
+
+    internal ulong DiscardedValidationMessageCount =>
+        _validationMessages?.DiscardedMessageCount ?? 0;
 
     public override Swapchain MainSwapchain => _mainSwapchain;
 
@@ -78,172 +91,319 @@ internal unsafe class D3D11GraphicsDevice : GraphicsDevice
 
     public D3D11GraphicsDevice(D3D11DeviceOptions options, SwapchainDescription? swapchainDesc)
     {
-#pragma warning disable CS0618
-        _d3d11Api = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
-            ? Silk.NET.Direct3D11.D3D11.GetApi(DXSwapchainProvider.Win32)
-            : Silk.NET.Direct3D11.D3D11.GetApi(DXSwapchainProvider.Sdl2);
-#pragma warning restore CS0618
-
-        var flags = (CreateDeviceFlag)options.DeviceCreationFlags;
-        IsDebugRequested = (flags & CreateDeviceFlag.Debug) != 0;
-#if DEBUG
-        flags |= CreateDeviceFlag.Debug;
-#endif
-        // If debug flag set but SDK layers aren't available we can't enable debug.
-        if ((flags & CreateDeviceFlag.Debug) != 0 && !SdkLayersAvailable(_d3d11Api))
-        {
-            flags &= ~CreateDeviceFlag.Debug;
-        }
-
-        D3DFeatureLevel featureLevel;
-        ID3D11Device* pDevice = null;
-        ID3D11DeviceContext* pContext = null;
-
         try
         {
-            D3DFeatureLevel* pFeatureLevels = stackalloc D3DFeatureLevel[]
+            var flags = (CreateDeviceFlag)options.DeviceCreationFlags;
+            bool debugRequested = (flags & CreateDeviceFlag.Debug) != 0;
+            InitializeValidation(GraphicsBackend.Direct3D11, debugRequested);
+
+#pragma warning disable CS0618
+            _d3d11Api = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+                ? Silk.NET.Direct3D11.D3D11.GetApi(DXSwapchainProvider.Win32)
+                : Silk.NET.Direct3D11.D3D11.GetApi(DXSwapchainProvider.Sdl2);
+#pragma warning restore CS0618
+
+#if DEBUG
+            flags |= CreateDeviceFlag.Debug;
+#endif
+            // If debug flag set but SDK layers aren't available we can't enable debug.
+            if ((flags & CreateDeviceFlag.Debug) != 0)
             {
-                D3DFeatureLevel.Level111,
-                D3DFeatureLevel.Level110,
-            };
+                int probeResult = ProbeSdkLayers(_d3d11Api);
+                _debugLayerProbeHResult = probeResult;
+                if (probeResult < 0)
+                {
+                    flags &= ~CreateDeviceFlag.Debug;
+                }
+            }
 
-            IDXGIAdapter* pAdapter = options.AdapterPtr != IntPtr.Zero
-                ? (IDXGIAdapter*)options.AdapterPtr
-                : null;
+            D3DFeatureLevel featureLevel;
+            ID3D11Device* pDevice = null;
+            ID3D11DeviceContext* pContext = null;
 
-            SilkMarshal.ThrowHResult(_d3d11Api.CreateDevice(
-                pAdapter,
-                pAdapter != null ? D3DDriverType.Unknown : D3DDriverType.Hardware,
-                IntPtr.Zero,
-                (uint)flags,
-                pFeatureLevels,
-                2,
-                Silk.NET.Direct3D11.D3D11.SdkVersion,
-                &pDevice,
-                &featureLevel,
-                &pContext));
+            try
+            {
+                try
+                {
+                    D3DFeatureLevel* pFeatureLevels = stackalloc D3DFeatureLevel[]
+                    {
+                        D3DFeatureLevel.Level111,
+                        D3DFeatureLevel.Level110,
+                    };
+
+                    IDXGIAdapter* pAdapter = options.AdapterPtr != IntPtr.Zero
+                        ? (IDXGIAdapter*)options.AdapterPtr
+                        : null;
+
+                    SilkMarshal.ThrowHResult(_d3d11Api.CreateDevice(
+                        pAdapter,
+                        pAdapter != null ? D3DDriverType.Unknown : D3DDriverType.Hardware,
+                        IntPtr.Zero,
+                        (uint)flags,
+                        pFeatureLevels,
+                        2,
+                        Silk.NET.Direct3D11.D3D11.SdkVersion,
+                        &pDevice,
+                        &featureLevel,
+                        &pContext));
+                }
+                catch
+                {
+                    // A failed COM call is allowed to have populated its output
+                    // pointers. Release any such partial result before retrying.
+                    if (pContext != null)
+                    {
+                        pContext->Release();
+                        pContext = null;
+                    }
+                    if (pDevice != null)
+                    {
+                        pDevice->Release();
+                        pDevice = null;
+                    }
+
+                    // Fallback: let the driver pick the feature level.
+                    SilkMarshal.ThrowHResult(_d3d11Api.CreateDevice(
+                        (IDXGIAdapter*)null,
+                        D3DDriverType.Hardware,
+                        IntPtr.Zero,
+                        (uint)flags,
+                        (D3DFeatureLevel*)null,
+                        0,
+                        Silk.NET.Direct3D11.D3D11.SdkVersion,
+                        &pDevice,
+                        &featureLevel,
+                        &pContext));
+                }
+
+                // Transfer both successful creation references into fields before
+                // any subsequent operation can throw. The finally block owns only
+                // pointers which were not transferred.
+                _device = default;
+                _device.Handle = pDevice;
+                pDevice = null;
+                _immediateContext = default;
+                _immediateContext.Handle = pContext;
+                pContext = null;
+            }
+            finally
+            {
+                if (pContext != null)
+                {
+                    pContext->Release();
+                }
+                if (pDevice != null)
+                {
+                    pDevice->Release();
+                }
+            }
+
+            _debugDeviceCreated = (flags & CreateDeviceFlag.Debug) != 0;
+            ActivateValidationMessageQueue();
+
+            // Query adapter information
+            {
+                IDXGIDevice* pDxgiDevice = null;
+                try
+                {
+                    Guid dxgiDeviceGuid = IDXGIDevice.Guid;
+                    SilkMarshal.ThrowHResult(
+                        ((IUnknown*)_device.Handle)->QueryInterface(
+                            &dxgiDeviceGuid,
+                            (void**)&pDxgiDevice));
+
+                    IDXGIAdapter* pAdapterOut = null;
+                    try
+                    {
+                        SilkMarshal.ThrowHResult(pDxgiDevice->GetAdapter(&pAdapterOut));
+
+                        // GetAdapter returns an owned reference. Transfer it before
+                        // reading metadata so constructor cleanup can always see it.
+                        _dxgiAdapter = default;
+                        _dxgiAdapter.Handle = pAdapterOut;
+                        pAdapterOut = null;
+
+                        AdapterDesc desc;
+                        SilkMarshal.ThrowHResult(_dxgiAdapter.Handle->GetDesc(&desc));
+                        _deviceName = new string(desc.Description);
+                        _vendorName = "id:" + desc.VendorId.ToString("x8");
+                        _deviceId = (int)desc.DeviceId;
+                    }
+                    finally
+                    {
+                        if (pAdapterOut != null)
+                        {
+                            pAdapterOut->Release();
+                        }
+                    }
+                }
+                finally
+                {
+                    if (pDxgiDevice != null)
+                    {
+                        pDxgiDevice->Release();
+                    }
+                }
+            }
+
+            switch (featureLevel)
+            {
+                case D3DFeatureLevel.Level100:
+                    _apiVersion = new GraphicsApiVersion(10, 0, 0, 0);
+                    break;
+
+                case D3DFeatureLevel.Level101:
+                    _apiVersion = new GraphicsApiVersion(10, 1, 0, 0);
+                    break;
+
+                case D3DFeatureLevel.Level110:
+                    _apiVersion = new GraphicsApiVersion(11, 0, 0, 0);
+                    break;
+
+                case D3DFeatureLevel.Level111:
+                    _apiVersion = new GraphicsApiVersion(11, 1, 0, 0);
+                    break;
+
+                case D3DFeatureLevel.Level120:
+                    _apiVersion = new GraphicsApiVersion(12, 0, 0, 0);
+                    break;
+
+                case D3DFeatureLevel.Level121:
+                    _apiVersion = new GraphicsApiVersion(12, 1, 0, 0);
+                    break;
+
+                case D3DFeatureLevel.Level122:
+                    _apiVersion = new GraphicsApiVersion(12, 2, 0, 0);
+                    break;
+            }
+
+            if (swapchainDesc != null)
+            {
+                SwapchainDescription desc = swapchainDesc.Value;
+                _mainSwapchain = new D3D11Swapchain(this, ref desc);
+            }
+
+            // Check threading support
+            FeatureDataThreading threadingData = default;
+            SilkMarshal.ThrowHResult(
+                _device.Handle->CheckFeatureSupport(
+                    Silk.NET.Direct3D11.Feature.Threading,
+                    &threadingData,
+                    (uint)sizeof(FeatureDataThreading)));
+            _supportsConcurrentResources = threadingData.DriverConcurrentCreates;
+            _commandListCapabilities = new D3D11CommandListCapabilities(
+                threadingData.DriverCommandLists,
+                options.DeferredTextureUploadMode);
+
+            // Check double precision support
+            FeatureDataDoubles doublesData = default;
+            SilkMarshal.ThrowHResult(
+                _device.Handle->CheckFeatureSupport(
+                    Silk.NET.Direct3D11.Feature.Doubles,
+                    &doublesData,
+                    (uint)sizeof(FeatureDataDoubles)));
+
+            Features = new GraphicsDeviceFeatures(
+                computeShader: true,
+                geometryShader: true,
+                tessellationShaders: true,
+                multipleViewports: true,
+                samplerLodBias: true,
+                drawBaseVertex: true,
+                drawBaseInstance: true,
+                drawIndirect: true,
+                drawIndirectBaseInstance: true,
+                fillModeWireframe: true,
+                samplerAnisotropy: true,
+                depthClipDisable: true,
+                texture1D: true,
+                independentBlend: true,
+                structuredBuffer: featureLevel >= D3DFeatureLevel.Level110,
+                subsetTextureView: true,
+                commandListDebugMarkers: featureLevel >= D3DFeatureLevel.Level111,
+                bufferRangeBinding: featureLevel >= D3DFeatureLevel.Level111,
+                shaderFloat64: doublesData.DoublePrecisionFloatShaderOps);
+
+            _d3d11ResourceFactory = new D3D11ResourceFactory(this);
+            _d3d11Info = new BackendInfoD3D11(this);
+
+            CompleteDeviceCreation();
         }
-        catch
+        catch (Exception creationError)
         {
-            // Fallback: let the driver pick the feature level
-            SilkMarshal.ThrowHResult(_d3d11Api.CreateDevice(
-                (IDXGIAdapter*)null,
-                D3DDriverType.Hardware,
-                IntPtr.Zero,
-                (uint)flags,
-                (D3DFeatureLevel*)null,
-                0,
-                Silk.NET.Direct3D11.D3D11.SdkVersion,
-                &pDevice,
-                &featureLevel,
-                &pContext));
+            FailDeviceCreation(creationError);
         }
-
-        _device = default;
-        _device.Handle = pDevice;
-        _immediateContext = default;
-        _immediateContext.Handle = pContext;
-
-        // Query adapter information
-        {
-            IDXGIDevice* pDxgiDevice;
-            var dxgiDeviceGuid = IDXGIDevice.Guid;
-            SilkMarshal.ThrowHResult(((IUnknown*)pDevice)->QueryInterface(&dxgiDeviceGuid, (void**)&pDxgiDevice));
-
-            IDXGIAdapter* pAdapterOut;
-            SilkMarshal.ThrowHResult(pDxgiDevice->GetAdapter(&pAdapterOut));
-            _dxgiAdapter = default;
-            _dxgiAdapter.Handle = pAdapterOut;
-
-            AdapterDesc desc;
-            SilkMarshal.ThrowHResult(pAdapterOut->GetDesc(&desc));
-            _deviceName = new string(desc.Description);
-            _vendorName = "id:" + desc.VendorId.ToString("x8");
-            _deviceId = (int)desc.DeviceId;
-
-            pDxgiDevice->Release();
-        }
-
-        switch (featureLevel)
-        {
-            case D3DFeatureLevel.Level100:
-                _apiVersion = new GraphicsApiVersion(10, 0, 0, 0);
-                break;
-
-            case D3DFeatureLevel.Level101:
-                _apiVersion = new GraphicsApiVersion(10, 1, 0, 0);
-                break;
-
-            case D3DFeatureLevel.Level110:
-                _apiVersion = new GraphicsApiVersion(11, 0, 0, 0);
-                break;
-
-            case D3DFeatureLevel.Level111:
-                _apiVersion = new GraphicsApiVersion(11, 1, 0, 0);
-                break;
-
-            case D3DFeatureLevel.Level120:
-                _apiVersion = new GraphicsApiVersion(12, 0, 0, 0);
-                break;
-
-            case D3DFeatureLevel.Level121:
-                _apiVersion = new GraphicsApiVersion(12, 1, 0, 0);
-                break;
-
-            case D3DFeatureLevel.Level122:
-                _apiVersion = new GraphicsApiVersion(12, 2, 0, 0);
-                break;
-        }
-
-        if (swapchainDesc != null)
-        {
-            SwapchainDescription desc = swapchainDesc.Value;
-            _mainSwapchain = new D3D11Swapchain(this, ref desc);
-        }
-
-        // Check threading support
-        FeatureDataThreading threadingData;
-        pDevice->CheckFeatureSupport(Silk.NET.Direct3D11.Feature.Threading, &threadingData, (uint)sizeof(FeatureDataThreading));
-        _supportsConcurrentResources = threadingData.DriverConcurrentCreates;
-        _supportsCommandLists = threadingData.DriverCommandLists;
-
-        _debugActive = (flags & CreateDeviceFlag.Debug) != 0;
-
-        // Check double precision support
-        FeatureDataDoubles doublesData;
-        pDevice->CheckFeatureSupport(Silk.NET.Direct3D11.Feature.Doubles, &doublesData, (uint)sizeof(FeatureDataDoubles));
-
-        Features = new GraphicsDeviceFeatures(
-            computeShader: true,
-            geometryShader: true,
-            tessellationShaders: true,
-            multipleViewports: true,
-            samplerLodBias: true,
-            drawBaseVertex: true,
-            drawBaseInstance: true,
-            drawIndirect: true,
-            drawIndirectBaseInstance: true,
-            fillModeWireframe: true,
-            samplerAnisotropy: true,
-            depthClipDisable: true,
-            texture1D: true,
-            independentBlend: true,
-            structuredBuffer: featureLevel >= D3DFeatureLevel.Level110,
-            subsetTextureView: true,
-            commandListDebugMarkers: featureLevel >= D3DFeatureLevel.Level111,
-            bufferRangeBinding: featureLevel >= D3DFeatureLevel.Level111,
-            shaderFloat64: doublesData.DoublePrecisionFloatShaderOps);
-
-        _d3d11ResourceFactory = new D3D11ResourceFactory(this);
-        _d3d11Info = new BackendInfoD3D11(this);
-
-        PostDeviceCreated();
     }
 
-    private static bool SdkLayersAvailable(Silk.NET.Direct3D11.D3D11 d3d11)
+    private void ActivateValidationMessageQueue()
+    {
+        if (_debugDeviceCreated)
+        {
+            if (D3D11ValidationMessageQueue.TryCreate(
+                _device.Handle,
+                out D3D11ValidationMessageQueue validationMessages,
+                out string activationFailure))
+            {
+                _validationMessages = validationMessages;
+
+                if (_validationMessages.CreationBaselineDiscardedMessageCount != 0)
+                {
+                    Validation.Report(
+                        GraphicsDeviceValidationSeverity.Error,
+                        "D3D11",
+                        "InfoQueue",
+                        "CreationBaselineMessagesDiscarded",
+                        $"The D3D11 info queue reported "
+                        + $"{_validationMessages.CreationBaselineDiscardedMessageCount} message(s) "
+                        + "discarded by its capacity limit before NeoVeldrid could activate the queue "
+                        + "immediately after D3D11CreateDevice returned. Their contents are unavailable.");
+                }
+
+                if (_validationMessages.CreationBaselineStorageDeniedMessageCount != 0)
+                {
+                    Validation.Report(
+                        GraphicsDeviceValidationSeverity.Warning,
+                        "D3D11",
+                        "InfoQueue",
+                        "CreationBaselineMessagesDeniedByStorageFilter",
+                        $"The D3D11 info queue reported "
+                        + $"{_validationMessages.CreationBaselineStorageDeniedMessageCount} message(s) "
+                        + "denied by its initial storage filter before NeoVeldrid could access the queue. "
+                        + "ID3D11InfoQueue is unavailable until D3D11CreateDevice returns; NeoVeldrid "
+                        + "then acquired it immediately, cleared the filter, and retained this count as "
+                        + "the creation baseline. Any subsequent increase fails validation.");
+                }
+
+                GraphicsDeviceValidationFeatures activeFeatures =
+                    GraphicsDeviceValidationFeatures.ApiDebugOutput;
+                if (_validationMessages.SupportsLiveObjectTracking)
+                {
+                    activeFeatures |= GraphicsDeviceValidationFeatures.LiveObjectTracking;
+                }
+
+                Validation.SetActive(activeFeatures, "ID3D11InfoQueue");
+            }
+            else
+            {
+                Validation.SetInactive(activationFailure);
+            }
+        }
+        else if (_debugLayerProbeHResult is int probeResult && probeResult < 0)
+        {
+            Validation.SetInactive(
+                $"The D3D11 SDK layers were unavailable (HRESULT 0x{probeResult:X8}); "
+                + "the device was created without the debug layer.");
+        }
+        else
+        {
+            Validation.SetInactive("The Direct3D 11 debug layer was not requested.");
+        }
+    }
+
+    private static int ProbeSdkLayers(Silk.NET.Direct3D11.D3D11 d3d11)
     {
         // Try creating a null device with debug flag to check if SDK layers are installed
-        int hr = d3d11.CreateDevice(
+        return d3d11.CreateDevice(
             (IDXGIAdapter*)null,
             D3DDriverType.Null,
             IntPtr.Zero,
@@ -254,7 +414,6 @@ internal unsafe class D3D11GraphicsDevice : GraphicsDevice
             (ID3D11Device**)null,
             (D3DFeatureLevel*)null,
             (ID3D11DeviceContext**)null);
-        return hr >= 0;
     }
 
     private static D3D11DeviceOptions MergeOptions(D3D11DeviceOptions d3D11DeviceOptions, GraphicsDeviceOptions options)
@@ -324,18 +483,51 @@ internal unsafe class D3D11GraphicsDevice : GraphicsDevice
     private protected override void SubmitCommandsCore(CommandList cl, Fence fence)
     {
         D3D11CommandList d3d11CL = Util.AssertSubtype<CommandList, D3D11CommandList>(cl);
+        D3D11Fence d3d11Fence = fence == null
+            ? null
+            : GetOwnedFence(fence);
         lock (_immediateContextLock)
         {
-            if (d3d11CL.DeviceCommandList != null) // CommandList may have been reset in the meantime (resized swapchain).
+            ID3D11DeviceContext* context = _immediateContext.Handle;
+            bool fenceReserved = false;
+            if (d3d11Fence != null)
             {
-                ((ID3D11DeviceContext*)_immediateContext)->ExecuteCommandList(d3d11CL.DeviceCommandList, false);
-                d3d11CL.OnCompleted();
+                d3d11Fence.AcquireSubmission(this);
+                fenceReserved = true;
             }
-        }
 
-        if (fence is D3D11Fence d3d11Fence)
-        {
-            d3d11Fence.Set();
+            try
+            {
+                bool executedCommandList = d3d11CL.DeviceCommandList != null;
+                if (executedCommandList) // CommandList may have been reset in the meantime (resized swapchain).
+                {
+                    context->ExecuteCommandList(d3d11CL.DeviceCommandList, false);
+                }
+
+                if (d3d11Fence != null)
+                {
+                    // The reservation remains held from preflight through this
+                    // marker, so Dispose cannot invalidate the query after the
+                    // command list has been committed. Flush guarantees that an
+                    // otherwise idle queue can make progress.
+                    d3d11Fence.ArmReserved(context);
+                    context->Flush();
+                }
+
+                // Complete managed ownership only after the optional native
+                // completion marker has been committed.
+                if (executedCommandList)
+                {
+                    d3d11CL.OnCompleted();
+                }
+            }
+            finally
+            {
+                if (fenceReserved)
+                {
+                    d3d11Fence.ReleaseSubmission();
+                }
+            }
         }
     }
 
@@ -344,7 +536,8 @@ internal unsafe class D3D11GraphicsDevice : GraphicsDevice
         lock (_immediateContextLock)
         {
             D3D11Swapchain d3d11SC = Util.AssertSubtype<Swapchain, D3D11Swapchain>(swapchain);
-            d3d11SC.DxgiSwapChain->Present((uint)d3d11SC.SyncInterval, 0);
+            SilkMarshal.ThrowHResult(
+                d3d11SC.DxgiSwapChain->Present((uint)d3d11SC.SyncInterval, 0));
         }
     }
 
@@ -689,15 +882,21 @@ internal unsafe class D3D11GraphicsDevice : GraphicsDevice
         else
         {
             int subresource = D3D11Util.ComputeSubresource(mipLevel, texture.MipLevels, arrayLayer);
-            Box resourceRegion = new Box
-            {
-                Left = x,
-                Top = y,
-                Front = z,
-                Right = x + width,
-                Bottom = y + height,
-                Back = z + depth,
-            };
+            Box resourceRegion = D3D11Util.GetTextureRegion(
+                d3dTex,
+                x,
+                y,
+                z,
+                width,
+                height,
+                depth,
+                mipLevel);
+            Box* nativeRegion = D3D11Util.IsFullTextureSubresource(
+                d3dTex,
+                mipLevel,
+                in resourceRegion)
+                ? null
+                : &resourceRegion;
 
             uint srcRowPitch = FormatHelpers.GetRowPitch(width, texture.Format);
             uint srcDepthPitch = FormatHelpers.GetDepthPitch(srcRowPitch, height, texture.Format);
@@ -706,7 +905,7 @@ internal unsafe class D3D11GraphicsDevice : GraphicsDevice
                 ((ID3D11DeviceContext*)_immediateContext)->UpdateSubresource(
                     d3dTex.DeviceTexture,
                     (uint)subresource,
-                    &resourceRegion,
+                    nativeRegion,
                     (void*)source,
                     srcRowPitch,
                     srcDepthPitch);
@@ -716,75 +915,244 @@ internal unsafe class D3D11GraphicsDevice : GraphicsDevice
 
     public override bool WaitForFence(Fence fence, ulong nanosecondTimeout)
     {
-        return Util.AssertSubtype<Fence, D3D11Fence>(fence).Wait(nanosecondTimeout);
+        if (RequiresValidationBoundary)
+        {
+            FenceWaitBoundary boundary = new FenceWaitBoundary(
+                this,
+                fence,
+                nanosecondTimeout);
+            ExecuteValidationBoundary(
+                "fence wait",
+                boundary,
+                static state => state.Result = state.Device.WaitForFenceCore(
+                    state.Fence,
+                    state.NanosecondTimeout));
+            return boundary.Result;
+        }
+
+        return WaitForFenceCore(fence, nanosecondTimeout);
+    }
+
+    private bool WaitForFenceCore(Fence fence, ulong nanosecondTimeout)
+    {
+        D3D11Fence d3d11Fence = GetOwnedFence(fence);
+        long startTimestamp = Stopwatch.GetTimestamp();
+        SpinWait spinner = default;
+        while (true)
+        {
+            if (IsFenceSignaledCore(d3d11Fence))
+            {
+                return true;
+            }
+            if (FenceWaitTimedOut(startTimestamp, nanosecondTimeout))
+            {
+                return false;
+            }
+
+            spinner.SpinOnce();
+        }
     }
 
     public override bool WaitForFences(Fence[] fences, bool waitAll, ulong nanosecondTimeout)
     {
-        int msTimeout;
-        if (nanosecondTimeout == ulong.MaxValue)
+        if (RequiresValidationBoundary)
         {
-            msTimeout = -1;
-        }
-        else
-        {
-            msTimeout = (int)Math.Min(nanosecondTimeout / 1_000_000, int.MaxValue);
+            FenceSetWaitBoundary boundary = new FenceSetWaitBoundary(
+                this,
+                fences,
+                waitAll,
+                nanosecondTimeout);
+            ExecuteValidationBoundary(
+                "fence-set wait",
+                boundary,
+                static state => state.Result = state.Device.WaitForFencesCore(
+                    state.Fences,
+                    state.WaitAll,
+                    state.NanosecondTimeout));
+            return boundary.Result;
         }
 
-        ManualResetEvent[] events = GetResetEventArray(fences.Length);
+        return WaitForFencesCore(fences, waitAll, nanosecondTimeout);
+    }
+
+    private bool WaitForFencesCore(Fence[] fences, bool waitAll, ulong nanosecondTimeout)
+    {
+        ArgumentNullException.ThrowIfNull(fences);
+        if (fences.Length == 0)
+        {
+            throw new ArgumentException("At least one fence is required.", nameof(fences));
+        }
+
+        D3D11Fence[] d3d11Fences = new D3D11Fence[fences.Length];
         for (int i = 0; i < fences.Length; i++)
         {
-            events[i] = Util.AssertSubtype<Fence, D3D11Fence>(fences[i]).ResetEvent;
-        }
-        bool result;
-        if (waitAll)
-        {
-            result = WaitHandle.WaitAll(events, msTimeout);
-        }
-        else
-        {
-            int index = WaitHandle.WaitAny(events, msTimeout);
-            result = index != WaitHandle.WaitTimeout;
+            d3d11Fences[i] = GetOwnedFence(fences[i]);
         }
 
-        ReturnResetEventArray(events);
-
-        return result;
-    }
-
-    private readonly object _resetEventsLock = new object();
-    private readonly List<ManualResetEvent[]> _resetEvents = new List<ManualResetEvent[]>();
-
-    private ManualResetEvent[] GetResetEventArray(int length)
-    {
-        lock (_resetEventsLock)
+        long startTimestamp = Stopwatch.GetTimestamp();
+        SpinWait spinner = default;
+        while (true)
         {
-            for (int i = _resetEvents.Count - 1; i > 0; i--)
+            bool anySignaled = false;
+            bool allSignaled = true;
+            lock (_immediateContextLock)
             {
-                ManualResetEvent[] array = _resetEvents[i];
-                if (array.Length == length)
+                ID3D11DeviceContext* context = _immediateContext.Handle;
+                for (int i = 0; i < d3d11Fences.Length; i++)
                 {
-                    _resetEvents.RemoveAt(i);
-                    return array;
+                    bool signaled = d3d11Fences[i].Poll(context);
+                    anySignaled |= signaled;
+                    allSignaled &= signaled;
                 }
             }
-        }
 
-        ManualResetEvent[] newArray = new ManualResetEvent[length];
-        return newArray;
+            if (waitAll ? allSignaled : anySignaled)
+            {
+                return true;
+            }
+            if (FenceWaitTimedOut(startTimestamp, nanosecondTimeout))
+            {
+                return false;
+            }
+
+            spinner.SpinOnce();
+        }
     }
 
-    private void ReturnResetEventArray(ManualResetEvent[] array)
+    internal bool IsFenceSignaled(D3D11Fence fence)
     {
-        lock (_resetEventsLock)
+        fence.ValidateOwner(this);
+        if (RequiresValidationBoundary)
         {
-            _resetEvents.Add(array);
+            FenceStatusBoundary boundary = new FenceStatusBoundary(this, fence);
+            ExecuteValidationBoundary(
+                "fence status",
+                boundary,
+                static state => state.Result = state.Device.IsFenceSignaledCore(state.Fence));
+            return boundary.Result;
         }
+
+        return IsFenceSignaledCore(fence);
+    }
+
+    private bool IsFenceSignaledCore(D3D11Fence fence)
+    {
+        lock (_immediateContextLock)
+        {
+            return fence.Poll(_immediateContext.Handle);
+        }
+    }
+
+    private static bool FenceWaitTimedOut(long startTimestamp, ulong nanosecondTimeout)
+    {
+        if (nanosecondTimeout == ulong.MaxValue)
+        {
+            return false;
+        }
+
+        long elapsedTicks = Stopwatch.GetTimestamp() - startTimestamp;
+        double elapsedNanoseconds =
+            elapsedTicks * (1_000_000_000d / Stopwatch.Frequency);
+        return elapsedNanoseconds >= nanosecondTimeout;
+    }
+
+    private sealed class FenceWaitBoundary
+    {
+        public FenceWaitBoundary(
+            D3D11GraphicsDevice device,
+            Fence fence,
+            ulong nanosecondTimeout)
+        {
+            Device = device;
+            Fence = fence;
+            NanosecondTimeout = nanosecondTimeout;
+        }
+
+        public D3D11GraphicsDevice Device { get; }
+        public Fence Fence { get; }
+        public ulong NanosecondTimeout { get; }
+        public bool Result { get; set; }
+    }
+
+    private sealed class FenceStatusBoundary
+    {
+        public FenceStatusBoundary(D3D11GraphicsDevice device, D3D11Fence fence)
+        {
+            Device = device;
+            Fence = fence;
+        }
+
+        public D3D11GraphicsDevice Device { get; }
+        public D3D11Fence Fence { get; }
+        public bool Result { get; set; }
+    }
+
+    private sealed class FenceResetBoundary
+    {
+        public FenceResetBoundary(D3D11GraphicsDevice device, D3D11Fence fence)
+        {
+            Device = device;
+            Fence = fence;
+        }
+
+        public D3D11GraphicsDevice Device { get; }
+        public D3D11Fence Fence { get; }
+    }
+
+    private sealed class FenceSetWaitBoundary
+    {
+        public FenceSetWaitBoundary(
+            D3D11GraphicsDevice device,
+            Fence[] fences,
+            bool waitAll,
+            ulong nanosecondTimeout)
+        {
+            Device = device;
+            Fences = fences;
+            WaitAll = waitAll;
+            NanosecondTimeout = nanosecondTimeout;
+        }
+
+        public D3D11GraphicsDevice Device { get; }
+        public Fence[] Fences { get; }
+        public bool WaitAll { get; }
+        public ulong NanosecondTimeout { get; }
+        public bool Result { get; set; }
     }
 
     public override void ResetFence(Fence fence)
     {
-        Util.AssertSubtype<Fence, D3D11Fence>(fence).Reset();
+        ResetFenceState(GetOwnedFence(fence));
+    }
+
+    internal void ResetFenceState(D3D11Fence fence)
+    {
+        fence.ValidateOwner(this);
+        if (RequiresValidationBoundary)
+        {
+            ExecuteValidationBoundary(
+                "fence reset",
+                new FenceResetBoundary(this, fence),
+                static state => state.Device.ResetFenceStateCore(state.Fence));
+            return;
+        }
+
+        ResetFenceStateCore(fence);
+    }
+
+    private D3D11Fence GetOwnedFence(Fence fence)
+    {
+        D3D11Fence d3d11Fence = Util.AssertSubtype<Fence, D3D11Fence>(fence);
+        d3d11Fence.ValidateOwner(this);
+        return d3d11Fence;
+    }
+
+    private void ResetFenceStateCore(D3D11Fence fence)
+    {
+        lock (_immediateContextLock)
+        {
+            fence.ResetForReuse(_immediateContext.Handle);
+        }
     }
 
     internal override uint GetUniformBufferMinOffsetAlignmentCore() => 256u;
@@ -793,69 +1161,213 @@ internal unsafe class D3D11GraphicsDevice : GraphicsDevice
 
     protected override void PlatformDispose()
     {
-        // Dispose staging buffers
+        List<Exception> failures = null;
+
         foreach (DeviceBuffer buffer in _availableStagingBuffers)
         {
-            buffer.Dispose();
+            AttemptPlatformCleanup(buffer.Dispose, ref failures);
         }
         _availableStagingBuffers.Clear();
 
-        _d3d11ResourceFactory.Dispose();
-        _mainSwapchain?.Dispose();
-        _immediateContext.Dispose();
-
-        if (_debugActive)
+        AttemptPlatformCleanup(() => _d3d11ResourceFactory?.Dispose(), ref failures);
+        AttemptPlatformCleanup(() => _mainSwapchain?.Dispose(), ref failures);
+        if (_immediateContext.Handle != null)
         {
-            // Release our device reference. If refCount > 0, leaked objects are keeping it alive.
-            ID3D11Device* pRawDevice = _device.Handle;
-            uint refCount = pRawDevice->Release();
-            _device = default;
+            AttemptPlatformCleanup(_immediateContext.Dispose, ref failures);
+        }
+        _immediateContext = default;
+        if (_dxgiAdapter.Handle != null)
+        {
+            AttemptPlatformCleanup(_dxgiAdapter.Dispose, ref failures);
+        }
+        _dxgiAdapter = default;
 
-            if (refCount > 0)
-            {
-                ID3D11Debug* pDebug;
-                var debugGuid = ID3D11Debug.Guid;
-                if (((IUnknown*)pRawDevice)->QueryInterface(&debugGuid, (void**)&pDebug) >= 0 && pDebug != null)
-                {
-                    pDebug->ReportLiveDeviceObjects(RldoFlags.Summary | RldoFlags.Detail | RldoFlags.IgnoreInternal);
-                    pDebug->Release();
-                }
-            }
+        // Copy operational and cleanup messages while the device and queue are
+        // unquestionably alive. The device-owned validation history outlives
+        // every native interface below.
+        AttemptPlatformCleanup(
+            () => _validationMessages?.DrainTo(Validation),
+            ref failures);
 
-            _dxgiAdapter.Dispose();
+        // The debug and info-queue interfaces deliberately keep the device alive
+        // after NeoVeldrid releases its reference. This makes the live-object
+        // report deterministic and lets it identify any remaining child object.
+        if (_device.Handle != null)
+        {
+            AttemptPlatformCleanup(_device.Dispose, ref failures);
+        }
+        _device = default;
+        AttemptPlatformCleanup(
+            () => _validationMessages?.ReportLiveObjectsAndDrainTo(Validation),
+            ref failures);
+        AttemptPlatformCleanup(() => _validationMessages?.Dispose(), ref failures);
 
-            // Report live DXGI objects (only available on Windows)
-            if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return;
+        AttemptPlatformCleanup(ReportDxgiLiveObjectsBestEffort, ref failures);
+        AttemptPlatformCleanup(() => _d3d11Api?.Dispose(), ref failures);
+
+        if (failures?.Count == 1)
+        {
+            throw failures[0];
+        }
+        if (failures?.Count > 1)
+        {
+            throw new AggregateException(
+                "Direct3D 11 teardown encountered multiple failures.",
+                failures);
+        }
+    }
+
+    private void ReportDxgiLiveObjectsBestEffort()
+    {
+        if (!_debugDeviceCreated || !RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+        {
+            return;
+        }
+
+        try
+        {
+#pragma warning disable CS0618
+            using var dxgi = DXGI.GetApi();
+#pragma warning restore CS0618
+            IDXGIDebug1* dxgiDebug = null;
             try
             {
-#pragma warning disable CS0618
-                using var dxgi = DXGI.GetApi();
-#pragma warning restore CS0618
-                IDXGIDebug1* pDxgiDebug;
-                var dxgiDebugGuid = IDXGIDebug1.Guid;
-                if (dxgi.GetDebugInterface1(0, &dxgiDebugGuid, (void**)&pDxgiDebug) >= 0 && pDxgiDebug != null)
+                Guid dxgiDebugGuid = IDXGIDebug1.Guid;
+                int activationResult =
+                    dxgi.GetDebugInterface1(0, &dxgiDebugGuid, (void**)&dxgiDebug);
+                if (activationResult < 0)
                 {
-                    var debugAll = DxgiDebugAll;
-                    pDxgiDebug->ReportLiveObjects(debugAll, DebugRloFlags.Summary | DebugRloFlags.IgnoreInternal);
-                    pDxgiDebug->Release();
+                    Validation.Report(
+                        GraphicsDeviceValidationSeverity.Warning,
+                        "DXGI",
+                        "LiveObjectTracking",
+                        "DebugInterfaceActivationFailed",
+                        $"DXGI.GetDebugInterface1 failed with HRESULT 0x{activationResult:X8}.");
+                    return;
+                }
+                if (dxgiDebug == null)
+                {
+                    Validation.Report(
+                        GraphicsDeviceValidationSeverity.Warning,
+                        "DXGI",
+                        "LiveObjectTracking",
+                        "DebugInterfaceActivationReturnedNull",
+                        "DXGI.GetDebugInterface1 succeeded without returning IDXGIDebug1.");
+                    return;
+                }
+
+                Guid debugAll = DxgiDebugAll;
+                int reportResult = dxgiDebug->ReportLiveObjects(
+                    debugAll,
+                    DebugRloFlags.Summary | DebugRloFlags.IgnoreInternal);
+                if (reportResult < 0)
+                {
+                    Validation.Report(
+                        GraphicsDeviceValidationSeverity.Warning,
+                        "DXGI",
+                        "LiveObjectTracking",
+                        "ReportLiveObjectsFailed",
+                        $"IDXGIDebug1.ReportLiveObjects failed with HRESULT 0x{reportResult:X8}.");
                 }
             }
-            catch (Exception)
+            finally
             {
-                // DXGIGetDebugInterface1 may not be available on older Windows versions
+                if (dxgiDebug != null)
+                {
+                    dxgiDebug->Release();
+                }
             }
         }
-        else
+        catch (Exception exception)
         {
-            _device.Dispose();
-            _dxgiAdapter.Dispose();
+            // DXGIGetDebugInterface1 is not guaranteed on every supported Windows
+            // version. Keep it as evidence without weakening the D3D11 queue gate.
+            Validation.Report(
+                GraphicsDeviceValidationSeverity.Warning,
+                "DXGI",
+                "LiveObjectTracking",
+                "ReportUnavailable",
+                exception.Message);
         }
+    }
 
-        _d3d11Api.Dispose();
+    private static void AttemptPlatformCleanup(Action cleanup, ref List<Exception> failures)
+    {
+        try
+        {
+            cleanup();
+        }
+        catch (Exception exception)
+        {
+            failures ??= new List<Exception>();
+            failures.Add(exception);
+        }
     }
 
     private protected override void WaitForIdleCore()
     {
+        QueryDesc completionQueryDescription = new QueryDesc
+        {
+            Query = Silk.NET.Direct3D11.Query.Event,
+            MiscFlags = 0,
+        };
+        ID3D11Query* completionQuery = null;
+        try
+        {
+            SilkMarshal.ThrowHResult(
+                _device.Handle->CreateQuery(
+                    &completionQueryDescription,
+                    &completionQuery));
+
+            // Every use of the immediate context is serialized by this lock.
+            // Keep ownership through the event-query wait so no later submit can
+            // cross the idle boundary while it is being established.
+            lock (_immediateContextLock)
+            {
+                ID3D11DeviceContext* context = _immediateContext.Handle;
+                context->End((ID3D11Asynchronous*)completionQuery);
+                context->Flush();
+
+                SpinWait spinner = default;
+                while (true)
+                {
+                    int result = context->GetData(
+                        (ID3D11Asynchronous*)completionQuery,
+                        null,
+                        0,
+                        (uint)AsyncGetdataFlag.Donotflush);
+                    if (result == 0) // S_OK
+                    {
+                        break;
+                    }
+
+                    if (result < 0)
+                    {
+                        SilkMarshal.ThrowHResult(result);
+                    }
+                    if (result != 1) // S_FALSE is the only pending result.
+                    {
+                        throw new NeoVeldridException(
+                            $"ID3D11DeviceContext.GetData returned unexpected status 0x{result:X8} while waiting for device idle.");
+                    }
+
+                    spinner.SpinOnce();
+                }
+            }
+        }
+        finally
+        {
+            // CreateQuery may populate its output even when it reports failure.
+            if (completionQuery != null)
+            {
+                completionQuery->Release();
+            }
+        }
+    }
+
+    protected override void CollectValidationMessages()
+    {
+        _validationMessages?.DrainTo(Validation);
     }
 
     public override bool GetD3D11Info(out BackendInfoD3D11 info)

@@ -2,15 +2,17 @@ using Silk.NET.Vulkan;
 using static NeoVeldrid.Vk.VulkanUtil;
 using System.Diagnostics;
 using System;
+using System.Collections.Generic;
 
 namespace NeoVeldrid.Vk;
 
 internal unsafe class VkTexture : Texture
 {
     private readonly VkGraphicsDevice _gd;
-    private readonly Image _optimalImage;
-    private readonly VkMemoryBlock _memoryBlock;
-    private readonly Silk.NET.Vulkan.Buffer _stagingBuffer;
+    private Image _optimalImage;
+    private VkMemoryBlock _memoryBlock;
+    private Silk.NET.Vulkan.Buffer _stagingBuffer;
+    private readonly uint _stagingBufferCapacity;
     private PixelFormat _format; // Static for regular images -- may change for shared staging images
     private readonly uint _actualImageArrayLayers;
     private bool _destroyed;
@@ -19,6 +21,7 @@ internal unsafe class VkTexture : Texture
     private uint _width;
     private uint _height;
     private uint _depth;
+    private TextureStagingLayout _stagingLayout;
 
     public override uint Width => _width;
 
@@ -43,12 +46,18 @@ internal unsafe class VkTexture : Texture
 
     public Image OptimalDeviceImage => _optimalImage;
     public Silk.NET.Vulkan.Buffer StagingBuffer => _stagingBuffer;
+    internal uint StagingBufferCapacity => _stagingBufferCapacity;
+    public VkMappableResourceSubmissionAccess SubmissionAccess { get; } =
+        new VkMappableResourceSubmissionAccess();
     public VkMemoryBlock Memory => _memoryBlock;
 
     public Format VkFormat { get; }
     public SampleCountFlags VkSampleCount { get; }
 
     private ImageLayout[] _imageLayouts;
+    private uint[] _imageLayoutRevisions;
+    private readonly List<VkImageLayoutTransaction> _pendingLayoutTransactions =
+        new List<VkImageLayoutTransaction>();
     private bool _isSwapchainTexture;
     private string _name;
 
@@ -85,7 +94,7 @@ internal unsafe class VkTexture : Texture
             imageCI.Extent.Width = Width;
             imageCI.Extent.Height = Height;
             imageCI.Extent.Depth = Depth;
-            imageCI.InitialLayout = ImageLayout.Preinitialized;
+            imageCI.InitialLayout = ImageLayout.Undefined;
             imageCI.Usage = VkFormats.VdToVkTextureUsage(Usage);
             imageCI.Tiling = isStaging ? ImageTiling.Linear : ImageTiling.Optimal;
             imageCI.Format = VkFormat;
@@ -135,34 +144,20 @@ internal unsafe class VkTexture : Texture
             CheckResult(result);
 
             _imageLayouts = new ImageLayout[subresourceCount];
+            _imageLayoutRevisions = new uint[subresourceCount];
             for (int i = 0; i < _imageLayouts.Length; i++)
             {
-                _imageLayouts[i] = ImageLayout.Preinitialized;
+                _imageLayouts[i] = ImageLayout.Undefined;
             }
         }
         else // isStaging
         {
-            uint depthPitch = FormatHelpers.GetDepthPitch(
-                FormatHelpers.GetRowPitch(Width, Format),
-                Height,
-                Format);
-            uint stagingSize = depthPitch * Depth;
-            for (uint level = 1; level < MipLevels; level++)
-            {
-                Util.GetMipDimensions(this, level, out uint mipWidth, out uint mipHeight, out uint mipDepth);
-
-                depthPitch = FormatHelpers.GetDepthPitch(
-                    FormatHelpers.GetRowPitch(mipWidth, Format),
-                    mipHeight,
-                    Format);
-
-                stagingSize += depthPitch * mipDepth;
-            }
-            stagingSize *= ArrayLayers;
+            _stagingLayout = TextureStagingLayout.Create(description);
+            _stagingBufferCapacity = _stagingLayout.TotalSizeInBytes;
 
             BufferCreateInfo bufferCI = new BufferCreateInfo { SType = StructureType.BufferCreateInfo };
             bufferCI.Usage = BufferUsageFlags.TransferSrcBit | BufferUsageFlags.TransferDstBit;
-            bufferCI.Size = stagingSize;
+            bufferCI.Size = _stagingBufferCapacity;
             Result result = _gd.Vk.CreateBuffer(_gd.Device, in bufferCI, null, out _stagingBuffer);
             CheckResult(result);
 
@@ -206,9 +201,9 @@ internal unsafe class VkTexture : Texture
             CheckResult(result);
         }
 
+        RefCount = new ResourceRefCount(RefCountedDispose);
         ClearIfRenderTarget();
         TransitionIfSampled();
-        RefCount = new ResourceRefCount(RefCountedDispose);
     }
 
     // Used to construct Swapchain textures.
@@ -238,10 +233,11 @@ internal unsafe class VkTexture : Texture
         VkSampleCount = VkFormats.VdToVkSampleCount(sampleCount);
         _optimalImage = existingImage;
         _imageLayouts = new[] { ImageLayout.Undefined };
+        _imageLayoutRevisions = new uint[1];
         _isSwapchainTexture = true;
 
+        RefCount = new ResourceRefCount(RefCountedDispose);
         ClearIfRenderTarget();
-        RefCount = new ResourceRefCount(DisposeCore);
     }
 
     private void ClearIfRenderTarget()
@@ -286,19 +282,17 @@ internal unsafe class VkTexture : Texture
         }
         else
         {
-            uint blockSize = FormatHelpers.IsCompressedFormat(Format) ? 4u : 1u;
-            Util.GetMipDimensions(this, mipLevel, out uint mipWidth, out uint mipHeight, out uint mipDepth);
-            uint rowPitch = FormatHelpers.GetRowPitch(mipWidth, Format);
-            uint depthPitch = FormatHelpers.GetDepthPitch(rowPitch, mipHeight, Format);
+            StagingTextureSubresourceLayout stagingLayout =
+                _stagingLayout.GetSubresourceLayout(mipLevel, arrayLayer);
 
             SubresourceLayout layout = new SubresourceLayout()
             {
-                RowPitch = rowPitch,
-                DepthPitch = depthPitch,
-                ArrayPitch = depthPitch,
-                Size = depthPitch,
+                Offset = stagingLayout.Offset,
+                RowPitch = stagingLayout.RowPitch,
+                DepthPitch = stagingLayout.DepthPitch,
+                ArrayPitch = stagingLayout.ArrayPitch,
+                Size = stagingLayout.SizeInBytes,
             };
-            layout.Offset = Util.ComputeSubresourceOffset(this, mipLevel, arrayLayer);
 
             return layout;
         }
@@ -310,56 +304,60 @@ internal unsafe class VkTexture : Texture
         uint levelCount,
         uint baseArrayLayer,
         uint layerCount,
-        ImageLayout newLayout)
+        ImageLayout newLayout,
+        VkImageLayoutTransaction transaction = null)
     {
         if (_stagingBuffer.Handle != 0)
         {
             return;
         }
 
-        ImageLayout oldLayout = _imageLayouts[CalculateSubresource(baseMipLevel, baseArrayLayer)];
-#if DEBUG
-        for (uint level = 0; level < levelCount; level++)
+        lock (VkImageLayoutTransaction.SyncRoot)
         {
-            for (uint layer = 0; layer < layerCount; layer++)
-            {
-                if (_imageLayouts[CalculateSubresource(baseMipLevel + level, baseArrayLayer + layer)] != oldLayout)
-                {
-                    throw new NeoVeldridException("Unexpected image layout.");
-                }
-            }
-        }
-#endif
-        if (oldLayout != newLayout)
-        {
-            ImageAspectFlags aspectMask;
-            if ((Usage & TextureUsage.DepthStencil) != 0)
-            {
-                aspectMask = FormatHelpers.IsStencilFormat(Format)
-                    ? ImageAspectFlags.DepthBit | ImageAspectFlags.StencilBit
-                    : ImageAspectFlags.DepthBit;
-            }
-            else
-            {
-                aspectMask = ImageAspectFlags.ColorBit;
-            }
-            VulkanUtil.TransitionImageLayout(
-                _gd.Vk,
-                cb,
-                OptimalDeviceImage,
+            EnsureLayoutAccessAllowedLocked(transaction);
+            ObserveLayoutRangeLocked(
+                transaction,
                 baseMipLevel,
                 levelCount,
                 baseArrayLayer,
-                layerCount,
-                aspectMask,
-                _imageLayouts[CalculateSubresource(baseMipLevel, baseArrayLayer)],
-                newLayout);
+                layerCount);
 
+            ImageLayout oldLayout = _imageLayouts[CalculateSubresource(baseMipLevel, baseArrayLayer)];
+#if DEBUG
             for (uint level = 0; level < levelCount; level++)
             {
                 for (uint layer = 0; layer < layerCount; layer++)
                 {
-                    _imageLayouts[CalculateSubresource(baseMipLevel + level, baseArrayLayer + layer)] = newLayout;
+                    if (_imageLayouts[CalculateSubresource(baseMipLevel + level, baseArrayLayer + layer)] != oldLayout)
+                    {
+                        throw new NeoVeldridException("Unexpected image layout.");
+                    }
+                }
+            }
+#endif
+            if (oldLayout != newLayout)
+            {
+                ImageAspectFlags aspectMask = ImageAspectMask;
+                VulkanUtil.TransitionImageLayout(
+                    _gd.Vk,
+                    cb,
+                    OptimalDeviceImage,
+                    baseMipLevel,
+                    levelCount,
+                    baseArrayLayer,
+                    layerCount,
+                    aspectMask,
+                    oldLayout,
+                    newLayout);
+
+                for (uint level = 0; level < levelCount; level++)
+                {
+                    for (uint layer = 0; layer < layerCount; layer++)
+                    {
+                        SetImageLayoutStateLocked(
+                            CalculateSubresource(baseMipLevel + level, baseArrayLayer + layer),
+                            newLayout);
+                    }
                 }
             }
         }
@@ -371,54 +369,71 @@ internal unsafe class VkTexture : Texture
         uint levelCount,
         uint baseArrayLayer,
         uint layerCount,
-        ImageLayout newLayout)
+        ImageLayout newLayout,
+        VkImageLayoutTransaction transaction = null)
     {
         if (_stagingBuffer.Handle != 0)
         {
             return;
         }
 
-        for (uint level = baseMipLevel; level < baseMipLevel + levelCount; level++)
+        lock (VkImageLayoutTransaction.SyncRoot)
         {
-            for (uint layer = baseArrayLayer; layer < baseArrayLayer + layerCount; layer++)
+            EnsureLayoutAccessAllowedLocked(transaction);
+            ObserveLayoutRangeLocked(
+                transaction,
+                baseMipLevel,
+                levelCount,
+                baseArrayLayer,
+                layerCount);
+
+            for (uint level = baseMipLevel; level < baseMipLevel + levelCount; level++)
             {
-                uint subresource = CalculateSubresource(level, layer);
-                ImageLayout oldLayout = _imageLayouts[subresource];
-
-                if (oldLayout != newLayout)
+                for (uint layer = baseArrayLayer; layer < baseArrayLayer + layerCount; layer++)
                 {
-                    ImageAspectFlags aspectMask;
-                    if ((Usage & TextureUsage.DepthStencil) != 0)
-                    {
-                        aspectMask = FormatHelpers.IsStencilFormat(Format)
-                            ? ImageAspectFlags.DepthBit | ImageAspectFlags.StencilBit
-                            : ImageAspectFlags.DepthBit;
-                    }
-                    else
-                    {
-                        aspectMask = ImageAspectFlags.ColorBit;
-                    }
-                    VulkanUtil.TransitionImageLayout(
-                        _gd.Vk,
-                        cb,
-                        OptimalDeviceImage,
-                        level,
-                        1,
-                        layer,
-                        1,
-                        aspectMask,
-                        oldLayout,
-                        newLayout);
+                    uint subresource = CalculateSubresource(level, layer);
+                    ImageLayout oldLayout = _imageLayouts[subresource];
 
-                    _imageLayouts[subresource] = newLayout;
+                    if (oldLayout != newLayout)
+                    {
+                        VulkanUtil.TransitionImageLayout(
+                            _gd.Vk,
+                            cb,
+                            OptimalDeviceImage,
+                            level,
+                            1,
+                            layer,
+                            1,
+                            ImageAspectMask,
+                            oldLayout,
+                            newLayout);
+
+                        SetImageLayoutStateLocked(subresource, newLayout);
+                    }
                 }
             }
         }
     }
 
-    internal ImageLayout GetImageLayout(uint mipLevel, uint arrayLayer)
+    internal ImageLayout GetImageLayout(
+        uint mipLevel,
+        uint arrayLayer,
+        VkImageLayoutTransaction transaction = null)
     {
-        return _imageLayouts[CalculateSubresource(mipLevel, arrayLayer)];
+        lock (VkImageLayoutTransaction.SyncRoot)
+        {
+            uint subresource = CalculateSubresource(mipLevel, arrayLayer);
+            if (transaction != null)
+            {
+                transaction.ObserveLocked(
+                    this,
+                    subresource,
+                    _imageLayouts[subresource],
+                    _imageLayoutRevisions[subresource]);
+            }
+
+            return _imageLayouts[subresource];
+        }
     }
 
     public override string Name
@@ -435,10 +450,24 @@ internal unsafe class VkTexture : Texture
     {
         Debug.Assert(_stagingBuffer.Handle != 0);
         Debug.Assert(Usage == TextureUsage.Staging);
+        TextureStagingLayout stagingLayout = TextureStagingLayout.Create(
+            width,
+            height,
+            depth,
+            MipLevels,
+            ArrayLayers,
+            format);
+        if (stagingLayout.TotalSizeInBytes > _stagingBufferCapacity)
+        {
+            throw new NeoVeldridException(
+                "The shared Vulkan staging texture is too small for the requested layout.");
+        }
+
         _width = width;
         _height = height;
         _depth = depth;
         _format = format;
+        _stagingLayout = stagingLayout;
     }
 
     private protected override void DisposeCore()
@@ -448,31 +477,206 @@ internal unsafe class VkTexture : Texture
 
     private void RefCountedDispose()
     {
-        if (!_destroyed)
+        if (_destroyed)
+            return;
+
+        // The cached view is a native child of the texture image. Do not
+        // advance to image retirement unless that child has been released.
+        // Texture tracks this stage independently, so a failed later stage can
+        // retry without disposing the view twice.
+        DisposeFullTextureView();
+
+        // Swapchain images are owned by the swapchain. Retiring the
+        // NeoVeldrid wrapper and its cached view must never destroy the
+        // borrowed VkImage or return unowned memory.
+        if (_isSwapchainTexture)
         {
-            base.Dispose();
-
             _destroyed = true;
+            return;
+        }
 
-            bool isStaging = (Usage & TextureUsage.Staging) == TextureUsage.Staging;
-            if (isStaging)
-            {
-                _gd.Vk.DestroyBuffer(_gd.Device, _stagingBuffer, null);
-            }
-            else
-            {
-                _gd.Vk.DestroyImage(_gd.Device, _optimalImage, null);
-            }
+        // Clear each owned handle only after its release succeeds. If freeing
+        // a later parent allocation fails, ResourceRefCount restores the final
+        // reference and a retry resumes without destroying the native texture
+        // object a second time.
+        if (_stagingBuffer.Handle != 0)
+        {
+            _gd.Vk.DestroyBuffer(_gd.Device, _stagingBuffer, null);
+            _stagingBuffer = default;
+        }
+        else if (_optimalImage.Handle != 0)
+        {
+            _gd.Vk.DestroyImage(_gd.Device, _optimalImage, null);
+            _optimalImage = default;
+        }
 
-            if (_memoryBlock.DeviceMemory.Handle != 0)
+        if (_memoryBlock.DeviceMemory.Handle != 0)
+        {
+            _gd.MemoryManager.Free(_memoryBlock);
+            _memoryBlock = default;
+        }
+
+        _destroyed = _stagingBuffer.Handle == 0
+            && _optimalImage.Handle == 0
+            && _memoryBlock.DeviceMemory.Handle == 0;
+    }
+
+    internal void SetImageLayout(
+        uint mipLevel,
+        uint arrayLayer,
+        ImageLayout layout,
+        VkImageLayoutTransaction transaction = null)
+    {
+        lock (VkImageLayoutTransaction.SyncRoot)
+        {
+            EnsureLayoutAccessAllowedLocked(transaction);
+            uint subresource = CalculateSubresource(mipLevel, arrayLayer);
+            transaction?.ObserveLocked(
+                this,
+                subresource,
+                _imageLayouts[subresource],
+                _imageLayoutRevisions[subresource]);
+            if (_imageLayouts[subresource] != layout)
+                SetImageLayoutStateLocked(subresource, layout);
+        }
+    }
+
+    internal void RegisterLayoutTransactionLocked(
+        VkImageLayoutTransaction transaction)
+    {
+        int existingIndex = _pendingLayoutTransactions.IndexOf(transaction);
+        if (existingIndex >= 0)
+        {
+            ValidateRecordingTransactionLocked(transaction);
+            return;
+        }
+
+        if (_pendingLayoutTransactions.Count != 0)
+        {
+            VkImageLayoutTransaction latestTransaction =
+                _pendingLayoutTransactions[^1];
+            if (latestTransaction.RecordingOrder >= transaction.RecordingOrder)
             {
-                _gd.MemoryManager.Free(_memoryBlock);
+                throw new NeoVeldridException(
+                    "A Vulkan image-layout transaction cannot acquire a Texture after a later recording transaction has already used it. " +
+                    "Finish recording command lists in one global order to avoid cyclic submission dependencies.");
+            }
+        }
+
+        _pendingLayoutTransactions.Add(transaction);
+    }
+
+    internal void ValidateRecordingTransactionLocked(
+        VkImageLayoutTransaction transaction)
+    {
+        if (_pendingLayoutTransactions.Count == 0 ||
+            !ReferenceEquals(_pendingLayoutTransactions[^1], transaction))
+        {
+            throw new NeoVeldridException(
+                "A Vulkan command list cannot continue recording image-layout assumptions after a later command list has used the same texture.");
+        }
+    }
+
+    internal void ValidateSubmittingTransactionLocked(
+        VkImageLayoutTransaction transaction)
+    {
+        if (_pendingLayoutTransactions.Count == 0 ||
+            !ReferenceEquals(_pendingLayoutTransactions[0], transaction))
+        {
+            throw new NeoVeldridException(
+                "Vulkan command lists which use the same texture must be submitted in recording order.");
+        }
+    }
+
+    internal void CommitLayoutTransactionLocked(
+        VkImageLayoutTransaction transaction)
+    {
+        ValidateSubmittingTransactionLocked(transaction);
+        _pendingLayoutTransactions.RemoveAt(0);
+    }
+
+    internal void ValidateRollingBackTransactionLocked(
+        VkImageLayoutTransaction transaction)
+    {
+        if (_pendingLayoutTransactions.Count == 0 ||
+            !ReferenceEquals(_pendingLayoutTransactions[^1], transaction))
+        {
+            throw new NeoVeldridException(
+                "A Vulkan command list cannot be abandoned while a later recording depends on its image-layout projections.");
+        }
+    }
+
+    internal void RollbackLayoutTransactionLocked(
+        VkImageLayoutTransaction transaction)
+    {
+        ValidateRollingBackTransactionLocked(transaction);
+        _pendingLayoutTransactions.RemoveAt(_pendingLayoutTransactions.Count - 1);
+    }
+
+    internal void RestoreImageLayoutStateLocked(
+        uint subresource,
+        ImageLayout layout,
+        uint revision)
+    {
+        _imageLayouts[subresource] = layout;
+        _imageLayoutRevisions[subresource] = revision;
+    }
+
+    private void ObserveLayoutRangeLocked(
+        VkImageLayoutTransaction transaction,
+        uint baseMipLevel,
+        uint levelCount,
+        uint baseArrayLayer,
+        uint layerCount)
+    {
+        if (transaction == null)
+            return;
+
+        for (uint level = 0; level < levelCount; level++)
+        {
+            for (uint layer = 0; layer < layerCount; layer++)
+            {
+                uint subresource = CalculateSubresource(
+                    baseMipLevel + level,
+                    baseArrayLayer + layer);
+                transaction.ObserveLocked(
+                    this,
+                    subresource,
+                    _imageLayouts[subresource],
+                    _imageLayoutRevisions[subresource]);
             }
         }
     }
 
-    internal void SetImageLayout(uint mipLevel, uint arrayLayer, ImageLayout layout)
+    private void EnsureLayoutAccessAllowedLocked(
+        VkImageLayoutTransaction transaction)
     {
-        _imageLayouts[CalculateSubresource(mipLevel, arrayLayer)] = layout;
+        if (transaction == null && _pendingLayoutTransactions.Count != 0)
+        {
+            throw new NeoVeldridException(
+                "An immediate Vulkan texture operation cannot overtake a recorded command list which uses the same texture.");
+        }
+    }
+
+    private void SetImageLayoutStateLocked(
+        uint subresource,
+        ImageLayout layout)
+    {
+        _imageLayouts[subresource] = layout;
+        _imageLayoutRevisions[subresource] =
+            unchecked(_imageLayoutRevisions[subresource] + 1u);
+    }
+
+    internal ImageAspectFlags ImageAspectMask
+    {
+        get
+        {
+            if ((Usage & TextureUsage.DepthStencil) == 0)
+                return ImageAspectFlags.ColorBit;
+
+            return FormatHelpers.IsStencilFormat(Format)
+                ? ImageAspectFlags.DepthBit | ImageAspectFlags.StencilBit
+                : ImageAspectFlags.DepthBit;
+        }
     }
 }

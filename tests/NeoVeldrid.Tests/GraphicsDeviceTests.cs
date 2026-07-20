@@ -10,6 +10,19 @@ public abstract class GraphicsDeviceTestBase_Debug<T> : GraphicsDeviceTestBase<T
         // Every test fixture creates its device with GraphicsDeviceOptions.Debug = true.
         Assert.True(GD.IsDebugRequested);
     }
+
+    [Fact]
+    public void RequiredValidationContract_IsProvedByActiveStatus()
+    {
+        GraphicsDeviceValidationRequirements.EnsureSatisfied(GD);
+        if (GraphicsDeviceValidationRequirements.IsApiValidationRequired)
+        {
+            Assert.True(GD.IsDebugActive, GD.Validation.Status.ToString());
+            Assert.True(
+                GD.Validation.Status.HasFeature(GraphicsDeviceValidationFeatures.ApiDebugOutput),
+                GD.Validation.Status.ToString());
+        }
+    }
 }
 
 #if TEST_VULKAN

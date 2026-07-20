@@ -10,9 +10,16 @@ internal class ResourceRefCount
 
     public ResourceRefCount(Action disposeAction)
     {
-        _disposeAction = disposeAction;
+        _disposeAction = disposeAction
+            ?? throw new ArgumentNullException(nameof(disposeAction));
         _refCount = 1;
     }
+
+    /// <summary>
+    /// Gets the currently-held native ownership count. This is an internal
+    /// lifecycle diagnostic; it does not itself acquire a reference.
+    /// </summary>
+    internal int CurrentCount => Volatile.Read(ref _refCount);
 
     public int Increment()
     {
@@ -31,7 +38,19 @@ internal class ResourceRefCount
         int ret = Interlocked.Decrement(ref _refCount);
         if (ret == 0)
         {
-            _disposeAction();
+            try
+            {
+                _disposeAction();
+            }
+            catch
+            {
+                // Disposal actions in the Vulkan backend retire ownership
+                // graphs incrementally and can report a cleanup failure. Keep
+                // the releasing reference alive so the remaining graph can be
+                // retried instead of stranding the counter at zero forever.
+                Interlocked.CompareExchange(ref _refCount, 1, 0);
+                throw;
+            }
         }
 
         return ret;

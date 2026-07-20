@@ -94,6 +94,44 @@ public sealed class VulkanCommandListSubmissionDiagnosticsFacadeTests
     }
 
     [Fact]
+    public void ValidationFailureAfterNativeSubmissionStillCommitsDiagnostics()
+    {
+        CommandList commandList = CreateCommandList();
+        DeviceBuffer target = RF.CreateBuffer(new BufferDescription(
+            32,
+            BufferUsage.Staging));
+        commandList.EnableSubmissionDiagnostics(initialBufferAccessCapacity: 2);
+
+        RecordUpdate(commandList, target, 0, new byte[4]);
+        GD.Validation.Report(
+            GraphicsDeviceValidationSeverity.Error,
+            "test",
+            "submission-boundary",
+            "committed-submission-sentinel",
+            "Synthetic validation failure after a committed native submission.");
+
+        GraphicsDeviceValidationException exception =
+            Assert.Throws<GraphicsDeviceValidationException>(
+                () => GD.SubmitCommands(commandList));
+        Assert.Contains(
+            exception.Messages,
+            message => message.Id == "committed-submission-sentinel");
+
+        Assert.True(commandList.TryGetLastSubmissionMetrics(out var committed));
+        Assert.Equal(1L, committed.SubmissionSequence);
+        Assert.Equal(4UL, committed.UpdatedBufferBytes);
+
+        // The native operation succeeded even though its validation boundary
+        // failed. Reuse must advance from the committed recording rather than
+        // treating it as a retryable pre-submission failure.
+        RecordUpdate(commandList, target, 8, new byte[8]);
+        GD.SubmitCommands(commandList);
+        Assert.True(commandList.TryGetLastSubmissionMetrics(out var reused));
+        Assert.Equal(2L, reused.SubmissionSequence);
+        Assert.Equal(8UL, reused.UpdatedBufferBytes);
+    }
+
+    [Fact]
     public void DisableAndReenableStartANewDiagnosticsLifetime()
     {
         CommandList commandList = CreateCommandList();

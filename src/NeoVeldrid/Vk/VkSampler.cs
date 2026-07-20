@@ -42,7 +42,14 @@ internal unsafe class VkSampler : Sampler
             BorderColor = VkFormats.VdToVkSamplerBorderColor(description.BorderColor)
         };
 
-        _gd.Vk.CreateSampler(_gd.Device, in samplerCI, null, out _sampler);
+        VkSamplerHandle createdSampler;
+        Result result = _gd.Vk.CreateSampler(
+            _gd.Device,
+            in samplerCI,
+            null,
+            out createdSampler);
+        VulkanUtil.CheckResult(result);
+        _sampler = createdSampler;
         RefCount = new ResourceRefCount(DisposeCore);
     }
 

@@ -72,7 +72,9 @@ public readonly record struct CommandListSubmissionMetrics(
     int SetGraphicsResourceSetCallCount = 0,
     int SetComputeResourceSetCallCount = 0,
     int SetViewportCallCount = 0,
-    int SetScissorRectCallCount = 0)
+    int SetScissorRectCallCount = 0,
+    int UpdateTextureCallCount = 0,
+    ulong UpdatedTextureBytes = 0UL)
 {
     public int TotalDrawCallCount =>
         DrawCallCount +
@@ -143,6 +145,8 @@ internal sealed class CommandListSubmissionDiagnostics
     private int _dispatchIndirectCallCount;
     private int _updateBufferCallCount;
     private ulong _updatedBufferBytes;
+    private int _updateTextureCallCount;
+    private ulong _updatedTextureBytes;
     private int _copyBufferCallCount;
     private ulong _copiedBufferBytes;
     private int _copyTextureCallCount;
@@ -261,7 +265,9 @@ internal sealed class CommandListSubmissionDiagnostics
             _setGraphicsResourceSetCallCount,
             _setComputeResourceSetCallCount,
             _setViewportCallCount,
-            _setScissorRectCallCount);
+            _setScissorRectCallCount,
+            _updateTextureCallCount,
+            _updatedTextureBytes);
 
         (_recordingBufferAccesses, _submittedBufferAccesses) =
             (_submittedBufferAccesses, _recordingBufferAccesses);
@@ -547,6 +553,36 @@ internal sealed class CommandListSubmissionDiagnostics
             sizeInBytes);
     }
 
+    internal void RecordUpdateTexture(
+        Texture texture,
+        uint sizeInBytes,
+        uint x,
+        uint y,
+        uint z,
+        uint width,
+        uint height,
+        uint depth,
+        uint mipLevel,
+        uint arrayLayer)
+    {
+        if (!_isRecording)
+            return;
+
+        BeginCommand(CommandKind.UpdateTexture);
+        _updateTextureCallCount++;
+        _updatedTextureBytes += sizeInBytes;
+        MixResource(texture);
+        Mix(sizeInBytes);
+        Mix(x);
+        Mix(y);
+        Mix(z);
+        Mix(width);
+        Mix(height);
+        Mix(depth);
+        Mix(mipLevel);
+        Mix(arrayLayer);
+    }
+
     internal void RecordCopyBuffer(
         DeviceBuffer source,
         uint sourceOffset,
@@ -647,6 +683,7 @@ internal sealed class CommandListSubmissionDiagnostics
 
     private static bool IsRenderCommand(CommandKind kind)
         => kind != CommandKind.UpdateBuffer &&
+           kind != CommandKind.UpdateTexture &&
            kind != CommandKind.CopyBuffer &&
            kind != CommandKind.CopyTexture &&
            kind != CommandKind.ResolveTexture &&
@@ -723,6 +760,8 @@ internal sealed class CommandListSubmissionDiagnostics
         _dispatchIndirectCallCount = 0;
         _updateBufferCallCount = 0;
         _updatedBufferBytes = 0UL;
+        _updateTextureCallCount = 0;
+        _updatedTextureBytes = 0UL;
         _copyBufferCallCount = 0;
         _copiedBufferBytes = 0UL;
         _copyTextureCallCount = 0;
@@ -815,6 +854,7 @@ internal sealed class CommandListSubmissionDiagnostics
         SetComputeResourceSet,
         SetViewport,
         SetScissorRect,
+        UpdateTexture,
     }
 }
 

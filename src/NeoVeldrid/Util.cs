@@ -161,45 +161,52 @@ internal static class Util
         return Math.Max(1, ret);
     }
 
-    internal static ulong ComputeSubresourceOffset(Texture tex, uint mipLevel, uint arrayLayer)
+    internal static void ClampCompressedCopyExtentToMipEdges(
+        Texture source,
+        uint srcX,
+        uint srcY,
+        uint srcMipLevel,
+        bool sourceIsImage,
+        Texture destination,
+        uint dstX,
+        uint dstY,
+        uint dstMipLevel,
+        bool destinationIsImage,
+        ref uint width,
+        ref uint height)
     {
-        Debug.Assert((tex.Usage & TextureUsage.Staging) == TextureUsage.Staging);
-        return ComputeArrayLayerOffset(tex, arrayLayer) + ComputeMipOffset(tex, mipLevel);
-    }
-
-    internal static uint ComputeMipOffset(Texture tex, uint mipLevel)
-    {
-        uint blockSize = FormatHelpers.IsCompressedFormat(tex.Format) ? 4u : 1u;
-        uint offset = 0;
-        for (uint level = 0; level < mipLevel; level++)
+        if (!FormatHelpers.IsCompressedFormat(source.Format)
+            && !FormatHelpers.IsCompressedFormat(destination.Format))
         {
-            GetMipDimensions(tex, level, out uint mipWidth, out uint mipHeight, out uint mipDepth);
-            uint storageWidth = Math.Max(mipWidth, blockSize);
-            uint storageHeight = Math.Max(mipHeight, blockSize);
-            offset += FormatHelpers.GetRegionSize(storageWidth, storageHeight, mipDepth, tex.Format);
+            return;
         }
 
-        return offset;
-    }
-
-    internal static uint ComputeArrayLayerOffset(Texture tex, uint arrayLayer)
-    {
-        if (arrayLayer == 0)
+        // The public copy contract permits a complete compression block at a
+        // sub-block-sized mip edge. Native image copy/upload extents must stop
+        // at the logical mip boundary; buffer-only sides retain block padding.
+        if (sourceIsImage)
         {
-            return 0;
+            GetMipDimensions(
+                source,
+                srcMipLevel,
+                out uint srcWidth,
+                out uint srcHeight,
+                out _);
+            width = Math.Min(width, checked(srcWidth - srcX));
+            height = Math.Min(height, checked(srcHeight - srcY));
         }
 
-        uint blockSize = FormatHelpers.IsCompressedFormat(tex.Format) ? 4u : 1u;
-        uint layerPitch = 0;
-        for (uint level = 0; level < tex.MipLevels; level++)
+        if (destinationIsImage)
         {
-            GetMipDimensions(tex, level, out uint mipWidth, out uint mipHeight, out uint mipDepth);
-            uint storageWidth = Math.Max(mipWidth, blockSize);
-            uint storageHeight = Math.Max(mipHeight, blockSize);
-            layerPitch += FormatHelpers.GetRegionSize(storageWidth, storageHeight, mipDepth, tex.Format);
+            GetMipDimensions(
+                destination,
+                dstMipLevel,
+                out uint dstWidth,
+                out uint dstHeight,
+                out _);
+            width = Math.Min(width, checked(dstWidth - dstX));
+            height = Math.Min(height, checked(dstHeight - dstY));
         }
-
-        return layerPitch * arrayLayer;
     }
 
     public static unsafe void CopyTextureRegion(
@@ -223,14 +230,26 @@ internal static class Util
         uint compressedDstX = dstX / blockSize;
         uint compressedDstY = dstY / blockSize;
         uint numRows = FormatHelpers.GetNumRows(height, format);
-        uint rowSize = width / blockSize * blockSizeInBytes;
+        uint rowSize = FormatHelpers.GetRowPitch(width, format);
 
-        if (srcRowPitch == dstRowPitch && srcDepthPitch == dstDepthPitch)
+        uint tightlyPackedDepthPitch = checked(rowSize * numRows);
+        bool copiesWholeDepthSlices =
+            srcX == 0u && srcY == 0u
+            && dstX == 0u && dstY == 0u
+            && srcRowPitch == rowSize
+            && dstRowPitch == rowSize
+            && srcDepthPitch == tightlyPackedDepthPitch
+            && dstDepthPitch == tightlyPackedDepthPitch;
+        if (copiesWholeDepthSlices)
         {
-            uint totalCopySize = depth * srcDepthPitch;
+            nuint totalCopySize = checked((nuint)depth * srcDepthPitch);
+            byte* sourceStart = (byte*)src + checked(
+                (nint)((nuint)srcZ * srcDepthPitch));
+            byte* destinationStart = (byte*)dst + checked(
+                (nint)((nuint)dstZ * dstDepthPitch));
             Buffer.MemoryCopy(
-                src,
-                dst,
+                sourceStart,
+                destinationStart,
                 totalCopySize,
                 totalCopySize);
         }

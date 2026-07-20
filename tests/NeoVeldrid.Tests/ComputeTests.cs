@@ -130,7 +130,7 @@ void main()
             texture.Format, TextureUsage.Staging,
             texture.Type, texture.SampleCount);
 
-        Texture staging = factory.CreateTexture(ref description);
+        using Texture staging = factory.CreateTexture(ref description);
 
         using CommandList cl = factory.CreateCommandList();
         cl.Begin();
@@ -186,7 +186,9 @@ void main()
     [SkippableFact]
     public void BasicCompute()
     {
-        Skip.IfNot(GD.Features.ComputeShader);
+        Skip.IfNot(
+            GD.Features.ComputeShader,
+            $"NV-SKIP-COMPUTE-SHADER: Compute shaders are unavailable on {GD.BackendType}.");
 
         ResourceLayout layout = RF.CreateResourceLayout(new ResourceLayoutDescription(
             new ResourceLayoutElementDescription("Params", ResourceKind.UniformBuffer, ShaderStages.Compute),
@@ -246,9 +248,13 @@ void main()
     [SkippableFact]
     public void ComputeCubemapGeneration()
     {
-        Skip.IfNot(GD.Features.ComputeShader);
+        Skip.IfNot(
+            GD.Features.ComputeShader,
+            $"NV-SKIP-COMPUTE-SHADER: Compute shaders are unavailable on {GD.BackendType}.");
 #if TEST_D3D11
-        Skip.If(GD.GetD3D11Info(out _), "D3D11 doesn't support Storage Cubemaps");
+        Skip.If(
+            GD.GetD3D11Info(out _),
+            "NV-SKIP-D3D11-STORAGE-CUBEMAP: D3D11 does not support storage cubemaps.");
 #endif
 
         const int TexSize = 32;
@@ -313,9 +319,13 @@ void main()
     [SkippableFact]
     public void ComputeCubemapBindSingleTextureMipLevelOutput()
     {
-        Skip.IfNot(GD.Features.ComputeShader);
+        Skip.IfNot(
+            GD.Features.ComputeShader,
+            $"NV-SKIP-COMPUTE-SHADER: Compute shaders are unavailable on {GD.BackendType}.");
 #if TEST_D3D11
-        Skip.If(GD.GetD3D11Info(out _), "D3D11 doesn't support Storage Cubemaps");
+        Skip.If(
+            GD.GetD3D11Info(out _),
+            "NV-SKIP-D3D11-STORAGE-CUBEMAP: D3D11 does not support storage cubemaps.");
 #endif
 
         const int TexSize = 128;
@@ -405,8 +415,13 @@ void main()
     [MemberData(nameof(FillBuffer_WithOffsetsData))]
     public void FillBuffer_WithOffsets(uint srcSetMultiple, uint srcBindingMultiple, uint dstSetMultiple, uint dstBindingMultiple, bool combinedLayout)
     {
-        Skip.IfNot(GD.Features.ComputeShader);
-        Skip.If(!GD.Features.BufferRangeBinding && (srcSetMultiple != 0 || srcBindingMultiple != 0 || dstSetMultiple != 0 || dstBindingMultiple != 0));
+        Skip.IfNot(
+            GD.Features.ComputeShader,
+            $"NV-SKIP-COMPUTE-SHADER: Compute shaders are unavailable on {GD.BackendType}.");
+        Skip.If(
+            !GD.Features.BufferRangeBinding
+                && (srcSetMultiple != 0 || srcBindingMultiple != 0 || dstSetMultiple != 0 || dstBindingMultiple != 0),
+            $"NV-SKIP-BUFFER-RANGE-BINDING: Buffer-range binding is unavailable on {GD.BackendType}.");
 
         Debug.Assert((GD.StructuredBufferMinOffsetAlignment % sizeof(uint)) == 0);
 
@@ -537,7 +552,9 @@ void main()
     [InlineData(BufferUsage.VertexBuffer)]
     public unsafe void FillBuffer_CombinedWithStructured(BufferUsage dstUsage)
     {
-        Skip.IfNot(GD.Features.ComputeShader);
+        Skip.IfNot(
+            GD.Features.ComputeShader,
+            $"NV-SKIP-COMPUTE-SHADER: Compute shaders are unavailable on {GD.BackendType}.");
 
         uint stride = (uint)sizeof(IndirectDrawIndexedArguments);
 

@@ -140,6 +140,17 @@ public abstract class ResourceFactory
     /// <returns>A new <see cref="Texture"/>.</returns>
     public Texture CreateTexture(ref TextureDescription description)
     {
+        if ((description.Usage & TextureUsage.Staging) != 0
+            && FormatHelpers.IsStencilFormat(description.Format))
+        {
+            // The public mapped staging layout has no way to describe the
+            // separate depth and stencil planes required by packed formats.
+            // Reject this backend-independent contract even when optional API
+            // usage validation is disabled.
+            throw new NeoVeldridException(
+                "NeoVeldrid staging textures do not define a packed depth-stencil plane layout. Use a depth-only format or an aspect-explicit transfer API.");
+        }
+
 #if VALIDATE_USAGE
         if (description.Width == 0 || description.Height == 0 || description.Depth == 0)
         {
@@ -170,6 +181,14 @@ public abstract class ResourceFactory
                 $"{nameof(TextureUsage)}.{nameof(TextureUsage.DepthStencil)} and {nameof(TextureUsage)}.{nameof(TextureUsage.GenerateMipmaps)} cannot be combined.");
         }
 #endif
+        if ((description.Usage & TextureUsage.Staging) != 0)
+        {
+            // Every backend exposes staging mappings and offsets through
+            // UInt32-sized public API fields. Reject an unaddressable layout
+            // before a backend can truncate it or issue a native allocation.
+            _ = TextureStagingLayout.Create(description);
+        }
+
         return CreateTextureCore(ref description);
     }
 

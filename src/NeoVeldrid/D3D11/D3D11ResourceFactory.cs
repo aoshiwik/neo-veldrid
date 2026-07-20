@@ -89,7 +89,7 @@ internal unsafe class D3D11ResourceFactory : ResourceFactory, IDisposable
 
     public override Fence CreateFence(bool signaled)
     {
-        return new D3D11Fence(signaled);
+        return new D3D11Fence(_gd, signaled);
     }
 
     public override Swapchain CreateSwapchain(ref SwapchainDescription description)
