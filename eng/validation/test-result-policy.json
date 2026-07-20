@@ -60,19 +60,10 @@
       "name": "Vulkan",
       "expectedDiscovered": {
         "algorithm": "sha256-trx-test-name-nul-v1",
-        "count": 594,
-        "sha256": "c1a2622e2c0750cab9a6e3578ea917fcc72471d40f9626afa1348f6e4a243c7e"
+        "count": 600,
+        "sha256": "022b062d167eba89fb1a835e9a68be84c6d62548b0e212e22f39ae290b8907ad"
       },
       "skipRules": [
-        {
-          "testMethod": "NeoVeldrid.Tests.VulkanRenderTests.UseBlendFactor",
-          "reasonCode": "NV-SKIP-KNOWN-VULKAN-BLEND-LAYOUT",
-          "classification": "known-defect",
-          "exitCondition": "Correct the Vulkan image-layout contract and pass with synchronization validation active.",
-          "expectedTestNames": [
-            "NeoVeldrid.Tests.VulkanRenderTests.UseBlendFactor"
-          ]
-        },
         {
           "testMethod": "NeoVeldrid.Tests.VulkanBufferTests.MapThenUpdate_Fails",
           "reasonCode": "NV-SKIP-VULKAN-MAPPED-UPDATE",

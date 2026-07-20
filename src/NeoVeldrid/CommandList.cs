@@ -1018,13 +1018,22 @@ public abstract class CommandList : DeviceResource, IDisposable
     /// <summary>
     /// Resolves a multisampled source <see cref="Texture"/> into a non-multisampled destination <see cref="Texture"/>.
     /// </summary>
-    /// <param name="source">The source of the resolve operation. Must be a multisampled <see cref="Texture"/>
-    /// (<see cref="Texture.SampleCount"/> > 1).</param>
-    /// <param name="destination">The destination of the resolve operation. Must be a non-multisampled <see cref="Texture"/>
-    /// (<see cref="Texture.SampleCount"/> == 1).</param>
+    /// <param name="source">The source of the resolve operation. Must be a multisampled color <see cref="Texture"/>
+    /// (<see cref="Texture.SampleCount"/> > 1) without <see cref="TextureUsage.DepthStencil"/>.</param>
+    /// <param name="destination">The destination of the resolve operation. Must be a non-multisampled color
+    /// <see cref="Texture"/> (<see cref="Texture.SampleCount"/> == 1) without
+    /// <see cref="TextureUsage.DepthStencil"/>.</param>
     public void ResolveTexture(Texture source, Texture destination)
     {
 #if VALIDATE_USAGE
+        if ((source.Usage & TextureUsage.DepthStencil) != 0 ||
+            (destination.Usage & TextureUsage.DepthStencil) != 0)
+        {
+            throw new NeoVeldridException(
+                $"The {nameof(ResolveTexture)} operation supports color " +
+                "textures only; depth-stencil resolve is not part of the " +
+                "portable command-list contract.");
+        }
         if (source.SampleCount == TextureSampleCount.Count1)
         {
             throw new NeoVeldridException(
@@ -1044,10 +1053,11 @@ public abstract class CommandList : DeviceResource, IDisposable
     /// <summary>
     /// Resolves a multisampled source <see cref="Texture"/> into a non-multisampled destination <see cref="Texture"/>.
     /// </summary>
-    /// <param name="source">The source of the resolve operation. Must be a multisampled <see cref="Texture"/>
-    /// (<see cref="Texture.SampleCount"/> > 1).</param>
-    /// <param name="destination">The destination of the resolve operation. Must be a non-multisampled <see cref="Texture"/>
-    /// (<see cref="Texture.SampleCount"/> == 1).</param>
+    /// <param name="source">The source of the resolve operation. Must be a multisampled color <see cref="Texture"/>
+    /// (<see cref="Texture.SampleCount"/> > 1) without <see cref="TextureUsage.DepthStencil"/>.</param>
+    /// <param name="destination">The destination of the resolve operation. Must be a non-multisampled color
+    /// <see cref="Texture"/> (<see cref="Texture.SampleCount"/> == 1) without
+    /// <see cref="TextureUsage.DepthStencil"/>.</param>
     protected abstract void ResolveTextureCore(Texture source, Texture destination);
 
     /// <summary>

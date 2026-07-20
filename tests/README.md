@@ -71,13 +71,17 @@ dotnet test tests/NeoVeldrid.Tests/NeoVeldrid.Tests.csproj -c Release -p:Exclude
 
 Some tests are skipped at runtime via `[SkippableFact]` + `Skip.If`/`Skip.IfNot`:
 
-- **UseBlendFactor on Vulkan** - triggers a Vulkan image layout validation error. Same error crashes upstream's process. Our fix to the debug callback turns it into a catchable exception instead.
-
 - **D3D11 cubemap storage tests** - D3D11 doesn't support storage cubemaps.
+
+- **Vulkan mapped-resource contract tests** - mapped update, mode, and binding
+  cases remain exact known or backend-specific exclusions.
 
 - **OpenGLES compute and buffer-range tests** - GLES on Windows desktop doesn't support compute shaders or buffer range binding. These are platform limitations, not bugs.
 
-Skip counts are driver-dependent. The categories above are expected; investigate skips with any other reason before treating a run as verified.
+Qualification skip identities and reason codes are exact in
+`eng/validation/test-result-policy.json`. A local device can expose additional
+capability skips, such as a missing Vulkan validation layer, but the result
+validator intentionally rejects those runs as qualification evidence.
 
 ### Vulkan allocation contracts
 

@@ -1640,12 +1640,9 @@ public abstract class RenderTests<T> : GraphicsDeviceTestBase<T> where T : Graph
         GD.Unmap(readback);
     }
 
-    [SkippableFact]
+    [Fact]
     public void UseBlendFactor()
     {
-        Skip.If(
-            GD.BackendType == GraphicsBackend.Vulkan,
-            "NV-SKIP-KNOWN-VULKAN-BLEND-LAYOUT: Vulkan image layout validation error.");
         const uint width = 512;
         const uint height = 512;
         using var output = RF.CreateTexture(

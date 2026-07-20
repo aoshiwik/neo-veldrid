@@ -2234,15 +2234,15 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
 
     public override TextureSampleCount GetSampleCountLimit(PixelFormat format, bool depthFormat)
     {
-        ImageUsageFlags usageFlags = ImageUsageFlags.SampledBit;
-        usageFlags |= depthFormat ? ImageUsageFlags.DepthStencilAttachmentBit : ImageUsageFlags.ColorAttachmentBit;
+        VkSampleCountQuery query =
+            VkSampleCountQuery.Create(format, depthFormat);
 
         _vk.GetPhysicalDeviceImageFormatProperties(
             _physicalDevice,
-            VkFormats.VdToVkPixelFormat(format),
+            query.Format,
             ImageType.Type2D,
             ImageTiling.Optimal,
-            usageFlags,
+            query.Usage,
             ImageCreateFlags.None,
             out ImageFormatProperties formatProperties);
 
