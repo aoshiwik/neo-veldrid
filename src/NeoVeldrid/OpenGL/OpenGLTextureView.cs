@@ -105,7 +105,7 @@ internal class OpenGLTextureView : TextureView, OpenGLDeferredResource
                 return SizedInternalFormat.R32f;
 
             case PixelFormat.R8_G8_UNorm:
-                return SizedInternalFormat.R8;
+                return SizedInternalFormat.RG8;
             case PixelFormat.R8_G8_SNorm:
                 return (SizedInternalFormat)InternalFormat.RG8SNorm;
             case PixelFormat.R8_G8_UInt:
@@ -114,7 +114,7 @@ internal class OpenGLTextureView : TextureView, OpenGLDeferredResource
                 return SizedInternalFormat.RG8i;
 
             case PixelFormat.R16_G16_UNorm:
-                return SizedInternalFormat.R16;
+                return SizedInternalFormat.RG16;
             case PixelFormat.R16_G16_SNorm:
                 return (SizedInternalFormat)InternalFormat.RG16SNorm;
             case PixelFormat.R16_G16_UInt:
@@ -139,7 +139,7 @@ internal class OpenGLTextureView : TextureView, OpenGLDeferredResource
             case PixelFormat.R8_G8_B8_A8_UInt:
                 return SizedInternalFormat.Rgba8ui;
             case PixelFormat.R8_G8_B8_A8_SInt:
-                return SizedInternalFormat.Rgba16i;
+                return SizedInternalFormat.Rgba8i;
 
             case PixelFormat.R16_G16_B16_A16_UNorm:
                 return SizedInternalFormat.Rgba16;

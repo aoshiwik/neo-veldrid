@@ -11,7 +11,7 @@ internal class OpenGLResourceFactory : ResourceFactory
     public override GraphicsBackend BackendType => _gd.BackendType;
 
     public unsafe OpenGLResourceFactory(OpenGLGraphicsDevice gd)
-        : base(gd.Features)
+        : base(gd)
     {
         _gd = gd;
         _pool = gd.StagingMemoryPool;
@@ -71,6 +71,20 @@ internal class OpenGLResourceFactory : ResourceFactory
     protected override Texture CreateTextureCore(ulong nativeTexture, ref TextureDescription description)
     {
         return new OpenGLTexture(_gd, (uint)nativeTexture, ref description);
+    }
+
+    protected override void ValidateNativeTextureImport(
+        ulong nativeTexture,
+        in TextureDescription description)
+    {
+        base.ValidateNativeTextureImport(nativeTexture, description);
+        if (nativeTexture > uint.MaxValue)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(nativeTexture),
+                nativeTexture,
+                "An OpenGL texture name must fit in UInt32.");
+        }
     }
 
     protected override TextureView CreateTextureViewCore(ref TextureViewDescription description)

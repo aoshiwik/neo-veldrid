@@ -1,0 +1,18 @@
+#version 450
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, r32ui) readonly uniform uimage2D InputTexture;
+layout(set = 0, binding = 1, std430) buffer OutputBuffer
+{
+    uvec4 Value;
+};
+
+void main()
+{
+    Value = uvec4(
+        imageLoad(InputTexture, ivec2(0, 0)).r,
+        imageLoad(InputTexture, ivec2(1, 0)).r,
+        imageLoad(InputTexture, ivec2(0, 1)).r,
+        imageLoad(InputTexture, ivec2(1, 1)).r);
+}

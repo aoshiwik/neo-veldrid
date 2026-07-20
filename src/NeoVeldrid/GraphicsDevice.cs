@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.ExceptionServices;
@@ -24,6 +25,10 @@ public abstract class GraphicsDevice : IDisposable
 
     private readonly object _deferredDisposalLock = new object();
     private readonly Queue<IDisposable> _disposables = new Queue<IDisposable>();
+    private readonly ReaderWriterLockSlim _textureOperationGate =
+        new ReaderWriterLockSlim(LockRecursionPolicy.SupportsRecursion);
+    private readonly ConcurrentDictionary<TextureCapabilityKey, TextureSupportResult>
+        _textureSupportCache = new();
     private DeferredDisposalQueueState _deferredDisposalState;
     private int _deferredDisposalDrainOwnerThreadId;
     private Sampler _aniso4xSampler;
@@ -1098,7 +1103,9 @@ public abstract class GraphicsDevice : IDisposable
 
     /// <summary>
     /// Gets whether or not the given <see cref="PixelFormat"/>, <see cref="TextureType"/>, and <see cref="TextureUsage"/>
-    /// combination is supported by this instance.
+    /// combination is supported by this instance. This compatibility query uses a minimal one-texel description; use
+    /// <see cref="GetTextureSupport(in TextureDescription)"/> when dimensions, mip levels, array layers, cubemap shape,
+    /// or sample count matter.
     /// </summary>
     /// <param name="format">The PixelFormat to query.</param>
     /// <param name="type">The TextureType to query.</param>
@@ -1109,12 +1116,14 @@ public abstract class GraphicsDevice : IDisposable
         TextureType type,
         TextureUsage usage)
     {
-        return GetPixelFormatSupportCore(format, type, usage, out _);
+        return GetPixelFormatSupport(format, type, usage, out _);
     }
 
     /// <summary>
     /// Gets whether or not the given <see cref="PixelFormat"/>, <see cref="TextureType"/>, and <see cref="TextureUsage"/>
     /// combination is supported by this instance, and also gets the device-specific properties supported by this instance.
+    /// This compatibility query uses a minimal one-texel description; use
+    /// <see cref="GetTextureSupport(in TextureDescription)"/> for a complete descriptor query.
     /// </summary>
     /// <param name="format">The PixelFormat to query.</param>
     /// <param name="type">The TextureType to query.</param>
@@ -1129,14 +1138,136 @@ public abstract class GraphicsDevice : IDisposable
         TextureUsage usage,
         out PixelFormatProperties properties)
     {
-        return GetPixelFormatSupportCore(format, type, usage, out properties);
+        TextureDescription description = new TextureDescription(
+            1,
+            1,
+            1,
+            1,
+            1,
+            format,
+            usage,
+            type,
+            TextureSampleCount.Count1);
+        TextureSupportResult result = GetTextureSupport(description);
+        properties = result.Properties;
+        return result.IsSupported;
     }
 
-    private protected abstract bool GetPixelFormatSupportCore(
-        PixelFormat format,
-        TextureType type,
-        TextureUsage usage,
-        out PixelFormatProperties properties);
+    /// <summary>
+    /// Queries support for every field of a texture description. Unsupported results explicitly identify whether the
+    /// boundary belongs to the description, NeoVeldrid, the selected backend, or the selected device.
+    /// </summary>
+    /// <param name="description">The complete texture description to query.</param>
+    /// <returns>The structured support result and, when supported, the applicable device limits.</returns>
+    public TextureSupportResult GetTextureSupport(in TextureDescription description)
+    {
+        using TextureOperationScope operation = AcquireTextureOperation();
+        return operation.GetSupport(description);
+    }
+
+    private TextureSupportResult GetTextureSupportUnderOperation(
+        in TextureDescription description)
+    {
+        TextureSupportResult descriptionResult = TextureDescriptionValidation.Query(description);
+        if (!descriptionResult.IsSupported)
+            return descriptionResult;
+
+        TextureCapabilityKey capabilityKey = new TextureCapabilityKey(description);
+        TextureSupportResult backendResult = _textureSupportCache.GetOrAdd(
+            capabilityKey,
+            static (key, device) => device.QueryTextureCapability(key),
+            this);
+        if (!backendResult.IsSupported)
+            return backendResult;
+
+        PixelFormatProperties properties = backendResult.Properties;
+        if (description.Width > properties.MaxWidth)
+            return DeviceLimit(TextureSupportReason.WidthLimit);
+        if (description.Height > properties.MaxHeight)
+            return DeviceLimit(TextureSupportReason.HeightLimit);
+        if (description.Depth > properties.MaxDepth)
+            return DeviceLimit(TextureSupportReason.DepthLimit);
+        if (description.MipLevels > properties.MaxMipLevels)
+            return DeviceLimit(TextureSupportReason.MipLevelLimit);
+        if (description.ArrayLayers > properties.MaxArrayLayers)
+            return DeviceLimit(TextureSupportReason.ArrayLayerLimit);
+        if (!properties.IsSampleCountSupported(description.SampleCount))
+            return DeviceLimit(TextureSupportReason.SampleCount);
+
+        return ValidateTextureSupportDescriptorCore(
+            description,
+            backendResult);
+    }
+
+    internal TextureOperationScope AcquireTextureOperation()
+    {
+        _textureOperationGate.EnterReadLock();
+        if (IsDisposed)
+        {
+            _textureOperationGate.ExitReadLock();
+            throw new ObjectDisposedException(nameof(GraphicsDevice));
+        }
+
+        return new TextureOperationScope(this);
+    }
+
+    private void ReleaseTextureOperation() =>
+        _textureOperationGate.ExitReadLock();
+
+    internal ref struct TextureOperationScope
+    {
+        private GraphicsDevice _device;
+
+        internal TextureOperationScope(GraphicsDevice device)
+        {
+            _device = device;
+        }
+
+        internal readonly TextureSupportResult GetSupport(
+            in TextureDescription description)
+        {
+            if (_device is null)
+            {
+                throw new ObjectDisposedException(
+                    nameof(TextureOperationScope));
+            }
+
+            return _device.GetTextureSupportUnderOperation(description);
+        }
+
+        public void Dispose()
+        {
+            GraphicsDevice device = _device;
+            _device = null;
+            device?.ReleaseTextureOperation();
+        }
+    }
+
+    private TextureSupportResult QueryTextureCapability(
+        TextureCapabilityKey capabilityKey)
+    {
+        TextureDescription canonicalDescription =
+            capabilityKey.CreateCanonicalDescription();
+        return GetTextureSupportCore(canonicalDescription);
+    }
+
+    private static TextureSupportResult DeviceLimit(TextureSupportReason reason) =>
+        TextureSupportResult.Unsupported(
+            TextureSupportClassification.DeviceCapability,
+            reason);
+
+    private protected abstract TextureSupportResult GetTextureSupportCore(
+        in TextureDescription description);
+
+    /// <summary>
+    /// Applies backend-specific checks which depend on the complete texture description. This runs after the
+    /// dimension-independent capability result has been read from the cache and after its scalar limits have been
+    /// checked, so exact extents and counts do not need to become part of the capability-cache key.
+    /// </summary>
+    private protected virtual TextureSupportResult ValidateTextureSupportDescriptorCore(
+        in TextureDescription description,
+        in TextureSupportResult capabilityResult) =>
+        capabilityResult;
 
     /// <summary>
     /// Adds the given object to a deferred disposal list, which will be processed when this GraphicsDevice becomes idle.
@@ -1432,6 +1563,40 @@ public abstract class GraphicsDevice : IDisposable
     }
 
     private void DisposeCore()
+    {
+        if (_textureOperationGate.IsReadLockHeld
+            && !_textureOperationGate.IsWriteLockHeld)
+        {
+            throw new InvalidOperationException(
+                "A graphics device cannot be disposed reentrantly from an active texture capability or creation operation.");
+        }
+
+        // Reject a deferred-disposal callback before waiting for the texture
+        // writer gate. A concurrent teardown can own that gate while waiting
+        // for this callback's drain to finish; deferring this check until after
+        // gate admission would make the two transactions wait on each other.
+        int currentThreadId = Environment.CurrentManagedThreadId;
+        lock (_deferredDisposalLock)
+        {
+            if (_deferredDisposalDrainOwnerThreadId == currentThreadId)
+            {
+                throw new InvalidOperationException(
+                    "A graphics device cannot be disposed reentrantly from a deferred resource disposal.");
+            }
+        }
+
+        _textureOperationGate.EnterWriteLock();
+        try
+        {
+            DisposeCoreUnderTextureOperationGate();
+        }
+        finally
+        {
+            _textureOperationGate.ExitWriteLock();
+        }
+    }
+
+    private void DisposeCoreUnderTextureOperationGate()
     {
         int currentThreadId = Environment.CurrentManagedThreadId;
         ExceptionDispatchInfo concurrentFailure = null;

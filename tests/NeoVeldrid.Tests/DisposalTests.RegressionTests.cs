@@ -19,10 +19,10 @@ public abstract class DeviceDisposalRegressionTests<T> where T : GraphicsDeviceC
     // GraphicsDevice.Dispose() used to re-run PlatformDispose() on every call. On the OpenGL
     // backend the second call posted a FlushAndFinish work item to the execution thread, but
     // that thread had already terminated during the first dispose, so the post blocked forever.
-    // IDisposable requires Dispose to be safe to call more than once; this verifies the second
-    // call returns promptly instead of deadlocking. The timeout turns a regression into a test
-    // failure rather than a hung run. It also checks IsDisposed tracks the lifecycle: false
-    // while the device is live, true once disposed.
+    // IDisposable requires Dispose to be safe to call more than once. Texture capability queries
+    // and creation also share a lifecycle gate with device teardown: an admitted operation must
+    // finish before native teardown starts, while new operations after teardown are rejected.
+    // The timeout turns a regression into a test failure rather than a hung run.
     [Fact(Timeout = 10000)]
     public Task Dispose_Twice_DoesNotHang()
     {
@@ -32,11 +32,55 @@ public abstract class DeviceDisposalRegressionTests<T> where T : GraphicsDeviceC
         return Task.Run(() =>
         {
             Activator.CreateInstance<T>().CreateGraphicsDevice(out Sdl2Window window, out GraphicsDevice gd);
-            Assert.False(gd.IsDisposed);
-            gd.Dispose();
-            gd.Dispose();
-            Assert.True(gd.IsDisposed);
-            window?.Close();
+            try
+            {
+                Assert.False(gd.IsDisposed);
+                TextureDescription description = TextureDescription.Texture2D(
+                    1,
+                    1,
+                    1,
+                    1,
+                    PixelFormat.R8_UNorm,
+                    TextureUsage.Sampled);
+
+                GraphicsDevice.TextureOperationScope operation =
+                    gd.AcquireTextureOperation();
+                Task disposing;
+                using ManualResetEventSlim disposeInvoked =
+                    new ManualResetEventSlim();
+                try
+                {
+                    disposing = Task.Run(() =>
+                    {
+                        disposeInvoked.Set();
+                        gd.Dispose();
+                    });
+                    Assert.True(disposeInvoked.Wait(5000));
+                    Assert.False(disposing.Wait(100));
+                    Assert.False(gd.IsDisposed);
+                    Assert.True(operation.GetSupport(description).IsSupported);
+                }
+                finally
+                {
+                    operation.Dispose();
+                }
+
+                Assert.True(disposing.Wait(5000));
+                disposing.GetAwaiter().GetResult();
+                Assert.True(gd.IsDisposed);
+                Assert.Throws<ObjectDisposedException>(
+                    () => gd.GetTextureSupport(description));
+                Assert.Throws<ObjectDisposedException>(
+                    () => gd.ResourceFactory.CreateTexture(description));
+
+                gd.Dispose();
+                Assert.True(gd.IsDisposed);
+            }
+            finally
+            {
+                gd.Dispose();
+                window?.Close();
+            }
         });
     }
 

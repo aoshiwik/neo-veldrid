@@ -14,8 +14,8 @@
       "name": "NonGPU",
       "expectedDiscovered": {
         "algorithm": "sha256-trx-test-name-nul-v1",
-        "count": 144,
-        "sha256": "0107f1bfa76ffa1afe6c71f1a56e15892cc195c7a27868f1f29b304bd2a43888"
+        "count": 147,
+        "sha256": "269d5c6b38e2382be0b1a723186a1432d42eb4faf61b08b32b93c814e9658795"
       },
       "skipRules": []
     },
@@ -23,8 +23,8 @@
       "name": "D3D11",
       "expectedDiscovered": {
         "algorithm": "sha256-trx-test-name-nul-v1",
-        "count": 497,
-        "sha256": "6b0db8ca3dc59f09cf2a0e722b121b0a7bdfbd172a69e998063ca5c1361987d4"
+        "count": 509,
+        "sha256": "de09610b6ce71d3f9af6848e690bddc8e02aa8b192d10a3574590a18b4424731"
       },
       "skipRules": [
         {
@@ -60,8 +60,8 @@
       "name": "Vulkan",
       "expectedDiscovered": {
         "algorithm": "sha256-trx-test-name-nul-v1",
-        "count": 600,
-        "sha256": "022b062d167eba89fb1a835e9a68be84c6d62548b0e212e22f39ae290b8907ad"
+        "count": 612,
+        "sha256": "3aeda585254d78209f488e50c3c975124e07c9a7707cb2df9086d4dd89eecf94"
       },
       "skipRules": [
         {
@@ -97,8 +97,8 @@
       "name": "OpenGL",
       "expectedDiscovered": {
         "algorithm": "sha256-trx-test-name-nul-v1",
-        "count": 500,
-        "sha256": "9289146fd6c84808ed383142e82b5feba4a467ee6b535fc87db9e6c3507f603a"
+        "count": 512,
+        "sha256": "aec13cf9edc150a58df4d0eb8ba5aec91fa609a6185bc516b6d6c35cf7fea875"
       },
       "skipRules": []
     },
@@ -106,8 +106,8 @@
       "name": "OpenGLES",
       "expectedDiscovered": {
         "algorithm": "sha256-trx-test-name-nul-v1",
-        "count": 499,
-        "sha256": "48b8d719c5a0f0f5b4915073ac190a4f2d2fc5be79c2f76e45c50c7361f981ac"
+        "count": 512,
+        "sha256": "94aab90892ba7bd8af99b9e54955154c74110a211847b408b5b04944ef936e4b"
       },
       "skipRules": [
         {
@@ -124,8 +124,8 @@
         {
           "testMethod": "NeoVeldrid.Tests.OpenGLESTextureTests.Copy_Compressed_Texture",
           "reasonCode": "NV-SKIP-COMPRESSED-STAGING",
-          "classification": "device-capability",
-          "exitCondition": "Qualify a GLES implementation with compressed staging readback or add a supported readback path.",
+          "classification": "backend-contract",
+          "exitCondition": "Implement a GLES compressed staging read/write contract or a supported raw-block readback path.",
           "expectedFingerprint": {
             "algorithm": "sha256-trx-test-name-reason-nul-v1",
             "count": 28,
@@ -135,8 +135,8 @@
         {
           "testMethod": "NeoVeldrid.Tests.OpenGLESTextureTests.CommandListCompressedEdgeMipUploadRetainsPayload",
           "reasonCode": "NV-SKIP-COMPRESSED-STAGING",
-          "classification": "device-capability",
-          "exitCondition": "Add a GLES-native positive oracle for compressed edge-mip uploads.",
+          "classification": "backend-contract",
+          "exitCondition": "Implement the GLES compressed staging read/write contract used for exact BC block capture.",
           "expectedTestNames": [
             "NeoVeldrid.Tests.OpenGLESTextureTests.CommandListCompressedEdgeMipUploadRetainsPayload"
           ]
@@ -144,8 +144,8 @@
         {
           "testMethod": "NeoVeldrid.Tests.OpenGLESTextureTests.CommandListCompressedOffsetEdgeUploadRetainsPayload",
           "reasonCode": "NV-SKIP-COMPRESSED-STAGING",
-          "classification": "device-capability",
-          "exitCondition": "Add a GLES-native positive oracle for compressed offset-edge uploads.",
+          "classification": "backend-contract",
+          "exitCondition": "Implement the GLES compressed staging read/write contract used for exact BC block capture.",
           "expectedTestNames": [
             "NeoVeldrid.Tests.OpenGLESTextureTests.CommandListCompressedOffsetEdgeUploadRetainsPayload"
           ]
@@ -153,8 +153,8 @@
         {
           "testMethod": "NeoVeldrid.Tests.OpenGLESTextureTests.Copy_Compressed_StagingDirectionsHaveIndependentOracles",
           "reasonCode": "NV-SKIP-COMPRESSED-STAGING",
-          "classification": "device-capability",
-          "exitCondition": "Qualify compressed staging transfers in both directions on the OpenGL ES backend.",
+          "classification": "backend-contract",
+          "exitCondition": "Implement compressed staging transfers in both directions on the OpenGL ES backend.",
           "expectedTestNames": [
             "NeoVeldrid.Tests.OpenGLESTextureTests.Copy_Compressed_StagingDirectionsHaveIndependentOracles(format: BC1_Rgba_UNorm, blockSizeInBytes: 8)",
             "NeoVeldrid.Tests.OpenGLESTextureTests.Copy_Compressed_StagingDirectionsHaveIndependentOracles(format: BC3_UNorm, blockSizeInBytes: 16)"
@@ -163,8 +163,8 @@
         {
           "testMethod": "NeoVeldrid.Tests.OpenGLESTextureTests.CopyTexture_SmallCompressed_ToStaging",
           "reasonCode": "NV-SKIP-COMPRESSED-STAGING",
-          "classification": "device-capability",
-          "exitCondition": "Qualify compressed staging readback on the OpenGL ES backend.",
+          "classification": "backend-contract",
+          "exitCondition": "Implement compressed staging readback on the OpenGL ES backend.",
           "expectedTestNames": [
             "NeoVeldrid.Tests.OpenGLESTextureTests.CopyTexture_SmallCompressed_ToStaging"
           ]
@@ -227,12 +227,41 @@
         {
           "testMethod": "NeoVeldrid.Tests.OpenGLESTextureTests.FormatCoverage_CopyThenRead",
           "reasonCode": "NV-SKIP-STAGING-FORMAT",
-          "classification": "device-capability",
-          "exitCondition": "Qualify staging support for every format in the coverage matrix or add a supported readback path.",
+          "classification": "backend-contract",
+          "exitCondition": "Implement the excluded GLES B8 and packed R10 staging/readback format mappings.",
           "expectedTestNames": [
             "NeoVeldrid.Tests.OpenGLESTextureTests.FormatCoverage_CopyThenRead(format: B8_G8_R8_A8_UNorm, rBits: 8, gBits: 8, bBits: 8, aBits: 8, srcType: Texture2D, srcWidth: 64, srcHeight: 64, srcDepth: 1, srcMipLevels: 1, srcArrayLayers: 1, dstType: Texture2D, dstWidth: 64, dstHeight: 64, dstDepth: 1, dstMipLevels: 1, dstArrayLayers: 1, copyWidth: 64, copyHeight: 64, copyDepth: 1, srcX: 0, srcY: 0, srcZ: 0, srcMipLevel: 0, srcArrayLayer: 0, dstX: 0, dstY: 0, dstZ: 0, dstMipLevel: 0, dstArrayLayer: 0)",
             "NeoVeldrid.Tests.OpenGLESTextureTests.FormatCoverage_CopyThenRead(format: R10_G10_B10_A2_UInt, rBits: 10, gBits: 10, bBits: 10, aBits: 2, srcType: Texture2D, srcWidth: 64, srcHeight: 64, srcDepth: 1, srcMipLevels: 1, srcArrayLayers: 1, dstType: Texture2D, dstWidth: 64, dstHeight: 64, dstDepth: 1, dstMipLevels: 1, dstArrayLayers: 1, copyWidth: 64, copyHeight: 64, copyDepth: 1, srcX: 0, srcY: 0, srcZ: 0, srcMipLevel: 0, srcArrayLayer: 0, dstX: 0, dstY: 0, dstZ: 0, dstMipLevel: 0, dstArrayLayer: 0)",
             "NeoVeldrid.Tests.OpenGLESTextureTests.FormatCoverage_CopyThenRead(format: R10_G10_B10_A2_UNorm, rBits: 10, gBits: 10, bBits: 10, aBits: 2, srcType: Texture2D, srcWidth: 64, srcHeight: 64, srcDepth: 1, srcMipLevels: 1, srcArrayLayers: 1, dstType: Texture2D, dstWidth: 64, dstHeight: 64, dstDepth: 1, dstMipLevels: 1, dstArrayLayers: 1, copyWidth: 64, copyHeight: 64, copyDepth: 1, srcX: 0, srcY: 0, srcZ: 0, srcMipLevel: 0, srcArrayLayer: 0, dstX: 0, dstY: 0, dstZ: 0, dstMipLevel: 0, dstArrayLayer: 0)"
+          ]
+        },
+        {
+          "testMethod": "NeoVeldrid.Tests.OpenGLESTextureTests.CommandListOrderedTextureUploadShapeMatrixHasExactContents",
+          "reasonCode": "NV-SKIP-ORDERED-UPLOAD-MATRIX",
+          "classification": "backend-contract",
+          "exitCondition": "Implement a supported one-dimensional texture model in the OpenGL ES backend.",
+          "expectedTestNames": [
+            "NeoVeldrid.Tests.OpenGLESTextureTests.CommandListOrderedTextureUploadShapeMatrixHasExactContents(scenarioIdentity: \"shape=1d-array;format=R8_G8_B8_A8_UNorm;texel=4;mi\"\u00B7\u00B7\u00B7)",
+            "NeoVeldrid.Tests.OpenGLESTextureTests.CommandListOrderedTextureUploadShapeMatrixHasExactContents(scenarioIdentity: \"shape=1d;format=R16_UNorm;texel=2;mip=1;layer=0;re\"\u00B7\u00B7\u00B7)"
+          ]
+        },
+        {
+          "testMethod": "NeoVeldrid.Tests.OpenGLESTextureTests.CommandListOrderedCompressedUploadMatrixHasExactBlocks",
+          "reasonCode": "NV-SKIP-ORDERED-UPLOAD-MATRIX",
+          "classification": "backend-contract",
+          "exitCondition": "Implement the GLES compressed staging read/write contract used for exact BC block capture.",
+          "expectedTestNames": [
+            "NeoVeldrid.Tests.OpenGLESTextureTests.CommandListOrderedCompressedUploadMatrixHasExactBlocks(scenarioIdentity: \"shape=2d;format=BC1_Rgba_UNorm;block=8;mip=0;layer\"\u00B7\u00B7\u00B7)",
+            "NeoVeldrid.Tests.OpenGLESTextureTests.CommandListOrderedCompressedUploadMatrixHasExactBlocks(scenarioIdentity: \"shape=2d;format=BC3_UNorm;block=16;mip=1;layer=0;r\"\u00B7\u00B7\u00B7)"
+          ]
+        },
+        {
+          "testMethod": "NeoVeldrid.Tests.OpenGLESTextureTests.CommandListMixedSizeTextureUploadsPreserveAdjacentAllocations",
+          "reasonCode": "NV-SKIP-ORDERED-UPLOAD-MATRIX",
+          "classification": "backend-contract",
+          "exitCondition": "Implement the GLES compressed staging read/write contract used for exact mixed-upload capture.",
+          "expectedTestNames": [
+            "NeoVeldrid.Tests.OpenGLESTextureTests.CommandListMixedSizeTextureUploadsPreserveAdjacentAllocations"
           ]
         }
       ]

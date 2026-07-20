@@ -59,6 +59,12 @@ internal class OpenGLExtensions : IReadOnlyCollection<string>
         ARB_ClipControl = GLVersion(4, 5) || IsExtensionSupported("GL_ARB_clip_control");
         EXT_sRGBWriteControl = _backend == GraphicsBackend.OpenGLES && IsExtensionSupported("GL_EXT_sRGB_write_control");
         EXT_DebugMarker = _backend == GraphicsBackend.OpenGLES && IsExtensionSupported("GL_EXT_debug_marker");
+        EXT_ColorBufferFloat = _backend == GraphicsBackend.OpenGLES
+            && IsExtensionSupported("GL_EXT_color_buffer_float");
+        EXT_ColorBufferHalfFloat = _backend == GraphicsBackend.OpenGLES
+            && IsExtensionSupported("GL_EXT_color_buffer_half_float");
+        EXT_RenderSNorm = _backend == GraphicsBackend.OpenGLES && IsExtensionSupported("GL_EXT_render_snorm");
+        EXT_TextureNorm16 = _backend == GraphicsBackend.OpenGLES && IsExtensionSupported("GL_EXT_texture_norm16");
 
         ARB_GpuShaderFp64 = GLVersion(4, 0) || IsExtensionSupported("GL_ARB_gpu_shader_fp64");
 
@@ -77,6 +83,10 @@ internal class OpenGLExtensions : IReadOnlyCollection<string>
     public readonly bool ARB_ClipControl;
     public readonly bool EXT_sRGBWriteControl;
     public readonly bool EXT_DebugMarker;
+    public readonly bool EXT_ColorBufferFloat;
+    public readonly bool EXT_ColorBufferHalfFloat;
+    public readonly bool EXT_RenderSNorm;
+    public readonly bool EXT_TextureNorm16;
     public readonly bool ARB_GpuShaderFp64;
     public readonly bool ARB_uniform_buffer_object;
 

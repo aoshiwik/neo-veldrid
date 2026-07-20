@@ -11,7 +11,7 @@ public class DisposeCollectorResourceFactory : ResourceFactory
     }
 
     public DisposeCollectorResourceFactory(ResourceFactory factory, DisposeCollector disposeCollector)
-        : base(factory.Features)
+        : base(factory.GraphicsDevice)
     {
         Factory = factory;
         DisposeCollector = disposeCollector;
@@ -88,6 +88,15 @@ public class DisposeCollectorResourceFactory : ResourceFactory
         DisposeCollector.Add(tex);
         return tex;
     }
+
+    protected override bool SupportsNativeTextureImport(
+        in TextureDescription description) =>
+        GetNativeTextureImportSupport(Factory, description);
+
+    protected override void ValidateNativeTextureImport(
+        ulong nativeTexture,
+        in TextureDescription description) =>
+        ValidateNativeTextureImport(Factory, nativeTexture, description);
 
     protected override TextureView CreateTextureViewCore(ref TextureViewDescription description)
     {

@@ -8,11 +8,17 @@ namespace NeoVeldrid;
 public abstract class ResourceFactory
 {
     /// <summary></summary>
-    /// <param name="features"></param>
-    protected ResourceFactory(GraphicsDeviceFeatures features)
+    /// <param name="graphicsDevice">The device which owns the resources created by this factory.</param>
+    protected ResourceFactory(GraphicsDevice graphicsDevice)
     {
-        Features = features;
+        ArgumentNullException.ThrowIfNull(graphicsDevice);
+        GraphicsDevice = graphicsDevice;
     }
+
+    /// <summary>
+    /// Gets the <see cref="GraphicsDevice"/> whose capability contract governs this factory.
+    /// </summary>
+    public GraphicsDevice GraphicsDevice { get; }
 
     /// <summary>
     /// Gets the <see cref="GraphicsBackend"/> of this instance.
@@ -22,7 +28,7 @@ public abstract class ResourceFactory
     /// <summary>
     /// Gets the <see cref="GraphicsDeviceFeatures"/> this instance was created with.
     /// </summary>
-    public GraphicsDeviceFeatures Features { get; }
+    public GraphicsDeviceFeatures Features => GraphicsDevice.Features;
 
     /// <summary>
     /// Creates a new <see cref="Pipeline"/>.
@@ -140,55 +146,9 @@ public abstract class ResourceFactory
     /// <returns>A new <see cref="Texture"/>.</returns>
     public Texture CreateTexture(ref TextureDescription description)
     {
-        if ((description.Usage & TextureUsage.Staging) != 0
-            && FormatHelpers.IsStencilFormat(description.Format))
-        {
-            // The public mapped staging layout has no way to describe the
-            // separate depth and stencil planes required by packed formats.
-            // Reject this backend-independent contract even when optional API
-            // usage validation is disabled.
-            throw new NeoVeldridException(
-                "NeoVeldrid staging textures do not define a packed depth-stencil plane layout. Use a depth-only format or an aspect-explicit transfer API.");
-        }
-
-#if VALIDATE_USAGE
-        if (description.Width == 0 || description.Height == 0 || description.Depth == 0)
-        {
-            throw new NeoVeldridException("Width, Height, and Depth must be non-zero.");
-        }
-        if ((description.Format == PixelFormat.D24_UNorm_S8_UInt || description.Format == PixelFormat.D32_Float_S8_UInt)
-            && (description.Usage & TextureUsage.DepthStencil) == 0)
-        {
-            throw new NeoVeldridException("The given PixelFormat can only be used in a Texture with DepthStencil usage.");
-        }
-        if ((description.Type == TextureType.Texture1D || description.Type == TextureType.Texture3D)
-            && description.SampleCount != TextureSampleCount.Count1)
-        {
-            throw new NeoVeldridException(
-                $"1D and 3D Textures must use {nameof(TextureSampleCount)}.{nameof(TextureSampleCount.Count1)}.");
-        }
-        if (description.Type == TextureType.Texture1D && !Features.Texture1D)
-        {
-            throw new NeoVeldridException($"1D Textures are not supported by this device.");
-        }
-        if ((description.Usage & TextureUsage.Staging) != 0 && description.Usage != TextureUsage.Staging)
-        {
-            throw new NeoVeldridException($"{nameof(TextureUsage)}.{nameof(TextureUsage.Staging)} cannot be combined with any other flags.");
-        }
-        if ((description.Usage & TextureUsage.DepthStencil) != 0 && (description.Usage & TextureUsage.GenerateMipmaps) != 0)
-        {
-            throw new NeoVeldridException(
-                $"{nameof(TextureUsage)}.{nameof(TextureUsage.DepthStencil)} and {nameof(TextureUsage)}.{nameof(TextureUsage.GenerateMipmaps)} cannot be combined.");
-        }
-#endif
-        if ((description.Usage & TextureUsage.Staging) != 0)
-        {
-            // Every backend exposes staging mappings and offsets through
-            // UInt32-sized public API fields. Reject an unaddressable layout
-            // before a backend can truncate it or issue a native allocation.
-            _ = TextureStagingLayout.Create(description);
-        }
-
+        using GraphicsDevice.TextureOperationScope operation =
+            GraphicsDevice.AcquireTextureOperation();
+        ValidateTextureSupport(description, operation.GetSupport(description));
         return CreateTextureCore(ref description);
     }
 
@@ -201,15 +161,33 @@ public abstract class ResourceFactory
     /// <remarks>
     /// The nativeTexture parameter is backend-specific, and the type of data passed in depends on which graphics API is
     /// being used.
-    /// When using the Vulkan backend, nativeTexture must be a valid VkImage handle.
-    /// When using the D3D11 backend, nativeTexture must be a valid pointer to an ID3D11Texture1D, ID3D11Texture2D, or
-    /// ID3D11Texture3D.
+    /// The Vulkan backend rejects this legacy overload because a VkImage handle alone cannot declare ownership, initial
+    /// layout, queue-family, creation flags, and subresource metadata.
+    /// When using the D3D11 backend, nativeTexture must be a valid pointer to an ID3D11Texture2D whose native descriptor
+    /// exactly matches the descriptor NeoVeldrid creates for the supplied description. Typed resources and resources with
+    /// additional bind or miscellaneous flags are intentionally rejected because this overload cannot faithfully expose
+    /// their additional metadata.
     /// When using the OpenGL backend, nativeTexture must be a valid OpenGL texture name.
     /// The properties of the Texture will be determined from the <see cref="TextureDescription"/> passed in. These
-    /// properties must match the true properties of the existing native texture.
+    /// properties must match the true properties of the existing native texture. The description must also represent a
+    /// texture which this factory's <see cref="GraphicsDevice"/> could create and consume itself. This overload is not a
+    /// general native-resource import contract for images requiring backend-specific ownership, layout, or creation metadata.
     /// </remarks>
-    public Texture CreateTexture(ulong nativeTexture, TextureDescription description)
-        => CreateTextureCore(nativeTexture, ref description);
+    public Texture CreateTexture(ulong nativeTexture, TextureDescription description) =>
+        CreateTexture(nativeTexture, ref description);
+
+    private void ValidateTextureSupport(
+        in TextureDescription description,
+        TextureSupportResult result)
+    {
+        if (!result.IsSupported)
+        {
+            throw new TextureNotSupportedException(
+                GraphicsDevice.BackendType,
+                description,
+                result);
+        }
+    }
 
     /// <summary>
     /// Creates a new <see cref="Texture"/> from an existing native texture.
@@ -220,15 +198,89 @@ public abstract class ResourceFactory
     /// <remarks>
     /// The nativeTexture parameter is backend-specific, and the type of data passed in depends on which graphics API is
     /// being used.
-    /// When using the Vulkan backend, nativeTexture must be a valid VkImage handle.
-    /// When using the D3D11 backend, nativeTexture must be a valid pointer to an ID3D11Texture1D, ID3D11Texture2D, or
-    /// ID3D11Texture3D.
+    /// The Vulkan backend rejects this legacy overload because a VkImage handle alone cannot declare ownership, initial
+    /// layout, queue-family, creation flags, and subresource metadata.
+    /// When using the D3D11 backend, nativeTexture must be a valid pointer to an ID3D11Texture2D whose native descriptor
+    /// exactly matches the descriptor NeoVeldrid creates for the supplied description. Typed resources and resources with
+    /// additional bind or miscellaneous flags are intentionally rejected because this overload cannot faithfully expose
+    /// their additional metadata.
     /// When using the OpenGL backend, nativeTexture must be a valid OpenGL texture name.
     /// The properties of the Texture will be determined from the <see cref="TextureDescription"/> passed in. These
-    /// properties must match the true properties of the existing native texture.
+    /// properties must match the true properties of the existing native texture. The description must also represent a
+    /// texture which this factory's <see cref="GraphicsDevice"/> could create and consume itself. This overload is not a
+    /// general native-resource import contract for images requiring backend-specific ownership, layout, or creation metadata.
     /// </remarks>
     public Texture CreateTexture(ulong nativeTexture, ref TextureDescription description)
-        => CreateTextureCore(nativeTexture, ref description);
+    {
+        using GraphicsDevice.TextureOperationScope operation =
+            GraphicsDevice.AcquireTextureOperation();
+        ValidateTextureSupport(description, operation.GetSupport(description));
+        if (!SupportsNativeTextureImport(description))
+        {
+            throw new TextureNotSupportedException(
+                GraphicsDevice.BackendType,
+                description,
+                TextureSupportResult.Unsupported(
+                    TextureSupportClassification.BackendContract,
+                    TextureSupportReason.NativeTextureImport));
+        }
+
+        ValidateNativeTextureImport(nativeTexture, description);
+        return CreateTextureCore(nativeTexture, ref description);
+    }
+
+    /// <summary>
+    /// Gets whether this backend's native-texture wrapper can faithfully represent the complete validated description.
+    /// Ordinary texture support does not imply that a backend can import the ownership and metadata of an arbitrary
+    /// externally-created image.
+    /// </summary>
+    /// <param name="description">The otherwise-supported texture description proposed for native import.</param>
+    /// <returns>True when the backend's native wrapper implements the description; otherwise false.</returns>
+    protected virtual bool SupportsNativeTextureImport(
+        in TextureDescription description) => true;
+
+    /// <summary>
+    /// Forwards the native-import shape contract through a factory decorator.
+    /// </summary>
+    protected static bool GetNativeTextureImportSupport(
+        ResourceFactory factory,
+        in TextureDescription description)
+    {
+        ArgumentNullException.ThrowIfNull(factory);
+        return factory.SupportsNativeTextureImport(description);
+    }
+
+    /// <summary>
+    /// Validates the backend-specific handle and its relationship to an otherwise-supported texture description.
+    /// Backends should reject handles which cannot be faithfully represented by the public <see cref="Texture"/>
+    /// contract instead of deferring the failure to native resource use.
+    /// </summary>
+    /// <param name="nativeTexture">The backend-specific native texture handle.</param>
+    /// <param name="description">The validated description proposed for the imported texture.</param>
+    protected virtual void ValidateNativeTextureImport(
+        ulong nativeTexture,
+        in TextureDescription description)
+    {
+        if (nativeTexture == 0)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(nativeTexture),
+                nativeTexture,
+                "A native texture handle must be non-zero.");
+        }
+    }
+
+    /// <summary>
+    /// Forwards backend-specific native-handle validation through a factory decorator.
+    /// </summary>
+    protected static void ValidateNativeTextureImport(
+        ResourceFactory factory,
+        ulong nativeTexture,
+        in TextureDescription description)
+    {
+        ArgumentNullException.ThrowIfNull(factory);
+        factory.ValidateNativeTextureImport(nativeTexture, description);
+    }
 
     /// <summary></summary>
     /// <param name="nativeTexture"></param>

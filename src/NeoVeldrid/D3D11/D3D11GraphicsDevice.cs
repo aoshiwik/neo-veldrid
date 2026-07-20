@@ -120,6 +120,12 @@ internal unsafe class D3D11GraphicsDevice : GraphicsDevice
             D3DFeatureLevel featureLevel;
             ID3D11Device* pDevice = null;
             ID3D11DeviceContext* pContext = null;
+            IDXGIAdapter* pAdapter = options.AdapterPtr != IntPtr.Zero
+                ? (IDXGIAdapter*)options.AdapterPtr
+                : null;
+            D3DDriverType driverType = pAdapter != null
+                ? D3DDriverType.Unknown
+                : D3DDriverType.Hardware;
 
             try
             {
@@ -131,13 +137,9 @@ internal unsafe class D3D11GraphicsDevice : GraphicsDevice
                         D3DFeatureLevel.Level110,
                     };
 
-                    IDXGIAdapter* pAdapter = options.AdapterPtr != IntPtr.Zero
-                        ? (IDXGIAdapter*)options.AdapterPtr
-                        : null;
-
                     SilkMarshal.ThrowHResult(_d3d11Api.CreateDevice(
                         pAdapter,
-                        pAdapter != null ? D3DDriverType.Unknown : D3DDriverType.Hardware,
+                        driverType,
                         IntPtr.Zero,
                         (uint)flags,
                         pFeatureLevels,
@@ -162,19 +164,27 @@ internal unsafe class D3D11GraphicsDevice : GraphicsDevice
                         pDevice = null;
                     }
 
-                    // Fallback: let the driver pick the feature level.
+                    // Windows 7's D3D11 runtime rejects a feature-level list
+                    // containing 11.1 with E_INVALIDARG even when the adapter
+                    // supports 11.0. Retry the same adapter at NeoVeldrid's
+                    // explicit 11.0 minimum instead of letting the driver
+                    // silently select a 10.x level.
+                    D3DFeatureLevel minimumFeatureLevel =
+                        D3DFeatureLevel.Level110;
                     SilkMarshal.ThrowHResult(_d3d11Api.CreateDevice(
-                        (IDXGIAdapter*)null,
-                        D3DDriverType.Hardware,
+                        pAdapter,
+                        driverType,
                         IntPtr.Zero,
                         (uint)flags,
-                        (D3DFeatureLevel*)null,
-                        0,
+                        &minimumFeatureLevel,
+                        1,
                         Silk.NET.Direct3D11.D3D11.SdkVersion,
                         &pDevice,
                         &featureLevel,
                         &pContext));
                 }
+
+                EnsureSupportedFeatureLevel(featureLevel);
 
                 // Transfer both successful creation references into fields before
                 // any subsequent operation can throw. The finally block owns only
@@ -248,14 +258,6 @@ internal unsafe class D3D11GraphicsDevice : GraphicsDevice
 
             switch (featureLevel)
             {
-                case D3DFeatureLevel.Level100:
-                    _apiVersion = new GraphicsApiVersion(10, 0, 0, 0);
-                    break;
-
-                case D3DFeatureLevel.Level101:
-                    _apiVersion = new GraphicsApiVersion(10, 1, 0, 0);
-                    break;
-
                 case D3DFeatureLevel.Level110:
                     _apiVersion = new GraphicsApiVersion(11, 0, 0, 0);
                     break;
@@ -575,59 +577,344 @@ internal unsafe class D3D11GraphicsDevice : GraphicsDevice
         return hr >= 0 && numQualityLevels != 0;
     }
 
-    private protected override bool GetPixelFormatSupportCore(
-        PixelFormat format,
-        TextureType type,
-        TextureUsage usage,
-        out PixelFormatProperties properties)
+    internal static bool IsSupportedFeatureLevel(
+        D3DFeatureLevel featureLevel) =>
+        featureLevel >= D3DFeatureLevel.Level110;
+
+    private static void EnsureSupportedFeatureLevel(
+        D3DFeatureLevel featureLevel)
     {
-        if (D3D11Formats.IsUnsupportedFormat(format))
+        if (!IsSupportedFeatureLevel(featureLevel))
         {
-            properties = default(PixelFormatProperties);
+            throw new NeoVeldridException(
+                "The Direct3D 11 backend requires feature level 11.0 or newer, "
+                + $"but D3D11CreateDevice selected 0x{(int)featureLevel:X4}.");
+        }
+    }
+
+    private protected override TextureSupportResult GetTextureSupportCore(
+        in TextureDescription description)
+    {
+        if (D3D11Formats.IsUnsupportedFormat(description.Format))
+        {
+            return UnsupportedTexture(
+                TextureSupportClassification.BackendContract,
+                TextureSupportReason.PixelFormat);
+        }
+
+        bool isSampled = (description.Usage & TextureUsage.Sampled) != 0;
+        bool isStorage = (description.Usage & TextureUsage.Storage) != 0;
+        bool isRenderTarget = (description.Usage & TextureUsage.RenderTarget) != 0;
+        bool isDepthStencil = (description.Usage & TextureUsage.DepthStencil) != 0;
+        bool isCubemap = (description.Usage & TextureUsage.Cubemap) != 0;
+        bool isStaging = (description.Usage & TextureUsage.Staging) != 0;
+        bool generatesMipmaps = (description.Usage & TextureUsage.GenerateMipmaps) != 0;
+
+        // D3D11Framebuffer currently exposes only 2D and 2D-array RTV/DSV
+        // dimensions. Report that backend contract instead of advertising the
+        // broader set of dimensions supported by native D3D11 views.
+        if (isRenderTarget && description.Type != TextureType.Texture2D)
+        {
+            return UnsupportedTexture(
+                TextureSupportClassification.BackendContract,
+                TextureSupportReason.RenderTargetUsage);
+        }
+        if (isDepthStencil
+            && (description.Type != TextureType.Texture2D || isCubemap))
+        {
+            return UnsupportedTexture(
+                TextureSupportClassification.BackendContract,
+                TextureSupportReason.DepthStencilUsage);
+        }
+
+        // D3D11TextureView has no cubemap UAV representation. It also creates
+        // an SRV for every storage view, so a storage texture must carry an
+        // explicit or mip-generation-implied ShaderResource bind flag.
+        if (isStorage && (isCubemap || (!isSampled && !generatesMipmaps)))
+        {
+            return UnsupportedTexture(
+                TextureSupportClassification.BackendContract,
+                TextureSupportReason.StorageUsage);
+        }
+
+        Format resourceFormat = D3D11Formats.GetTypelessFormat(
+            D3D11Formats.ToDxgiFormat(description.Format, isDepthStencil));
+        if (!TryGetFormatSupport(resourceFormat, out FormatSupport resourceSupport))
+        {
+            return UnsupportedTexture(
+                TextureSupportClassification.DeviceCapability,
+                TextureSupportReason.PixelFormat);
+        }
+
+        FormatSupport requiredTextureSupport = description.Type switch
+        {
+            TextureType.Texture1D => FormatSupport.Texture1D,
+            TextureType.Texture2D => FormatSupport.Texture2D,
+            TextureType.Texture3D => FormatSupport.Texture3D,
+            _ => FormatSupport.None,
+        };
+        if ((resourceSupport & requiredTextureSupport) == 0)
+        {
+            return UnsupportedTexture(
+                TextureSupportClassification.DeviceCapability,
+                TextureSupportReason.TextureType);
+        }
+
+        Format shaderViewFormat = D3D11Formats.GetViewFormat(
+            D3D11Formats.ToDxgiFormat(description.Format, isDepthStencil));
+        if (!TryGetFormatSupport(shaderViewFormat, out FormatSupport shaderViewSupport))
+        {
+            return UnsupportedTexture(
+                TextureSupportClassification.DeviceCapability,
+                TextureSupportReason.PixelFormat);
+        }
+
+        // TextureUsage.Sampled means shader-resource access, which includes
+        // integer Texture.Load operations. D3D11_FORMAT_SUPPORT_SHADER_SAMPLE
+        // is a filtering capability and is not reported for formats such as
+        // R32_UInt even though a typed SRV and ShaderLoad are fully supported.
+        if (isSampled && (shaderViewSupport & FormatSupport.ShaderLoad) == 0)
+        {
+            return UnsupportedTexture(
+                TextureSupportClassification.DeviceCapability,
+                TextureSupportReason.SampledUsage);
+        }
+        if (isCubemap && (shaderViewSupport & FormatSupport.Texturecube) == 0)
+        {
+            return UnsupportedTexture(
+                TextureSupportClassification.DeviceCapability,
+                TextureSupportReason.CubemapUsage);
+        }
+        if (isStaging && (resourceSupport & FormatSupport.CpuLockable) == 0)
+        {
+            return UnsupportedTexture(
+                TextureSupportClassification.DeviceCapability,
+                TextureSupportReason.StagingUsage);
+        }
+
+        Format colorViewFormat = shaderViewFormat;
+        FormatSupport colorViewSupport = shaderViewSupport;
+        if (!isDepthStencil)
+        {
+            colorViewFormat = D3D11Formats.ToDxgiFormat(description.Format, false);
+            if (!TryGetFormatSupport(colorViewFormat, out colorViewSupport))
+            {
+                return UnsupportedTexture(
+                    TextureSupportClassification.DeviceCapability,
+                    TextureSupportReason.PixelFormat);
+            }
+        }
+
+        if (isRenderTarget && (colorViewSupport & FormatSupport.RenderTarget) == 0)
+        {
+            return UnsupportedTexture(
+                TextureSupportClassification.DeviceCapability,
+                TextureSupportReason.RenderTargetUsage);
+        }
+
+        FormatSupport depthViewSupport = FormatSupport.None;
+        Format depthViewFormat = Format.FormatUnknown;
+        if (isDepthStencil)
+        {
+            depthViewFormat = D3D11Formats.GetDepthFormat(description.Format);
+            if (!TryGetFormatSupport(depthViewFormat, out depthViewSupport)
+                || (depthViewSupport & FormatSupport.DepthStencil) == 0)
+            {
+                return UnsupportedTexture(
+                    TextureSupportClassification.DeviceCapability,
+                    TextureSupportReason.DepthStencilUsage);
+            }
+        }
+
+        if (isStorage
+            && ((shaderViewSupport & FormatSupport.TypedUnorderedAccessView) == 0
+                || !SupportsTypedStorageAccess(shaderViewFormat)))
+        {
+            return UnsupportedTexture(
+                TextureSupportClassification.DeviceCapability,
+                TextureSupportReason.StorageUsage);
+        }
+
+        if (description.MipLevels > 1
+            && (shaderViewSupport & FormatSupport.Mip) == 0)
+        {
+            return UnsupportedTexture(
+                TextureSupportClassification.DeviceCapability,
+                TextureSupportReason.MipLevelLimit);
+        }
+
+        if (generatesMipmaps)
+        {
+            const FormatSupport mipGenerationSupport =
+                FormatSupport.ShaderSample
+                | FormatSupport.Mip
+                | FormatSupport.MipAutogen
+                | FormatSupport.RenderTarget;
+            if ((colorViewSupport & mipGenerationSupport) != mipGenerationSupport)
+            {
+                return UnsupportedTexture(
+                    TextureSupportClassification.DeviceCapability,
+                    TextureSupportReason.MipmapGeneration);
+            }
+        }
+
+        GetTextureLimits(
+            description.Type,
+            isCubemap,
+            out uint maxWidth,
+            out uint maxHeight,
+            out uint maxDepth,
+            out uint maxMipLevels,
+            out uint maxArrayLayers);
+        if ((shaderViewSupport & FormatSupport.Mip) == 0)
+            maxMipLevels = 1;
+
+        uint sampleCounts = 1u << (int)TextureSampleCount.Count1;
+        if (CanUseMultisampling(
+            description,
+            isSampled,
+            isStorage,
+            isRenderTarget,
+            isDepthStencil,
+            isCubemap,
+            isStaging,
+            generatesMipmaps,
+            shaderViewSupport,
+            colorViewSupport,
+            depthViewSupport))
+        {
+            Format multisampleFormat = isDepthStencil
+                ? depthViewFormat
+                : colorViewFormat;
+            if (CheckFormatMultisample(multisampleFormat, 2)) { sampleCounts |= 1u << (int)TextureSampleCount.Count2; }
+            if (CheckFormatMultisample(multisampleFormat, 4)) { sampleCounts |= 1u << (int)TextureSampleCount.Count4; }
+            if (CheckFormatMultisample(multisampleFormat, 8)) { sampleCounts |= 1u << (int)TextureSampleCount.Count8; }
+            if (CheckFormatMultisample(multisampleFormat, 16)) { sampleCounts |= 1u << (int)TextureSampleCount.Count16; }
+            if (CheckFormatMultisample(multisampleFormat, 32)) { sampleCounts |= 1u << (int)TextureSampleCount.Count32; }
+        }
+
+        return TextureSupportResult.Supported(new PixelFormatProperties(
+            maxWidth,
+            maxHeight,
+            maxDepth,
+            maxMipLevels,
+            maxArrayLayers,
+            sampleCounts));
+    }
+
+    private bool TryGetFormatSupport(Format format, out FormatSupport support)
+    {
+        uint rawSupport;
+        int result = _device.Handle->CheckFormatSupport(format, &rawSupport);
+        support = result >= 0 ? (FormatSupport)rawSupport : FormatSupport.None;
+        return result >= 0;
+    }
+
+    private bool SupportsTypedStorageAccess(Format format)
+    {
+        FeatureDataFormatSupport2 support = new FeatureDataFormatSupport2
+        {
+            InFormat = format,
+        };
+        int result = _device.Handle->CheckFeatureSupport(
+            Silk.NET.Direct3D11.Feature.FormatSupport2,
+            &support,
+            (uint)sizeof(FeatureDataFormatSupport2));
+        const FormatSupport2 requiredSupport =
+            FormatSupport2.UavTypedLoad | FormatSupport2.UavTypedStore;
+        return result >= 0
+            && (((FormatSupport2)support.OutFormatSupport2 & requiredSupport)
+                == requiredSupport);
+    }
+
+    private static bool CanUseMultisampling(
+        in TextureDescription description,
+        bool isSampled,
+        bool isStorage,
+        bool isRenderTarget,
+        bool isDepthStencil,
+        bool isCubemap,
+        bool isStaging,
+        bool generatesMipmaps,
+        FormatSupport shaderViewSupport,
+        FormatSupport colorViewSupport,
+        FormatSupport depthViewSupport)
+    {
+        if (description.Type != TextureType.Texture2D
+            || isStorage
+            || isCubemap
+            || isStaging
+            || generatesMipmaps)
+        {
             return false;
         }
 
-        Format dxgiFormat = D3D11Formats.ToDxgiFormat(format, (usage & TextureUsage.DepthStencil) != 0);
-
-        uint fsRaw;
-        int fhr = ((ID3D11Device*)_device)->CheckFormatSupport(dxgiFormat, &fsRaw);
-        if (fhr < 0)
+        if (isSampled
+            && (shaderViewSupport & FormatSupport.MultisampleLoad) == 0)
         {
-            properties = default(PixelFormatProperties);
-            return false;
-        }
-        FormatSupport fs = (FormatSupport)fsRaw;
-
-        if ((usage & TextureUsage.RenderTarget) != 0 && (fs & FormatSupport.RenderTarget) == 0
-            || (usage & TextureUsage.DepthStencil) != 0 && (fs & FormatSupport.DepthStencil) == 0
-            || (usage & TextureUsage.Sampled) != 0 && (fs & FormatSupport.ShaderSample) == 0
-            || (usage & TextureUsage.Cubemap) != 0 && (fs & FormatSupport.Texturecube) == 0
-            || (usage & TextureUsage.Storage) != 0 && (fs & FormatSupport.TypedUnorderedAccessView) == 0)
-        {
-            properties = default(PixelFormatProperties);
             return false;
         }
 
+        FormatSupport targetSupport = isDepthStencil
+            ? depthViewSupport
+            : colorViewSupport;
+        if ((isRenderTarget || isDepthStencil)
+            && (targetSupport & FormatSupport.MultisampleRendertarget) == 0)
+        {
+            return false;
+        }
+
+        // NeoVeldrid permits every multisampled color texture to be passed to
+        // ResolveTexture, regardless of its other usage flags.
+        return isDepthStencil
+            || (colorViewSupport & FormatSupport.MultisampleResolve) != 0;
+    }
+
+    private static void GetTextureLimits(
+        TextureType type,
+        bool isCubemap,
+        out uint maxWidth,
+        out uint maxHeight,
+        out uint maxDepth,
+        out uint maxMipLevels,
+        out uint maxArrayLayers)
+    {
         const uint MaxTextureDimension = 16384;
         const uint MaxVolumeExtent = 2048;
+        const uint MaxTextureArrayLayers = 2048;
 
-        uint sampleCounts = 0;
-        if (CheckFormatMultisample(dxgiFormat, 1)) { sampleCounts |= (1 << 0); }
-        if (CheckFormatMultisample(dxgiFormat, 2)) { sampleCounts |= (1 << 1); }
-        if (CheckFormatMultisample(dxgiFormat, 4)) { sampleCounts |= (1 << 2); }
-        if (CheckFormatMultisample(dxgiFormat, 8)) { sampleCounts |= (1 << 3); }
-        if (CheckFormatMultisample(dxgiFormat, 16)) { sampleCounts |= (1 << 4); }
-        if (CheckFormatMultisample(dxgiFormat, 32)) { sampleCounts |= (1 << 5); }
-
-        properties = new PixelFormatProperties(
-            MaxTextureDimension,
-            type == TextureType.Texture1D ? 1 : MaxTextureDimension,
-            type != TextureType.Texture3D ? 1 : MaxVolumeExtent,
-            uint.MaxValue,
-            type == TextureType.Texture3D ? 1 : MaxVolumeExtent,
-            sampleCounts);
-        return true;
+        if (type == TextureType.Texture1D)
+        {
+            maxWidth = MaxTextureDimension;
+            maxHeight = 1;
+            maxDepth = 1;
+            maxMipLevels = 15;
+            maxArrayLayers = MaxTextureArrayLayers;
+        }
+        else if (type == TextureType.Texture2D)
+        {
+            maxWidth = MaxTextureDimension;
+            maxHeight = MaxTextureDimension;
+            maxDepth = 1;
+            maxMipLevels = 15;
+            // Native cube arrays contain six physical slices per public,
+            // logical cube. D3D11's largest valid multiple of six is 2046.
+            maxArrayLayers = isCubemap ? 341u : MaxTextureArrayLayers;
+        }
+        else
+        {
+            maxWidth = MaxVolumeExtent;
+            maxHeight = MaxVolumeExtent;
+            maxDepth = MaxVolumeExtent;
+            maxMipLevels = 12;
+            maxArrayLayers = 1;
+        }
     }
+
+    private static TextureSupportResult UnsupportedTexture(
+        TextureSupportClassification classification,
+        TextureSupportReason reason) =>
+        TextureSupportResult.Unsupported(classification, reason);
 
     protected override MappedResource MapCore(MappableResource resource, MapMode mode, uint subresource)
     {

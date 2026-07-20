@@ -8,7 +8,7 @@ internal class VkResourceFactory : ResourceFactory
     private readonly Device _device;
 
     public VkResourceFactory(VkGraphicsDevice vkGraphicsDevice)
-        : base (vkGraphicsDevice.Features)
+        : base(vkGraphicsDevice)
     {
         _gd = vkGraphicsDevice;
         _device = vkGraphicsDevice.Device;
@@ -73,6 +73,13 @@ internal class VkResourceFactory : ResourceFactory
             description.SampleCount,
             new Image(nativeTexture));
     }
+
+    // Vulkan image import needs explicit ownership, initial-layout, queue-family,
+    // image-create-flag, and subresource metadata. The legacy ulong overload
+    // carries none of that information, so accepting it would create a
+    // swapchain-like wrapper with false layout and ownership semantics.
+    protected override bool SupportsNativeTextureImport(
+        in TextureDescription description) => false;
 
     protected override TextureView CreateTextureViewCore(ref TextureViewDescription description)
     {

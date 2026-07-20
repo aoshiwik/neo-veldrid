@@ -207,16 +207,16 @@ internal static class OpenGLFormats
         switch (format)
         {
             case PixelFormat.R8_UNorm:
+            case PixelFormat.R8_SNorm:
             case PixelFormat.R16_UNorm:
+            case PixelFormat.R16_SNorm:
             case PixelFormat.R16_Float:
             case PixelFormat.R32_Float:
             case PixelFormat.BC4_UNorm:
                 return GLPixelFormat.Red;
 
-            case PixelFormat.R8_SNorm:
             case PixelFormat.R8_UInt:
             case PixelFormat.R8_SInt:
-            case PixelFormat.R16_SNorm:
             case PixelFormat.R16_UInt:
             case PixelFormat.R16_SInt:
             case PixelFormat.R32_UInt:
@@ -225,16 +225,16 @@ internal static class OpenGLFormats
                 return GLPixelFormat.RedInteger;
 
             case PixelFormat.R8_G8_UNorm:
+            case PixelFormat.R8_G8_SNorm:
             case PixelFormat.R16_G16_UNorm:
+            case PixelFormat.R16_G16_SNorm:
             case PixelFormat.R16_G16_Float:
             case PixelFormat.R32_G32_Float:
             case PixelFormat.BC5_UNorm:
                 return GLPixelFormat.RG;
 
-            case PixelFormat.R8_G8_SNorm:
             case PixelFormat.R8_G8_UInt:
             case PixelFormat.R8_G8_SInt:
-            case PixelFormat.R16_G16_SNorm:
             case PixelFormat.R16_G16_UInt:
             case PixelFormat.R16_G16_SInt:
             case PixelFormat.R32_G32_UInt:
@@ -244,7 +244,9 @@ internal static class OpenGLFormats
 
             case PixelFormat.R8_G8_B8_A8_UNorm:
             case PixelFormat.R8_G8_B8_A8_UNorm_SRgb:
+            case PixelFormat.R8_G8_B8_A8_SNorm:
             case PixelFormat.R16_G16_B16_A16_UNorm:
+            case PixelFormat.R16_G16_B16_A16_SNorm:
             case PixelFormat.R16_G16_B16_A16_Float:
             case PixelFormat.R32_G32_B32_A32_Float:
                 return GLPixelFormat.Rgba;
@@ -253,10 +255,8 @@ internal static class OpenGLFormats
             case PixelFormat.B8_G8_R8_A8_UNorm_SRgb:
                 return GLPixelFormat.Bgra;
 
-            case PixelFormat.R8_G8_B8_A8_SNorm:
             case PixelFormat.R8_G8_B8_A8_UInt:
             case PixelFormat.R8_G8_B8_A8_SInt:
-            case PixelFormat.R16_G16_B16_A16_SNorm:
             case PixelFormat.R16_G16_B16_A16_UInt:
             case PixelFormat.R16_G16_B16_A16_SInt:
             case PixelFormat.R32_G32_B32_A32_UInt:
@@ -389,7 +389,7 @@ internal static class OpenGLFormats
             case PixelFormat.R8_UNorm:
                 return SizedInternalFormat.R8;
             case PixelFormat.R8_SNorm:
-                return SizedInternalFormat.R8i;
+                return (SizedInternalFormat)InternalFormat.R8SNorm;
             case PixelFormat.R8_UInt:
                 return SizedInternalFormat.R8ui;
             case PixelFormat.R8_SInt:
@@ -398,7 +398,7 @@ internal static class OpenGLFormats
             case PixelFormat.R16_UNorm:
                 return depthFormat ? (SizedInternalFormat)InternalFormat.DepthComponent16 : SizedInternalFormat.R16;
             case PixelFormat.R16_SNorm:
-                return SizedInternalFormat.R16i;
+                return (SizedInternalFormat)InternalFormat.R16SNorm;
             case PixelFormat.R16_UInt:
                 return SizedInternalFormat.R16ui;
             case PixelFormat.R16_SInt:
@@ -416,7 +416,7 @@ internal static class OpenGLFormats
             case PixelFormat.R8_G8_UNorm:
                 return SizedInternalFormat.RG8;
             case PixelFormat.R8_G8_SNorm:
-                return SizedInternalFormat.RG8i;
+                return (SizedInternalFormat)InternalFormat.RG8SNorm;
             case PixelFormat.R8_G8_UInt:
                 return SizedInternalFormat.RG8ui;
             case PixelFormat.R8_G8_SInt:
@@ -425,7 +425,7 @@ internal static class OpenGLFormats
             case PixelFormat.R16_G16_UNorm:
                 return SizedInternalFormat.RG16;
             case PixelFormat.R16_G16_SNorm:
-                return SizedInternalFormat.RG16i;
+                return (SizedInternalFormat)InternalFormat.RG16SNorm;
             case PixelFormat.R16_G16_UInt:
                 return SizedInternalFormat.RG16ui;
             case PixelFormat.R16_G16_SInt:
@@ -445,7 +445,7 @@ internal static class OpenGLFormats
             case PixelFormat.R8_G8_B8_A8_UNorm_SRgb:
                 return (SizedInternalFormat)InternalFormat.Srgb8Alpha8;
             case PixelFormat.R8_G8_B8_A8_SNorm:
-                return SizedInternalFormat.Rgba8i;
+                return (SizedInternalFormat)InternalFormat.Rgba8SNorm;
             case PixelFormat.R8_G8_B8_A8_UInt:
                 return SizedInternalFormat.Rgba8ui;
             case PixelFormat.R8_G8_B8_A8_SInt:
@@ -458,7 +458,7 @@ internal static class OpenGLFormats
             case PixelFormat.R16_G16_B16_A16_UNorm:
                 return SizedInternalFormat.Rgba16;
             case PixelFormat.R16_G16_B16_A16_SNorm:
-                return SizedInternalFormat.Rgba16i;
+                return (SizedInternalFormat)InternalFormat.Rgba16SNorm;
             case PixelFormat.R16_G16_B16_A16_UInt:
                 return SizedInternalFormat.Rgba16ui;
             case PixelFormat.R16_G16_B16_A16_SInt:
@@ -687,7 +687,9 @@ internal static class OpenGLFormats
             case PixelFormat.BC4_SNorm:
             case PixelFormat.BC5_UNorm:
             case PixelFormat.BC5_SNorm:
-                return extensions.GLVersion(3, 0) || extensions.IsExtensionSupported("GL_ARB_texture_compression_rgtc");
+                return extensions.GLVersion(3, 0)
+                    || extensions.IsExtensionSupported("GL_ARB_texture_compression_rgtc")
+                    || extensions.IsExtensionSupported("GL_EXT_texture_compression_rgtc");
 
             case PixelFormat.BC7_UNorm:
             case PixelFormat.BC7_UNorm_SRgb:

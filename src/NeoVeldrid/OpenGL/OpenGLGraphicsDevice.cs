@@ -72,8 +72,14 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
     }
     private BackendInfoOpenGL _openglInfo;
 
-    private TextureSampleCount _maxColorTextureSamples;
+    private const uint Count1SampleMask = 1u << (int)TextureSampleCount.Count1;
+    private const GLEnum GLNumSampleCounts = (GLEnum)0x9380;
+    private const GLEnum GLSamples = (GLEnum)0x80A9;
+
+    private readonly Dictionary<MultisampleTextureSupportKey, uint> _multisampleTextureSampleCounts
+        = new Dictionary<MultisampleTextureSupportKey, uint>();
     private uint _maxTextureSize;
+    private uint _maxCubeMapTextureSize;
     private uint _maxTexDepth;
     private uint _maxTexArrayLayers;
     private uint _minUboOffsetAlignment;
@@ -300,6 +306,49 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
             _minSsboOffsetAlignment = (uint)ssboAlignment;
         }
 
+        int maxColorTextureSamples;
+        if (_backendType == GraphicsBackend.OpenGL)
+        {
+            GL.GetInteger(GetPName.MaxColorTextureSamples, out maxColorTextureSamples);
+            CheckLastError();
+        }
+        else
+        {
+            GL.GetInteger((GetPName)GLEnum.MaxSamples, out maxColorTextureSamples);
+            CheckLastError();
+        }
+
+        TextureSampleCount maxColorTextureSampleCount =
+            GetTextureSampleCountLimit(maxColorTextureSamples);
+        TextureSampleCount maxDepthTextureSampleCount;
+        TextureSampleCount maxIntegerTextureSampleCount;
+
+        if (_backendType == GraphicsBackend.OpenGL)
+        {
+            // These global limits bound target-specific format queries. They
+            // are not themselves proof that any particular format supports
+            // every smaller power-of-two sample count.
+            GL.GetInteger((GetPName)0x910F, out int maxDepthTextureSamples); // GL_MAX_DEPTH_TEXTURE_SAMPLES
+            CheckLastError();
+            GL.GetInteger((GetPName)0x9110, out int maxIntegerSamples); // GL_MAX_INTEGER_SAMPLES
+            CheckLastError();
+            maxDepthTextureSampleCount = GetTextureSampleCountLimit(maxDepthTextureSamples);
+            maxIntegerTextureSampleCount = GetTextureSampleCountLimit(maxIntegerSamples);
+        }
+        else
+        {
+            maxDepthTextureSampleCount = maxColorTextureSampleCount;
+            maxIntegerTextureSampleCount = maxColorTextureSampleCount;
+        }
+
+        // The context still belongs to this initialization thread. Capture
+        // every native, target-specific sample-count result now so public
+        // support queries remain thread-safe and perform no native GL calls.
+        InitializeMultisampleTextureSupport(
+            maxColorTextureSampleCount,
+            maxDepthTextureSampleCount,
+            maxIntegerTextureSampleCount);
+
         _resourceFactory = new OpenGLResourceFactory(this);
 
         _vao = GL.GenVertexArray();
@@ -343,45 +392,13 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
         _textureSamplerManager = new OpenGLTextureSamplerManager(this, _extensions);
         _commandExecutor = new OpenGLCommandExecutor(this, platformInfo);
 
-        int maxColorTextureSamples;
-        if (_backendType == GraphicsBackend.OpenGL)
-        {
-            GL.GetInteger(GetPName.MaxColorTextureSamples, out maxColorTextureSamples);
-            CheckLastError();
-        }
-        else
-        {
-            GL.GetInteger((GetPName)GLEnum.MaxSamples, out maxColorTextureSamples);
-            CheckLastError();
-        }
-        if (maxColorTextureSamples >= 32)
-        {
-            _maxColorTextureSamples = TextureSampleCount.Count32;
-        }
-        else if (maxColorTextureSamples >= 16)
-        {
-            _maxColorTextureSamples = TextureSampleCount.Count16;
-        }
-        else if (maxColorTextureSamples >= 8)
-        {
-            _maxColorTextureSamples = TextureSampleCount.Count8;
-        }
-        else if (maxColorTextureSamples >= 4)
-        {
-            _maxColorTextureSamples = TextureSampleCount.Count4;
-        }
-        else if (maxColorTextureSamples >= 2)
-        {
-            _maxColorTextureSamples = TextureSampleCount.Count2;
-        }
-        else
-        {
-            _maxColorTextureSamples = TextureSampleCount.Count1;
-        }
-
         int maxTexSize;
 
         GL.GetInteger(GetPName.MaxTextureSize, out maxTexSize);
+        CheckLastError();
+
+        int maxCubeMapTextureSize;
+        GL.GetInteger(GetPName.MaxCubeMapTextureSize, out maxCubeMapTextureSize);
         CheckLastError();
 
         int maxTexDepth;
@@ -400,6 +417,7 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
         }
 
         _maxTextureSize = (uint)maxTexSize;
+        _maxCubeMapTextureSize = (uint)maxCubeMapTextureSize;
         _maxTexDepth = (uint)maxTexDepth;
         _maxTexArrayLayers = (uint)maxTexArrayLayers;
 
@@ -787,40 +805,1006 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
 
     public override TextureSampleCount GetSampleCountLimit(PixelFormat format, bool depthFormat)
     {
-        return _maxColorTextureSamples;
+        uint sampleCounts = GetMultisampleTextureSampleCounts(
+            format,
+            depthFormat,
+            TextureTarget.Texture2DMultisample);
+        return GetMaximumSampleCount(sampleCounts);
     }
 
-    private protected override bool GetPixelFormatSupportCore(
-        PixelFormat format,
-        TextureType type,
-        TextureUsage usage,
-        out PixelFormatProperties properties)
+    private protected override TextureSupportResult GetTextureSupportCore(
+        in TextureDescription description)
     {
-        if (type == TextureType.Texture1D && !_features.Texture1D
-            || !OpenGLFormats.IsFormatSupported(_extensions, format, _backendType)
-            || (usage & TextureUsage.Staging) != 0
-                && IsCompressedStagingReadbackUnsupported(format))
+        TextureUsage usage = description.Usage;
+        bool isOpenGLES = _backendType == GraphicsBackend.OpenGLES;
+        bool isSampled = (usage & TextureUsage.Sampled) != 0;
+        bool isStorage = (usage & TextureUsage.Storage) != 0;
+        bool isRenderTarget = (usage & TextureUsage.RenderTarget) != 0;
+        bool isDepthStencil = (usage & TextureUsage.DepthStencil) != 0;
+        bool isCubemap = (usage & TextureUsage.Cubemap) != 0;
+        bool isStaging = (usage & TextureUsage.Staging) != 0;
+        bool generatesMipmaps = (usage & TextureUsage.GenerateMipmaps) != 0;
+        bool isCompressed = FormatHelpers.IsCompressedFormat(description.Format);
+
+        if (description.Type == TextureType.Texture1D && !_features.Texture1D)
         {
-            properties = default(PixelFormatProperties);
+            return UnsupportedTexture(
+                TextureSupportClassification.BackendContract,
+                TextureSupportReason.TextureType);
+        }
+
+        if (!SupportsTextureTarget(description.Type, description.ArrayLayers, isCubemap))
+        {
+            return UnsupportedTexture(
+                TextureSupportClassification.DeviceCapability,
+                TextureSupportReason.TextureType);
+        }
+
+        if (!OpenGLFormats.IsFormatSupported(
+            _extensions,
+            description.Format,
+            _backendType))
+        {
+            TextureSupportClassification classification =
+                isOpenGLES && IsOpenGLESBackendExcludedFormat(description.Format)
+                    ? TextureSupportClassification.BackendContract
+                    : TextureSupportClassification.DeviceCapability;
+            return UnsupportedTexture(classification, TextureSupportReason.PixelFormat);
+        }
+
+        if (isOpenGLES
+            && RequiresOpenGLESNormalized16Extension(
+                description.Format,
+                isDepthStencil)
+            && !_extensions.EXT_TextureNorm16)
+        {
+            return UnsupportedTexture(
+                TextureSupportClassification.DeviceCapability,
+                TextureSupportReason.PixelFormat);
+        }
+
+        if (isCubemap && description.ArrayLayers > 1)
+        {
+            if (!SupportsCubeMapArrays())
+            {
+                return UnsupportedTexture(
+                    TextureSupportClassification.DeviceCapability,
+                    TextureSupportReason.CubemapUsage);
+            }
+
+            // OpenGLTexture's mutable-storage fallback currently allocates a
+            // Texture2DArray rather than the requested TextureCubeMapArray.
+            // Immutable storage is therefore part of the backend contract for
+            // cube arrays, not merely a performance preference.
+            if (!CanMaterializeCubeMapArrays())
+            {
+                return UnsupportedTexture(
+                    TextureSupportClassification.BackendContract,
+                    TextureSupportReason.CubemapUsage);
+            }
+        }
+
+        // OpenGLFramebuffer's attachment paths are defined for 2D targets and
+        // individual layers/faces of 2D arrays and cubemaps. Its 1D and 3D
+        // attachment paths do not materialize valid framebuffer attachments.
+        if ((isRenderTarget || isDepthStencil)
+            && description.Type != TextureType.Texture2D)
+        {
+            return UnsupportedTexture(
+                TextureSupportClassification.BackendContract,
+                isDepthStencil
+                    ? TextureSupportReason.DepthStencilUsage
+                    : TextureSupportReason.RenderTargetUsage);
+        }
+
+        if (isRenderTarget && isDepthStencil)
+        {
+            return UnsupportedTexture(
+                TextureSupportClassification.BackendContract,
+                TextureSupportReason.RenderTargetUsage);
+        }
+
+        if (isRenderTarget)
+        {
+            if (isCompressed)
+            {
+                return UnsupportedTexture(
+                    TextureSupportClassification.BackendContract,
+                    TextureSupportReason.RenderTargetUsage);
+            }
+
+            if (isOpenGLES && !IsOpenGLESColorRenderable(description.Format))
+            {
+                return UnsupportedTexture(
+                    TextureSupportClassification.DeviceCapability,
+                    TextureSupportReason.RenderTargetUsage);
+            }
+        }
+
+        if (isStorage)
+        {
+            if (isDepthStencil || !IsStorageFormatImplemented(description.Format, isOpenGLES))
+            {
+                return UnsupportedTexture(
+                    TextureSupportClassification.BackendContract,
+                    TextureSupportReason.StorageUsage);
+            }
+
+            if (!SupportsStorageImages())
+            {
+                return UnsupportedTexture(
+                    TextureSupportClassification.DeviceCapability,
+                    TextureSupportReason.StorageUsage);
+            }
+
+            // GLSL ES does not expose NeoVeldrid's multisampled storage-image
+            // contract through the image types used by this backend.
+            if (isOpenGLES
+                && description.SampleCount != TextureSampleCount.Count1)
+            {
+                return UnsupportedTexture(
+                    TextureSupportClassification.BackendContract,
+                    TextureSupportReason.StorageUsage);
+            }
+        }
+
+        if (isStaging)
+        {
+            if (IsCompressedStagingReadbackUnsupported(description.Format))
+            {
+                return UnsupportedTexture(
+                    TextureSupportClassification.BackendContract,
+                    TextureSupportReason.StagingUsage);
+            }
+
+            // GLES readback is implemented through a temporary framebuffer;
+            // a texture which cannot be attached cannot satisfy the staging
+            // resource's read/write mapping contract.
+            if (isOpenGLES && !IsOpenGLESColorRenderable(description.Format))
+            {
+                return UnsupportedTexture(
+                    TextureSupportClassification.DeviceCapability,
+                    TextureSupportReason.StagingUsage);
+            }
+        }
+
+        if (generatesMipmaps)
+        {
+            if (description.SampleCount != TextureSampleCount.Count1)
+            {
+                return UnsupportedTexture(
+                    TextureSupportClassification.BackendContract,
+                    TextureSupportReason.MipmapGeneration);
+            }
+
+            if (isOpenGLES)
+            {
+                // GLES GenerateMipmap requires an uncompressed,
+                // color-renderable, texture-filterable internal format.
+                if (isCompressed || IsIntegerTextureFormat(description.Format))
+                {
+                    return UnsupportedTexture(
+                        TextureSupportClassification.BackendContract,
+                        TextureSupportReason.MipmapGeneration);
+                }
+
+                if (!IsOpenGLESColorRenderable(description.Format)
+                    || !IsOpenGLESTextureFilterable(description.Format))
+                {
+                    return UnsupportedTexture(
+                        TextureSupportClassification.DeviceCapability,
+                        TextureSupportReason.MipmapGeneration);
+                }
+            }
+        }
+
+        if (description.SampleCount != TextureSampleCount.Count1)
+        {
+            if (isCompressed)
+            {
+                return UnsupportedTexture(
+                    TextureSupportClassification.BackendContract,
+                    TextureSupportReason.SampleCount);
+            }
+
+            if (isStaging)
+            {
+                return UnsupportedTexture(
+                    TextureSupportClassification.BackendContract,
+                    TextureSupportReason.StagingUsage);
+            }
+
+            if (!SupportsMultisampleTarget(description.ArrayLayers)
+                || (!isDepthStencil
+                    && isOpenGLES
+                    && !IsOpenGLESColorRenderable(description.Format)))
+            {
+                return UnsupportedTexture(
+                    TextureSupportClassification.DeviceCapability,
+                    TextureSupportReason.SampleCount);
+            }
+        }
+
+        GetTextureLimits(
+            description,
+            isCubemap,
+            out uint maxWidth,
+            out uint maxHeight,
+            out uint maxDepth,
+            out uint maxMipLevels,
+            out uint maxArrayLayers);
+
+        uint sampleCounts = Count1SampleMask;
+        if (CanUseMultisampling(
+            description,
+            isStorage,
+            isDepthStencil,
+            isCubemap,
+            isStaging,
+            generatesMipmaps,
+            isCompressed,
+            isOpenGLES))
+        {
+            TextureTarget multisampleTarget = description.ArrayLayers > 1
+                ? TextureTarget.Texture2DMultisampleArray
+                : TextureTarget.Texture2DMultisample;
+            sampleCounts = GetMultisampleTextureSampleCounts(
+                description.Format,
+                isDepthStencil,
+                multisampleTarget);
+        }
+
+        // Sampled usage needs no extra branch here: the format and target
+        // checks above are exactly the capabilities consumed by the GL sampler
+        // path. Keeping it explicit in the local vocabulary documents that it
+        // was considered rather than accidentally omitted.
+        _ = isSampled;
+
+        return TextureSupportResult.Supported(new PixelFormatProperties(
+            maxWidth,
+            maxHeight,
+            maxDepth,
+            maxMipLevels,
+            maxArrayLayers,
+            sampleCounts));
+    }
+
+    private bool SupportsTextureTarget(
+        TextureType type,
+        uint arrayLayers,
+        bool isCubemap)
+    {
+        if (type == TextureType.Texture1D)
+        {
+            return _backendType == GraphicsBackend.OpenGL
+                && (arrayLayers == 1 || SupportsTextureArrays());
+        }
+
+        if (type == TextureType.Texture3D)
+        {
+            return _backendType == GraphicsBackend.OpenGL
+                || _extensions.GLESVersion(3, 0);
+        }
+
+        return isCubemap
+            || arrayLayers == 1
+            || SupportsTextureArrays();
+    }
+
+    private bool SupportsTextureArrays() =>
+        _extensions.GLVersion(3, 0)
+        || _extensions.IsExtensionSupported("GL_EXT_texture_array")
+        || _extensions.GLESVersion(3, 0);
+
+    private bool SupportsCubeMapArrays() =>
+        _extensions.GLVersion(4, 0)
+        || _extensions.IsExtensionSupported("GL_ARB_texture_cube_map_array")
+        || _extensions.GLESVersion(3, 2)
+        || _extensions.IsExtensionSupported("GL_OES_texture_cube_map_array")
+        || _extensions.IsExtensionSupported("GL_EXT_texture_cube_map_array");
+
+    private bool CanMaterializeCubeMapArrays() =>
+        SupportsCubeMapArrays()
+        && (_extensions.ARB_DirectStateAccess || _extensions.TextureStorage);
+
+    private bool SupportsStorageImages() =>
+        _extensions.GLVersion(4, 2)
+        || _extensions.IsExtensionSupported("GL_ARB_shader_image_load_store")
+        || _extensions.GLESVersion(3, 1);
+
+    private bool SupportsMultisampleTarget(uint arrayLayers)
+    {
+        if (arrayLayers > 1)
+            return SupportsMultisampleArrayTextures();
+
+        return _extensions.GLVersion(3, 2)
+            || _extensions.IsExtensionSupported("GL_ARB_texture_multisample")
+            || _extensions.GLESVersion(3, 1);
+    }
+
+    private bool SupportsMultisampleArrayTextures() =>
+        _extensions.GLVersion(3, 2)
+        || _extensions.IsExtensionSupported("GL_ARB_texture_multisample")
+        || _extensions.GLESVersion(3, 2)
+        || _extensions.IsExtensionSupported(
+            "GL_OES_texture_storage_multisample_2d_array");
+
+    private bool CanUseMultisampling(
+        in TextureDescription description,
+        bool isStorage,
+        bool isDepthStencil,
+        bool isCubemap,
+        bool isStaging,
+        bool generatesMipmaps,
+        bool isCompressed,
+        bool isOpenGLES)
+    {
+        if (description.Type != TextureType.Texture2D
+            || isCubemap
+            || isStaging
+            || generatesMipmaps
+            || isCompressed
+            || (isStorage && isOpenGLES)
+            || !SupportsMultisampleTarget(description.ArrayLayers))
+        {
             return false;
         }
 
-        uint sampleCounts = 0;
-        int max = (int)_maxColorTextureSamples + 1;
-        for (int i = 0; i < max; i++)
+        return isDepthStencil
+            || !isOpenGLES
+            || IsOpenGLESColorRenderable(description.Format);
+    }
+
+    private void InitializeMultisampleTextureSupport(
+        TextureSampleCount maxColorTextureSampleCount,
+        TextureSampleCount maxDepthTextureSampleCount,
+        TextureSampleCount maxIntegerTextureSampleCount)
+    {
+        bool supportsTexture2DMultisample = SupportsMultisampleTarget(arrayLayers: 1);
+        bool supportsTexture2DMultisampleArray = SupportsMultisampleArrayTextures();
+        if (!supportsTexture2DMultisample && !supportsTexture2DMultisampleArray)
+            return;
+
+        bool canQueryTargetSpecificSupport =
+            CanQueryTargetSpecificInternalFormatSupport();
+
+        foreach (PixelFormat format in Enum.GetValues<PixelFormat>())
         {
-            sampleCounts |= (uint)(1 << i);
+            if (!OpenGLFormats.IsFormatSupported(_extensions, format, _backendType)
+                || FormatHelpers.IsCompressedFormat(format))
+            {
+                continue;
+            }
+
+            if (!FormatHelpers.IsStencilFormat(format)
+                && CanUseMultisampleInternalFormat(format, depthFormat: false))
+            {
+                TextureSampleCount maxSampleCount = IsIntegerTextureFormat(format)
+                    ? maxIntegerTextureSampleCount
+                    : maxColorTextureSampleCount;
+                CacheMultisampleTextureSupport(
+                    format,
+                    depthFormat: false,
+                    supportsTexture2DMultisample,
+                    supportsTexture2DMultisampleArray,
+                    canQueryTargetSpecificSupport,
+                    maxSampleCount);
+            }
+
+            if (FormatHelpers.IsDepthStencilFormat(format)
+                && CanUseMultisampleInternalFormat(format, depthFormat: true))
+            {
+                CacheMultisampleTextureSupport(
+                    format,
+                    depthFormat: true,
+                    supportsTexture2DMultisample,
+                    supportsTexture2DMultisampleArray,
+                    canQueryTargetSpecificSupport,
+                    maxDepthTextureSampleCount);
+            }
+        }
+    }
+
+    private bool CanUseMultisampleInternalFormat(
+        PixelFormat format,
+        bool depthFormat)
+    {
+        if (depthFormat && !FormatHelpers.IsDepthStencilFormat(format))
+            return false;
+
+        if (_backendType != GraphicsBackend.OpenGLES)
+            return true;
+
+        if (RequiresOpenGLESNormalized16Extension(format, depthFormat)
+            && !_extensions.EXT_TextureNorm16)
+        {
+            return false;
         }
 
-        properties = new PixelFormatProperties(
-            _maxTextureSize,
-            type == TextureType.Texture1D ? 1 : _maxTextureSize,
-            type != TextureType.Texture3D ? 1 : _maxTexDepth,
-            uint.MaxValue,
-            type == TextureType.Texture3D ? 1 : _maxTexArrayLayers,
+        return depthFormat || IsOpenGLESColorRenderable(format);
+    }
+
+    private bool CanQueryTargetSpecificInternalFormatSupport()
+    {
+        if (_getProcAddress("glGetInternalformativ") == IntPtr.Zero)
+            return false;
+
+        if (_backendType == GraphicsBackend.OpenGLES)
+        {
+            // GLES 3.1 adds Texture2DMultisample to the query target set;
+            // GLES 3.2 and OES_texture_storage_multisample_2d_array extend it
+            // to Texture2DMultisampleArray.
+            return _extensions.GLESVersion(3, 1);
+        }
+
+        // ARB_internalformat_query only proves renderbuffer sample counts.
+        // Texture-target evidence requires query2 (core in OpenGL 4.3).
+        return _extensions.GLVersion(4, 3)
+            || _extensions.IsExtensionSupported("GL_ARB_internalformat_query2");
+    }
+
+    private void CacheMultisampleTextureSupport(
+        PixelFormat format,
+        bool depthFormat,
+        bool supportsTexture2DMultisample,
+        bool supportsTexture2DMultisampleArray,
+        bool canQueryTargetSpecificSupport,
+        TextureSampleCount maxSampleCount)
+    {
+        if (supportsTexture2DMultisample)
+        {
+            CacheMultisampleTextureSupport(
+                format,
+                depthFormat,
+                TextureTarget.Texture2DMultisample,
+                canQueryTargetSpecificSupport,
+                maxSampleCount);
+        }
+
+        if (supportsTexture2DMultisampleArray)
+        {
+            CacheMultisampleTextureSupport(
+                format,
+                depthFormat,
+                TextureTarget.Texture2DMultisampleArray,
+                canQueryTargetSpecificSupport,
+                maxSampleCount);
+        }
+    }
+
+    private void CacheMultisampleTextureSupport(
+        PixelFormat format,
+        bool depthFormat,
+        TextureTarget target,
+        bool canQueryTargetSpecificSupport,
+        TextureSampleCount maxSampleCount)
+    {
+        // Count1 uses an ordinary texture target and is already proven by the
+        // format checks. Newer contexts expose exact target-specific query
+        // results. Desktop GL 3.2 through 4.2 does not, so discover the same
+        // information once by attempting each exact allocation while this
+        // initialization thread still owns the context.
+        uint sampleCounts = Count1SampleMask;
+        if (maxSampleCount != TextureSampleCount.Count1)
+        {
+            uint queriedSampleCounts = Count1SampleMask;
+            bool querySucceeded = canQueryTargetSpecificSupport
+                && TryQueryMultisampleTextureSupport(
+                    format,
+                    depthFormat,
+                    target,
+                    maxSampleCount,
+                    out queriedSampleCounts);
+            if (querySucceeded)
+            {
+                sampleCounts = queriedSampleCounts;
+            }
+            else if (_backendType == GraphicsBackend.OpenGL)
+            {
+                sampleCounts = ProbeMultisampleTextureSupport(
+                    format,
+                    depthFormat,
+                    target,
+                    maxSampleCount);
+            }
+        }
+
+        _multisampleTextureSampleCounts.Add(
+            new MultisampleTextureSupportKey(format, depthFormat, target),
             sampleCounts);
+    }
+
+    private bool TryQueryMultisampleTextureSupport(
+        PixelFormat format,
+        bool depthFormat,
+        TextureTarget target,
+        TextureSampleCount maxSampleCount,
+        out uint sampleCounts)
+    {
+        sampleCounts = Count1SampleMask;
+        InternalFormat internalFormat = (InternalFormat)
+            OpenGLFormats.VdToGLSizedInternalFormat(format, depthFormat);
+
+        GL.GetInternalformat(
+            target,
+            internalFormat,
+            GLNumSampleCounts,
+            1,
+            out int numberOfSampleCounts);
+        if ((uint)GL.GetError() != 0
+            || numberOfSampleCounts < 0
+            || numberOfSampleCounts > 64)
+        {
+            return false;
+        }
+
+        if (numberOfSampleCounts == 0)
+            return true;
+
+        int* nativeSampleCounts = stackalloc int[numberOfSampleCounts];
+        GL.GetInternalformat(
+            target,
+            internalFormat,
+            GLSamples,
+            (uint)numberOfSampleCounts,
+            nativeSampleCounts);
+        if ((uint)GL.GetError() != 0)
+            return false;
+
+        uint maxSamples = FormatHelpers.GetSampleCountUInt32(maxSampleCount);
+        for (int index = 0; index < numberOfSampleCounts; index++)
+        {
+            int nativeSampleCount = nativeSampleCounts[index];
+            if (nativeSampleCount > 0 && (uint)nativeSampleCount <= maxSamples)
+            {
+                sampleCounts |= GetSampleCountBit((uint)nativeSampleCount);
+            }
+        }
+
         return true;
     }
+
+    private uint ProbeMultisampleTextureSupport(
+        PixelFormat format,
+        bool depthFormat,
+        TextureTarget target,
+        TextureSampleCount maxSampleCount)
+    {
+        uint sampleCounts = Count1SampleMask;
+        for (int count = (int)TextureSampleCount.Count2;
+            count <= (int)maxSampleCount;
+            count++)
+        {
+            TextureSampleCount sampleCount = (TextureSampleCount)count;
+            if (TryAllocateMultisampleTexture(
+                format,
+                depthFormat,
+                target,
+                sampleCount))
+            {
+                sampleCounts |= 1u << count;
+            }
+        }
+
+        return sampleCounts;
+    }
+
+    private bool TryAllocateMultisampleTexture(
+        PixelFormat format,
+        bool depthFormat,
+        TextureTarget target,
+        TextureSampleCount sampleCount)
+    {
+        bool directStateAccess = _extensions.ARB_DirectStateAccess;
+        int previousTexture = 0;
+        if (!directStateAccess)
+        {
+            GetPName bindingName = target switch
+            {
+                TextureTarget.Texture2DMultisample => (GetPName)0x9104, // GL_TEXTURE_BINDING_2D_MULTISAMPLE
+                TextureTarget.Texture2DMultisampleArray => (GetPName)0x9105, // GL_TEXTURE_BINDING_2D_MULTISAMPLE_ARRAY
+                _ => throw Illegal.Value<TextureTarget>(),
+            };
+            GL.GetInteger(bindingName, out previousTexture);
+            CheckInitializationError("multisample texture support probe binding query");
+        }
+
+        uint texture;
+        if (directStateAccess)
+        {
+            GL.CreateTextures(target, 1, out texture);
+        }
+        else
+        {
+            texture = GL.GenTexture();
+        }
+        CheckInitializationError("multisample texture support probe object creation");
+
+        try
+        {
+            if (!directStateAccess)
+            {
+                GL.BindTexture(target, texture);
+                CheckInitializationError("multisample texture support probe binding");
+            }
+
+            uint samples = FormatHelpers.GetSampleCountUInt32(sampleCount);
+            SizedInternalFormat sizedInternalFormat =
+                OpenGLFormats.VdToGLSizedInternalFormat(
+                    format,
+                    depthFormat);
+            InternalFormat mutableInternalFormat =
+                OpenGLTexture.GetMutableInternalFormat(
+                    format,
+                    depthFormat);
+            OpenGLTexture.AllocateMultisampleStorage(
+                GL,
+                _extensions,
+                texture,
+                target,
+                samples,
+                sizedInternalFormat,
+                mutableInternalFormat,
+                1,
+                1,
+                2);
+
+            // An allocation failure is the capability result being measured,
+            // not an initialization failure. Consume it here before restoring
+            // caller-visible state.
+            return ConsumeMultisampleTextureProbeErrors();
+        }
+        finally
+        {
+            if (!directStateAccess)
+            {
+                GL.BindTexture(target, unchecked((uint)previousTexture));
+                CheckInitializationError("multisample texture support probe binding restoration");
+            }
+            GL.DeleteTexture(texture);
+            CheckInitializationError("multisample texture support probe object deletion");
+        }
+    }
+
+    private bool ConsumeMultisampleTextureProbeErrors()
+    {
+        bool supported = true;
+        uint error;
+        while ((error = (uint)GL.GetError()) != 0)
+        {
+            // These are the specified ways an exact target, internal format,
+            // or sample count can be rejected. Resource exhaustion and
+            // context loss are device-initialization failures, not evidence
+            // that this particular descriptor is unsupported.
+            if (error != 0x0500 // GL_INVALID_ENUM
+                && error != 0x0501 // GL_INVALID_VALUE
+                && error != 0x0502) // GL_INVALID_OPERATION
+            {
+                throw new NeoVeldridException(
+                    "OpenGL initialization failed during the multisample "
+                    + "texture support probe: glGetError returned "
+                    + $"{(ErrorCode)error}.");
+            }
+
+            supported = false;
+        }
+
+        return supported;
+    }
+
+    private uint GetMultisampleTextureSampleCounts(
+        PixelFormat format,
+        bool depthFormat,
+        TextureTarget target)
+    {
+        return _multisampleTextureSampleCounts.TryGetValue(
+            new MultisampleTextureSupportKey(format, depthFormat, target),
+            out uint sampleCounts)
+                ? sampleCounts
+                : Count1SampleMask;
+    }
+
+    private void GetTextureLimits(
+        in TextureDescription description,
+        bool isCubemap,
+        out uint maxWidth,
+        out uint maxHeight,
+        out uint maxDepth,
+        out uint maxMipLevels,
+        out uint maxArrayLayers)
+    {
+        if (description.Type == TextureType.Texture1D)
+        {
+            maxWidth = _maxTextureSize;
+            maxHeight = 1;
+            maxDepth = 1;
+            maxArrayLayers = SupportsTextureArrays() ? _maxTexArrayLayers : 1;
+        }
+        else if (description.Type == TextureType.Texture2D)
+        {
+            maxWidth = isCubemap ? _maxCubeMapTextureSize : _maxTextureSize;
+            maxHeight = maxWidth;
+            maxDepth = 1;
+            if (isCubemap)
+            {
+                maxArrayLayers = CanMaterializeCubeMapArrays()
+                    ? Math.Max(1u, _maxTexArrayLayers / 6u)
+                    : 1u;
+            }
+            else
+            {
+                maxArrayLayers = SupportsTextureArrays()
+                    ? _maxTexArrayLayers
+                    : 1u;
+            }
+        }
+        else
+        {
+            maxWidth = _maxTexDepth;
+            maxHeight = _maxTexDepth;
+            maxDepth = _maxTexDepth;
+            maxArrayLayers = 1;
+        }
+
+        if (description.SampleCount != TextureSampleCount.Count1
+            && !SupportsMultisampleArrayTextures())
+        {
+            maxArrayLayers = Math.Min(maxArrayLayers, 1u);
+        }
+
+        maxMipLevels = description.SampleCount == TextureSampleCount.Count1
+            ? GetMipLevelCount(Math.Max(maxWidth, Math.Max(maxHeight, maxDepth)))
+            : 1u;
+    }
+
+    private bool IsOpenGLESColorRenderable(PixelFormat format)
+        => IsOpenGLESColorRenderable(format, _extensions);
+
+    internal static bool IsOpenGLESColorRenderable(
+        PixelFormat format,
+        OpenGLExtensions extensions)
+    {
+        if (FormatHelpers.IsCompressedFormat(format)
+            || FormatHelpers.IsStencilFormat(format))
+        {
+            return false;
+        }
+
+        if (IsOpenGLESSignedNormalizedFormat(format)
+            && !extensions.EXT_RenderSNorm)
+        {
+            return false;
+        }
+
+        if (IsOpenGLESNormalized16Format(format))
+        {
+            return extensions.EXT_TextureNorm16;
+        }
+
+        if (format == PixelFormat.R11_G11_B10_Float)
+        {
+            return extensions.EXT_ColorBufferFloat;
+        }
+
+        if (IsHalfFloatTextureFormat(format))
+        {
+            return extensions.EXT_ColorBufferHalfFloat
+                || extensions.EXT_ColorBufferFloat;
+        }
+
+        if (Is32BitFloatTextureFormat(format))
+        {
+            return extensions.EXT_ColorBufferFloat;
+        }
+
+        // Unsigned-normalized and integer ES 3 formats are color-renderable
+        // in the core format tables. Signed-normalized and floating-point
+        // renderability are supplied only by their extensions above.
+        return true;
+    }
+
+    private bool IsOpenGLESTextureFilterable(PixelFormat format)
+    {
+        if (IsIntegerTextureFormat(format))
+            return false;
+
+        if (Is32BitFloatTextureFormat(format))
+        {
+            return _extensions.IsExtensionSupported(
+                "GL_OES_texture_float_linear");
+        }
+
+        return true;
+    }
+
+    private static bool IsStorageFormatImplemented(
+        PixelFormat format,
+        bool isOpenGLES)
+    {
+        if (FormatHelpers.IsCompressedFormat(format)
+            || IsSrgbFormat(format))
+        {
+            return false;
+        }
+
+        if (!isOpenGLES)
+            return true;
+
+        // These are the storage-image format qualifiers implemented by the
+        // GLES shader and BindImageTexture paths. Other native image formats
+        // are not part of the backend's portable shader contract.
+        switch (format)
+        {
+            case PixelFormat.R32_Float:
+            case PixelFormat.R32_UInt:
+            case PixelFormat.R32_SInt:
+            case PixelFormat.R8_G8_B8_A8_UNorm:
+            case PixelFormat.R8_G8_B8_A8_SNorm:
+            case PixelFormat.R8_G8_B8_A8_UInt:
+            case PixelFormat.R8_G8_B8_A8_SInt:
+            case PixelFormat.R16_G16_B16_A16_Float:
+            case PixelFormat.R16_G16_B16_A16_UInt:
+            case PixelFormat.R16_G16_B16_A16_SInt:
+            case PixelFormat.R32_G32_B32_A32_Float:
+            case PixelFormat.R32_G32_B32_A32_UInt:
+            case PixelFormat.R32_G32_B32_A32_SInt:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private static bool IsOpenGLESBackendExcludedFormat(PixelFormat format)
+    {
+        switch (format)
+        {
+            case PixelFormat.B8_G8_R8_A8_UNorm:
+            case PixelFormat.B8_G8_R8_A8_UNorm_SRgb:
+            case PixelFormat.R10_G10_B10_A2_UNorm:
+            case PixelFormat.R10_G10_B10_A2_UInt:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private static bool RequiresOpenGLESNormalized16Extension(
+        PixelFormat format,
+        bool isDepthStencil) =>
+        !(isDepthStencil && format == PixelFormat.R16_UNorm)
+        && IsOpenGLESNormalized16Format(format);
+
+    private static bool IsOpenGLESNormalized16Format(PixelFormat format) =>
+        format == PixelFormat.R16_UNorm
+        || format == PixelFormat.R16_SNorm
+        || format == PixelFormat.R16_G16_UNorm
+        || format == PixelFormat.R16_G16_SNorm
+        || format == PixelFormat.R16_G16_B16_A16_UNorm
+        || format == PixelFormat.R16_G16_B16_A16_SNorm;
+
+    private static bool IsOpenGLESSignedNormalizedFormat(PixelFormat format) =>
+        format == PixelFormat.R8_SNorm
+        || format == PixelFormat.R8_G8_SNorm
+        || format == PixelFormat.R8_G8_B8_A8_SNorm
+        || format == PixelFormat.R16_SNorm
+        || format == PixelFormat.R16_G16_SNorm
+        || format == PixelFormat.R16_G16_B16_A16_SNorm;
+
+    private static bool IsIntegerTextureFormat(PixelFormat format)
+    {
+        switch (format)
+        {
+            case PixelFormat.R8_UInt:
+            case PixelFormat.R8_SInt:
+            case PixelFormat.R16_UInt:
+            case PixelFormat.R16_SInt:
+            case PixelFormat.R32_UInt:
+            case PixelFormat.R32_SInt:
+            case PixelFormat.R8_G8_UInt:
+            case PixelFormat.R8_G8_SInt:
+            case PixelFormat.R16_G16_UInt:
+            case PixelFormat.R16_G16_SInt:
+            case PixelFormat.R32_G32_UInt:
+            case PixelFormat.R32_G32_SInt:
+            case PixelFormat.R8_G8_B8_A8_UInt:
+            case PixelFormat.R8_G8_B8_A8_SInt:
+            case PixelFormat.R16_G16_B16_A16_UInt:
+            case PixelFormat.R16_G16_B16_A16_SInt:
+            case PixelFormat.R32_G32_B32_A32_UInt:
+            case PixelFormat.R32_G32_B32_A32_SInt:
+            case PixelFormat.R10_G10_B10_A2_UInt:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private static bool IsHalfFloatTextureFormat(PixelFormat format) =>
+        format == PixelFormat.R16_Float
+        || format == PixelFormat.R16_G16_Float
+        || format == PixelFormat.R16_G16_B16_A16_Float;
+
+    private static bool Is32BitFloatTextureFormat(PixelFormat format) =>
+        format == PixelFormat.R32_Float
+        || format == PixelFormat.R32_G32_Float
+        || format == PixelFormat.R32_G32_B32_A32_Float;
+
+    private static bool IsSrgbFormat(PixelFormat format)
+    {
+        switch (format)
+        {
+            case PixelFormat.R8_G8_B8_A8_UNorm_SRgb:
+            case PixelFormat.B8_G8_R8_A8_UNorm_SRgb:
+            case PixelFormat.BC1_Rgb_UNorm_SRgb:
+            case PixelFormat.BC1_Rgba_UNorm_SRgb:
+            case PixelFormat.BC2_UNorm_SRgb:
+            case PixelFormat.BC3_UNorm_SRgb:
+            case PixelFormat.BC7_UNorm_SRgb:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private static TextureSampleCount GetTextureSampleCountLimit(int sampleCount)
+    {
+        if (sampleCount >= 32) return TextureSampleCount.Count32;
+        if (sampleCount >= 16) return TextureSampleCount.Count16;
+        if (sampleCount >= 8) return TextureSampleCount.Count8;
+        if (sampleCount >= 4) return TextureSampleCount.Count4;
+        if (sampleCount >= 2) return TextureSampleCount.Count2;
+        return TextureSampleCount.Count1;
+    }
+
+    private static uint GetSampleCountBit(uint sampleCount)
+    {
+        return sampleCount switch
+        {
+            1 => 1u << (int)TextureSampleCount.Count1,
+            2 => 1u << (int)TextureSampleCount.Count2,
+            4 => 1u << (int)TextureSampleCount.Count4,
+            8 => 1u << (int)TextureSampleCount.Count8,
+            16 => 1u << (int)TextureSampleCount.Count16,
+            32 => 1u << (int)TextureSampleCount.Count32,
+            _ => 0,
+        };
+    }
+
+    private static TextureSampleCount GetMaximumSampleCount(uint sampleCounts)
+    {
+        for (int sampleCount = (int)TextureSampleCount.Count32;
+            sampleCount > (int)TextureSampleCount.Count1;
+            sampleCount--)
+        {
+            if ((sampleCounts & (1u << sampleCount)) != 0)
+                return (TextureSampleCount)sampleCount;
+        }
+
+        return TextureSampleCount.Count1;
+    }
+
+    private static uint GetMipLevelCount(uint maxDimension)
+    {
+        uint mipLevels = 0;
+        do
+        {
+            mipLevels++;
+            maxDimension >>= 1;
+        }
+        while (maxDimension != 0);
+
+        return mipLevels;
+    }
+
+    private static TextureSupportResult UnsupportedTexture(
+        TextureSupportClassification classification,
+        TextureSupportReason reason) =>
+        TextureSupportResult.Unsupported(classification, reason);
+
+    private readonly record struct MultisampleTextureSupportKey(
+        PixelFormat Format,
+        bool DepthFormat,
+        TextureTarget Target);
 
     protected override MappedResource MapCore(MappableResource resource, MapMode mode, uint subresource)
     {
