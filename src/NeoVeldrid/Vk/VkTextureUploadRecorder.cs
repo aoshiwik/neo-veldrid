@@ -17,6 +17,7 @@ internal static unsafe class VkTextureUploadRecorder
         CommandBuffer commandBuffer,
         VkBuffer source,
         uint sourceOffset,
+        uint sourceSizeInBytes,
         VkTexture destination,
         uint x,
         uint y,
@@ -65,6 +66,12 @@ internal static unsafe class VkTextureUploadRecorder
             },
             ImageSubresource = destinationSubresource
         };
+        VkBufferTransferAccess.BeginTransferRead(
+            graphicsDevice.Vk,
+            commandBuffer,
+            source.DeviceBuffer,
+            sourceOffset,
+            sourceSizeInBytes);
         graphicsDevice.Vk.CmdCopyBufferToImage(
             commandBuffer,
             source.DeviceBuffer,
@@ -72,6 +79,12 @@ internal static unsafe class VkTextureUploadRecorder
             ImageLayout.TransferDstOptimal,
             1,
             in region);
+        VkBufferTransferAccess.EndTransferRead(
+            graphicsDevice.Vk,
+            commandBuffer,
+            source.DeviceBuffer,
+            sourceOffset,
+            sourceSizeInBytes);
 
         RestoreImageAfterTransferWrite(
             commandBuffer,

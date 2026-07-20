@@ -256,6 +256,61 @@ internal unsafe static class VulkanUtil
             destination.Stages);
     }
 
+    /// <summary>
+    /// Creates the external dependency which orders a render pass's attachment
+    /// prior uses and this render pass's attachment loads. A render pass with
+    /// an explicit external dependency no longer receives Vulkan's implicit
+    /// one, so its source must cover every way the image could have been used
+    /// before the pass, including shader, compute, transfer, and attachment
+    /// access. The destination remains the exact attachment load/write stages.
+    /// </summary>
+    internal static SubpassDependency CreateRenderPassAttachmentDependency(
+        bool hasColorAttachments,
+        bool hasDepthStencilAttachment)
+    {
+        if (!hasColorAttachments && !hasDepthStencilAttachment)
+        {
+            throw new NeoVeldridException(
+                "A Vulkan attachment dependency requires at least one color or depth-stencil attachment.");
+        }
+
+        PipelineStageFlags sourceStages = PipelineStageFlags.AllCommandsBit;
+        PipelineStageFlags destinationStages = PipelineStageFlags.None;
+        AccessFlags sourceAccess =
+            AccessFlags.MemoryReadBit |
+            AccessFlags.MemoryWriteBit;
+        AccessFlags destinationAccess = AccessFlags.None;
+
+        if (hasColorAttachments)
+        {
+            // Color loads and stores execute in ColorAttachmentOutput.
+            destinationStages |= PipelineStageFlags.ColorAttachmentOutputBit;
+            destinationAccess |=
+                AccessFlags.ColorAttachmentReadBit
+                | AccessFlags.ColorAttachmentWriteBit;
+        }
+
+        if (hasDepthStencilAttachment)
+        {
+            // Loads, including loadOp Clear, execute in early fragment tests
+            // before all subsequent depth/stencil attachment access.
+            destinationStages |= PipelineStageFlags.EarlyFragmentTestsBit;
+            destinationAccess |=
+                AccessFlags.DepthStencilAttachmentReadBit
+                | AccessFlags.DepthStencilAttachmentWriteBit;
+        }
+
+        return new SubpassDependency
+        {
+            SrcSubpass = VkApi.SubpassExternal,
+            DstSubpass = 0,
+            SrcStageMask = sourceStages,
+            DstStageMask = destinationStages,
+            SrcAccessMask = sourceAccess,
+            DstAccessMask = destinationAccess
+        };
+    }
+
     private static VkImageLayoutAccessScope DescribeImageLayoutAccess(
         ImageLayout layout,
         bool isSource)

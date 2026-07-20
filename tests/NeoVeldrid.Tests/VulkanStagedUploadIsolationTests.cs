@@ -989,6 +989,46 @@ public sealed class VulkanStagedUploadIsolationTests
         {
             GD.Unmap(capture);
         }
+
+        Texture stagingTexture = RF.CreateTexture(TextureDescription.Texture2D(
+            2,
+            2,
+            1,
+            1,
+            PixelFormat.R8_UNorm,
+            TextureUsage.Staging));
+        Texture deviceTexture = RF.CreateTexture(TextureDescription.Texture2D(
+            2,
+            2,
+            1,
+            1,
+            PixelFormat.R8_UNorm,
+            TextureUsage.Sampled));
+        GD.UpdateTexture(
+            stagingTexture,
+            new byte[] { 1, 2, 3, 4 },
+            0, 0, 0,
+            2, 2, 1,
+            0, 0);
+
+        commandList.Begin();
+        commandList.CopyTexture(stagingTexture, deviceTexture);
+        commandList.End();
+
+        GD.Map(stagingTexture, MapMode.Write);
+        try
+        {
+            NeoVeldridException error = Assert.Throws<NeoVeldridException>(
+                () => GD.SubmitCommands(commandList));
+            Assert.Contains("host access is active", error.Message);
+        }
+        finally
+        {
+            GD.Unmap(stagingTexture);
+        }
+
+        GD.SubmitCommands(commandList);
+        GD.WaitForIdle();
     }
 
     [Fact]

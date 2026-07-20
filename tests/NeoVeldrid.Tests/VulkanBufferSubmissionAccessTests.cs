@@ -10,7 +10,7 @@ public sealed class VulkanBufferSubmissionAccessTests
     [Fact]
     public void HostWriteIsAllowedWithoutSubmissionUse()
     {
-        var access = new VkBufferSubmissionAccess();
+        var access = new VkMappableResourceSubmissionAccess();
 
         access.BeginHostWrite("buffer");
 
@@ -24,7 +24,7 @@ public sealed class VulkanBufferSubmissionAccessTests
     [Fact]
     public void HostWriteIsRejectedUntilEverySubmissionUseCompletes()
     {
-        var access = new VkBufferSubmissionAccess();
+        var access = new VkMappableResourceSubmissionAccess();
         access.BeginSubmissionUse();
         access.BeginSubmissionUse();
 
@@ -44,7 +44,7 @@ public sealed class VulkanBufferSubmissionAccessTests
     [Fact]
     public void SubmissionUseCannotBeginDuringHostWrite()
     {
-        var access = new VkBufferSubmissionAccess();
+        var access = new VkMappableResourceSubmissionAccess();
         access.BeginHostWrite("shared");
 
         Assert.Throws<NeoVeldridException>(access.BeginSubmissionUse);
@@ -58,7 +58,7 @@ public sealed class VulkanBufferSubmissionAccessTests
     [Fact]
     public void RepeatedHostMapsShareOneExclusiveHostAccessPeriod()
     {
-        var access = new VkBufferSubmissionAccess();
+        var access = new VkMappableResourceSubmissionAccess();
 
         access.BeginHostMap("shared");
         access.BeginHostMap("shared");
@@ -80,7 +80,7 @@ public sealed class VulkanBufferSubmissionAccessTests
     [Fact]
     public void HostMapIsRejectedUntilEverySubmissionUseCompletes()
     {
-        var access = new VkBufferSubmissionAccess();
+        var access = new VkMappableResourceSubmissionAccess();
         access.BeginSubmissionUse();
         access.BeginSubmissionUse();
 
@@ -97,7 +97,7 @@ public sealed class VulkanBufferSubmissionAccessTests
     [Fact]
     public void UnbalancedReleasesAreRejected()
     {
-        var access = new VkBufferSubmissionAccess();
+        var access = new VkMappableResourceSubmissionAccess();
 
         Assert.Throws<NeoVeldridException>(access.EndSubmissionUse);
         Assert.Throws<NeoVeldridException>(access.EndHostWrite);

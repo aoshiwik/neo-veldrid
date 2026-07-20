@@ -312,18 +312,22 @@ internal unsafe class VkPipeline : Pipeline
             attachments[attachmentCount++] = depthAttachmentDesc;
         }
 
-        SubpassDependency subpassDependency = new SubpassDependency();
-        subpassDependency.SrcSubpass = Silk.NET.Vulkan.Vk.SubpassExternal;
-        subpassDependency.SrcStageMask = PipelineStageFlags.ColorAttachmentOutputBit;
-        subpassDependency.DstStageMask = PipelineStageFlags.ColorAttachmentOutputBit;
-        subpassDependency.DstAccessMask = AccessFlags.ColorAttachmentReadBit | AccessFlags.ColorAttachmentWriteBit;
+        bool hasRenderPassAttachments = attachmentCount != 0;
+        SubpassDependency subpassDependency = hasRenderPassAttachments
+            ? CreateRenderPassAttachmentDependency(
+                hasColorAttachments: outputDesc.ColorAttachments.Length != 0,
+                hasDepthStencilAttachment: outputDesc.DepthAttachment != null)
+            : default;
 
         renderPassCI.AttachmentCount = attachmentCount;
         renderPassCI.PAttachments = attachments;
         renderPassCI.SubpassCount = 1;
         renderPassCI.PSubpasses = &subpass;
-        renderPassCI.DependencyCount = 1;
-        renderPassCI.PDependencies = &subpassDependency;
+        if (hasRenderPassAttachments)
+        {
+            renderPassCI.DependencyCount = 1;
+            renderPassCI.PDependencies = &subpassDependency;
+        }
 
         Result creationResult = _gd.Vk.CreateRenderPass(_gd.Device, in renderPassCI, null, out _renderPass);
         CheckResult(creationResult);

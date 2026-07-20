@@ -182,21 +182,21 @@ internal unsafe class VkCommandList : CommandList
     {
         StagingResourceInfo info = _currentStagingInfo;
         info.ImageLayouts.ValidateSubmissionOrder();
-        foreach (VkBuffer buffer in info.Buffers)
+        foreach (VkMappableResourceSubmissionAccess access in info.SubmissionAccesses)
         {
             try
             {
-                buffer.SubmissionAccess.BeginSubmissionUse();
-                info.AcquiredBuffers.Add(buffer);
+                access.BeginSubmissionUse();
+                info.AcquiredSubmissionAccesses.Add(access);
             }
             catch
             {
-                for (int i = info.AcquiredBuffers.Count - 1; i >= 0; i--)
+                for (int i = info.AcquiredSubmissionAccesses.Count - 1; i >= 0; i--)
                 {
-                    info.AcquiredBuffers[i].SubmissionAccess.EndSubmissionUse();
+                    info.AcquiredSubmissionAccesses[i].EndSubmissionUse();
                 }
 
-                info.AcquiredBuffers.Clear();
+                info.AcquiredSubmissionAccesses.Clear();
                 throw;
             }
         }
@@ -301,9 +301,9 @@ internal unsafe class VkCommandList : CommandList
             return false;
 
         info.SubmissionReferencesAcquired = false;
-        for (int i = info.AcquiredBuffers.Count - 1; i >= 0; i--)
-            info.AcquiredBuffers[i].SubmissionAccess.EndSubmissionUse();
-        info.AcquiredBuffers.Clear();
+        for (int i = info.AcquiredSubmissionAccesses.Count - 1; i >= 0; i--)
+            info.AcquiredSubmissionAccesses[i].EndSubmissionUse();
+        info.AcquiredSubmissionAccesses.Clear();
 
         foreach (ResourceRefCount resource in info.Resources)
             resource.Decrement();
@@ -908,7 +908,14 @@ internal unsafe class VkCommandList : CommandList
     private void TrackBuffer(VkBuffer buffer)
     {
         _currentStagingInfo.Resources.Add(buffer.RefCount);
-        _currentStagingInfo.Buffers.Add(buffer);
+        _currentStagingInfo.SubmissionAccesses.Add(buffer.SubmissionAccess);
+    }
+
+    private void TrackTexture(VkTexture texture)
+    {
+        _currentStagingInfo.Resources.Add(texture.RefCount);
+        if ((texture.Usage & TextureUsage.Staging) != 0)
+            _currentStagingInfo.SubmissionAccesses.Add(texture.SubmissionAccess);
     }
 
     private protected override void SetIndexBufferCore(DeviceBuffer buffer, IndexFormat format, uint offset)
@@ -1066,6 +1073,7 @@ internal unsafe class VkCommandList : CommandList
             _cb,
             staging.Buffer,
             staging.Offset,
+            sizeInBytes,
             destination,
             x,
             y,
@@ -1124,9 +1132,9 @@ internal unsafe class VkCommandList : CommandList
             _currentStagingInfo.ImageLayouts);
 
         VkTexture srcVkTexture = Util.AssertSubtype<Texture, VkTexture>(source);
-        _currentStagingInfo.Resources.Add(srcVkTexture.RefCount);
+        TrackTexture(srcVkTexture);
         VkTexture dstVkTexture = Util.AssertSubtype<Texture, VkTexture>(destination);
-        _currentStagingInfo.Resources.Add(dstVkTexture.RefCount);
+        TrackTexture(dstVkTexture);
     }
 
     internal static void CopyTextureCore_VkCommandBuffer(
@@ -1271,7 +1279,9 @@ internal unsafe class VkCommandList : CommandList
                 ImageSubresource = dstSubresource
             };
 
+            VkBufferTransferAccess.BeginTransferRead(vk, cb, srcBuffer);
             vk.CmdCopyBufferToImage(cb, srcBuffer, dstImage, ImageLayout.TransferDstOptimal, 1, in regions);
+            VkBufferTransferAccess.EndTransferRead(vk, cb, srcBuffer);
 
             VkTextureUploadRecorder.RestoreImageAfterTransferWrite(
                 cb,
@@ -1339,7 +1349,9 @@ internal unsafe class VkCommandList : CommandList
                 layers[layer] = region;
             }
 
+            VkBufferTransferAccess.BeginTransferWrite(vk, cb, dstBuffer);
             vk.CmdCopyImageToBuffer(cb, srcImage, ImageLayout.TransferSrcOptimal, dstBuffer, layerCount, layers);
+            VkBufferTransferAccess.EndTransferWrite(vk, cb, dstBuffer);
 
             VkTextureUploadRecorder.RestoreImageAfterTransferRead(
                 cb,
@@ -1355,6 +1367,9 @@ internal unsafe class VkCommandList : CommandList
             VkBufferHandle dstBuffer = dstVkTexture.StagingBuffer;
             SubresourceLayout dstLayout = dstVkTexture.GetSubresourceLayout(
                 dstVkTexture.CalculateSubresource(dstMipLevel, dstBaseArrayLayer));
+
+            VkBufferTransferAccess.BeginTransferRead(vk, cb, srcBuffer);
+            VkBufferTransferAccess.BeginTransferWrite(vk, cb, dstBuffer);
 
             uint zLimit = Math.Max(depth, layerCount);
             if (!FormatHelpers.IsCompressedFormat(source.Format))
@@ -1413,6 +1428,9 @@ internal unsafe class VkCommandList : CommandList
                 }
 
             }
+
+            VkBufferTransferAccess.EndTransferRead(vk, cb, srcBuffer);
+            VkBufferTransferAccess.EndTransferWrite(vk, cb, dstBuffer);
         }
     }
 
@@ -1782,8 +1800,8 @@ internal unsafe class VkCommandList : CommandList
         public uint Slot { get; }
         public List<VkBuffer> BuffersUsed { get; }
         public HashSet<ResourceRefCount> Resources { get; }
-        public HashSet<VkBuffer> Buffers { get; }
-        public List<VkBuffer> AcquiredBuffers { get; }
+        public HashSet<VkMappableResourceSubmissionAccess> SubmissionAccesses { get; }
+        public List<VkMappableResourceSubmissionAccess> AcquiredSubmissionAccesses { get; }
         public VkBuffer CurrentUploadBuffer { get; set; }
         public uint CurrentUploadOffset { get; set; }
         public bool SubmissionReferencesAcquired { get; set; }
@@ -1799,10 +1817,11 @@ internal unsafe class VkCommandList : CommandList
             Resources = new HashSet<ResourceRefCount>(
                 initialTrackedResourceCapacity,
                 ReferenceEqualityComparer.Instance);
-            Buffers = new HashSet<VkBuffer>(
+            SubmissionAccesses = new HashSet<VkMappableResourceSubmissionAccess>(
                 initialTrackedResourceCapacity,
                 ReferenceEqualityComparer.Instance);
-            AcquiredBuffers = new List<VkBuffer>(initialTrackedResourceCapacity);
+            AcquiredSubmissionAccesses =
+                new List<VkMappableResourceSubmissionAccess>(initialTrackedResourceCapacity);
         }
 
         public void Clear()
@@ -1810,8 +1829,8 @@ internal unsafe class VkCommandList : CommandList
             ImageLayouts.ResetForReuse();
             BuffersUsed.Clear();
             Resources.Clear();
-            Buffers.Clear();
-            AcquiredBuffers.Clear();
+            SubmissionAccesses.Clear();
+            AcquiredSubmissionAccesses.Clear();
             CurrentUploadBuffer = null;
             CurrentUploadOffset = 0u;
             SubmissionReferencesAcquired = false;

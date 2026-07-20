@@ -111,11 +111,10 @@ internal unsafe class VkFramebuffer : VkFramebufferBase
             attachments[attachmentCount++] = depthAttachmentDesc;
         }
 
-        SubpassDependency subpassDependency = new SubpassDependency();
-        subpassDependency.SrcSubpass = Silk.NET.Vulkan.Vk.SubpassExternal;
-        subpassDependency.SrcStageMask = PipelineStageFlags.ColorAttachmentOutputBit;
-        subpassDependency.DstStageMask = PipelineStageFlags.ColorAttachmentOutputBit;
-        subpassDependency.DstAccessMask = AccessFlags.ColorAttachmentReadBit | AccessFlags.ColorAttachmentWriteBit;
+        SubpassDependency subpassDependency =
+            CreateRenderPassAttachmentDependency(
+                hasColorAttachments: colorAttachmentCount != 0,
+                hasDepthStencilAttachment: DepthTarget != null);
 
         renderPassCI.AttachmentCount = attachmentCount;
         renderPassCI.PAttachments = attachments;

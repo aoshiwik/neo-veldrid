@@ -101,6 +101,29 @@ public sealed class VulkanImageLayoutTransitionTests
             PipelineStageFlags.EarlyFragmentTestsBit |
             PipelineStageFlags.LateFragmentTestsBit,
             depth.DestinationStages);
+
+        SubpassDependency attachmentDependency =
+            VulkanUtil.CreateRenderPassAttachmentDependency(
+                hasColorAttachments: true,
+                hasDepthStencilAttachment: true);
+
+        Assert.Equal(Silk.NET.Vulkan.Vk.SubpassExternal, attachmentDependency.SrcSubpass);
+        Assert.Equal(0u, attachmentDependency.DstSubpass);
+        Assert.Equal(PipelineStageFlags.AllCommandsBit, attachmentDependency.SrcStageMask);
+        Assert.Equal(
+            PipelineStageFlags.ColorAttachmentOutputBit |
+            PipelineStageFlags.EarlyFragmentTestsBit,
+            attachmentDependency.DstStageMask);
+        Assert.Equal(
+            AccessFlags.MemoryReadBit |
+            AccessFlags.MemoryWriteBit,
+            attachmentDependency.SrcAccessMask);
+        Assert.Equal(
+            AccessFlags.ColorAttachmentReadBit |
+            AccessFlags.ColorAttachmentWriteBit |
+            AccessFlags.DepthStencilAttachmentReadBit |
+            AccessFlags.DepthStencilAttachmentWriteBit,
+            attachmentDependency.DstAccessMask);
     }
 
     [Fact]

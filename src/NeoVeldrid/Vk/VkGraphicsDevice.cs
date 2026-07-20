@@ -1746,6 +1746,7 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
     {
         VkMemoryBlock memoryBlock = default(VkMemoryBlock);
         VkBuffer mappedBuffer = null;
+        VkTexture mappedTexture = null;
         IntPtr mappedPtr = IntPtr.Zero;
         uint sizeInBytes;
         uint offset = 0;
@@ -1762,12 +1763,23 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
         else
         {
             VkTexture texture = Util.AssertSubtype<MappableResource, VkTexture>(resource);
-            SubresourceLayout layout = texture.GetSubresourceLayout(subresource);
-            memoryBlock = texture.Memory;
-            sizeInBytes = (uint)layout.Size;
-            offset = (uint)layout.Offset;
-            rowPitch = (uint)layout.RowPitch;
-            depthPitch = (uint)layout.DepthPitch;
+            ReclaimCompletedSubmissions();
+            texture.SubmissionAccess.BeginHostMap(texture.Name);
+            try
+            {
+                SubresourceLayout layout = texture.GetSubresourceLayout(subresource);
+                memoryBlock = texture.Memory;
+                sizeInBytes = (uint)layout.Size;
+                offset = (uint)layout.Offset;
+                rowPitch = (uint)layout.RowPitch;
+                depthPitch = (uint)layout.DepthPitch;
+                mappedTexture = texture;
+            }
+            catch
+            {
+                texture.SubmissionAccess.EndHostMap();
+                throw;
+            }
         }
 
         try
@@ -1802,6 +1814,7 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
         catch
         {
             mappedBuffer?.SubmissionAccess.EndHostMap();
+            mappedTexture?.SubmissionAccess.EndHostMap();
             throw;
         }
     }
@@ -1810,6 +1823,7 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
     {
         VkMemoryBlock memoryBlock = default(VkMemoryBlock);
         VkBuffer mappedBuffer = null;
+        VkTexture mappedTexture = null;
         if (resource is VkBuffer buffer)
         {
             mappedBuffer = buffer;
@@ -1818,6 +1832,7 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
         else
         {
             VkTexture tex = Util.AssertSubtype<MappableResource, VkTexture>(resource);
+            mappedTexture = tex;
             memoryBlock = tex.Memory;
         }
 
@@ -1831,6 +1846,7 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
         finally
         {
             mappedBuffer?.SubmissionAccess.EndHostMap();
+            mappedTexture?.SubmissionAccess.EndHostMap();
         }
     }
 
@@ -2410,22 +2426,31 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
         bool isStaging = (vkTex.Usage & TextureUsage.Staging) != 0;
         if (isStaging)
         {
-            VkMemoryBlock memBlock = vkTex.Memory;
-            uint subresource = texture.CalculateSubresource(mipLevel, arrayLayer);
-            SubresourceLayout layout = vkTex.GetSubresourceLayout(subresource);
-            byte* imageBasePtr = (byte*)memBlock.BlockMappedPointer + layout.Offset;
+            ReclaimCompletedSubmissions();
+            vkTex.SubmissionAccess.BeginHostWrite(vkTex.Name);
+            try
+            {
+                VkMemoryBlock memBlock = vkTex.Memory;
+                uint subresource = texture.CalculateSubresource(mipLevel, arrayLayer);
+                SubresourceLayout layout = vkTex.GetSubresourceLayout(subresource);
+                byte* imageBasePtr = (byte*)memBlock.BlockMappedPointer + layout.Offset;
 
-            uint srcRowPitch = FormatHelpers.GetRowPitch(width, texture.Format);
-            uint srcDepthPitch = FormatHelpers.GetDepthPitch(srcRowPitch, height, texture.Format);
-            Util.CopyTextureRegion(
-                source.ToPointer(),
-                0, 0, 0,
-                srcRowPitch, srcDepthPitch,
-                imageBasePtr,
-                x, y, z,
-                (uint)layout.RowPitch, (uint)layout.DepthPitch,
-                width, height, depth,
-                texture.Format);
+                uint srcRowPitch = FormatHelpers.GetRowPitch(width, texture.Format);
+                uint srcDepthPitch = FormatHelpers.GetDepthPitch(srcRowPitch, height, texture.Format);
+                Util.CopyTextureRegion(
+                    source.ToPointer(),
+                    0, 0, 0,
+                    srcRowPitch, srcDepthPitch,
+                    imageBasePtr,
+                    x, y, z,
+                    (uint)layout.RowPitch, (uint)layout.DepthPitch,
+                    width, height, depth,
+                    texture.Format);
+            }
+            finally
+            {
+                vkTex.SubmissionAccess.EndHostWrite();
+            }
         }
         else
         {
@@ -2821,6 +2846,7 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
         private readonly VkBuffer _retainedBuffer;
 
         private bool _commandListPrepared;
+        private bool _stagingTextureLeaseAcquired;
         private bool _retainedBufferLeaseAcquired;
         private bool _retainedBufferReferenceAcquired;
         private bool _terminal;
@@ -2844,6 +2870,7 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
             _stagingBuffer = stagingBuffer;
             _retainedBuffer = retainedBuffer;
             _commandListPrepared = false;
+            _stagingTextureLeaseAcquired = false;
             _retainedBufferLeaseAcquired = false;
             _retainedBufferReferenceAcquired = false;
             _terminal = false;
@@ -2851,7 +2878,10 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
 
         public void PrepareForSubmission()
         {
-            if (_terminal || _commandListPrepared || _retainedBufferLeaseAcquired)
+            if (_terminal ||
+                _commandListPrepared ||
+                _stagingTextureLeaseAcquired ||
+                _retainedBufferLeaseAcquired)
             {
                 throw new NeoVeldridException(
                     "Vulkan submission resources cannot be prepared more than once.");
@@ -2865,6 +2895,12 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
                 {
                     _commandList.CommandBufferSubmitted(_commandBuffer);
                     _commandListPrepared = true;
+                }
+
+                if (_stagingTexture != null)
+                {
+                    _stagingTexture.SubmissionAccess.BeginSubmissionUse();
+                    _stagingTextureLeaseAcquired = true;
                 }
 
                 if (_retainedBuffer != null)
@@ -2920,8 +2956,16 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
                 {
                     try
                     {
-                        if (_retainedBufferLeaseAcquired)
-                            _retainedBuffer.SubmissionAccess.EndSubmissionUse();
+                        try
+                        {
+                            if (_retainedBufferLeaseAcquired)
+                                _retainedBuffer.SubmissionAccess.EndSubmissionUse();
+                        }
+                        finally
+                        {
+                            if (_stagingTextureLeaseAcquired)
+                                _stagingTexture.SubmissionAccess.EndSubmissionUse();
+                        }
                     }
                     finally
                     {

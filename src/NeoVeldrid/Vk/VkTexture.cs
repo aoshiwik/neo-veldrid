@@ -44,6 +44,8 @@ internal unsafe class VkTexture : Texture
 
     public Image OptimalDeviceImage => _optimalImage;
     public Silk.NET.Vulkan.Buffer StagingBuffer => _stagingBuffer;
+    public VkMappableResourceSubmissionAccess SubmissionAccess { get; } =
+        new VkMappableResourceSubmissionAccess();
     public VkMemoryBlock Memory => _memoryBlock;
 
     public Format VkFormat { get; }

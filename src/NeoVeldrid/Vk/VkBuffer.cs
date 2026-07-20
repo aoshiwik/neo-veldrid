@@ -21,7 +21,8 @@ internal unsafe class VkBuffer : DeviceBuffer
 
     public VkBufferHandle DeviceBuffer => _deviceBuffer;
     public VkMemoryBlock Memory => _memory;
-    public VkBufferSubmissionAccess SubmissionAccess { get; } = new VkBufferSubmissionAccess();
+    public VkMappableResourceSubmissionAccess SubmissionAccess { get; } =
+        new VkMappableResourceSubmissionAccess();
 
     public MemoryRequirements BufferMemoryRequirements => _bufferMemoryRequirements;
 
