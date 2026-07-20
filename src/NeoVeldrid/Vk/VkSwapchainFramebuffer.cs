@@ -211,26 +211,19 @@ internal unsafe class VkSwapchainFramebuffer : VkFramebufferBase
             transaction);
     }
 
-    public override void TransitionToIntermediateLayout(
+    public override void RecordRenderPassFinalLayouts(
         CommandBuffer cb,
         VkImageLayoutTransaction transaction)
-    {
-        for (int i = 0; i < ColorTargets.Count; i++)
-        {
-            FramebufferAttachment ca = ColorTargets[i];
-            VkTexture vkTex = Util.AssertSubtype<Texture, VkTexture>(ca.Target);
-            vkTex.SetImageLayout(
-                0,
-                ca.ArrayLayer,
-                ImageLayout.ColorAttachmentOptimal,
-                transaction);
-        }
-    }
+        => _scFramebuffers[(int)_currentImageIndex]
+            .RecordRenderPassFinalLayouts(cb, transaction);
 
-    public override void TransitionToFinalLayout(
+    public override void TransitionToExternalLayouts(
         CommandBuffer cb,
         VkImageLayoutTransaction transaction)
     {
+        _scFramebuffers[(int)_currentImageIndex]
+            .TransitionToExternalLayouts(cb, transaction);
+
         for (int i = 0; i < ColorTargets.Count; i++)
         {
             FramebufferAttachment ca = ColorTargets[i];

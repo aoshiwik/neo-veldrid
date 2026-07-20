@@ -377,7 +377,7 @@ internal unsafe class VkFramebuffer : VkFramebufferBase
             transaction);
     }
 
-    public override void TransitionToIntermediateLayout(
+    public override void RecordRenderPassFinalLayouts(
         CommandBuffer cb,
         VkImageLayoutTransaction transaction)
     {
@@ -402,7 +402,7 @@ internal unsafe class VkFramebuffer : VkFramebufferBase
         }
     }
 
-    public override void TransitionToFinalLayout(
+    public override void TransitionToExternalLayouts(
         CommandBuffer cb,
         VkImageLayoutTransaction transaction)
     {

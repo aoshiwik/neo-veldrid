@@ -1,5 +1,9 @@
 using System;
 using Xunit;
+#if TEST_VULKAN
+using NeoVeldrid.Vk;
+using Silk.NET.Vulkan;
+#endif
 
 namespace NeoVeldrid.Tests;
 
@@ -164,7 +168,44 @@ public class OpenGLESSwapchainFramebufferTests : SwapchainFramebufferTests<OpenG
 [Trait("Backend", "Vulkan")]
 public class VulkanFramebufferTests : FramebufferTests<VulkanDeviceCreator> { }
 [Trait("Backend", "Vulkan")]
-public class VulkanSwapchainFramebufferTests : SwapchainFramebufferTests<VulkanDeviceCreatorWithMainSwapchain> { }
+public class VulkanSwapchainFramebufferTests
+    : SwapchainFramebufferTests<VulkanDeviceCreatorWithMainSwapchain>
+{
+    [Fact]
+    public void CompletedSwapchainPassTracksColorAndDepthFinalLayouts()
+    {
+        VkSwapchainFramebuffer framebuffer =
+            Assert.IsType<VkSwapchainFramebuffer>(GD.SwapchainFramebuffer);
+        VkTexture color = Assert.IsType<VkTexture>(
+            framebuffer.ColorTargets[0].Target);
+        VkTexture depth = Assert.IsType<VkTexture>(
+            framebuffer.DepthTarget!.Value.Target);
+        CommandList commandList = RF.CreateCommandList();
+
+        commandList.Begin();
+        commandList.SetFramebuffer(framebuffer);
+        commandList.ClearColorTarget(0, RgbaFloat.Red);
+        commandList.ClearDepthStencil(1f);
+        commandList.End();
+
+        Assert.Equal(
+            ImageLayout.PresentSrcKhr,
+            color.GetImageLayout(0, 0));
+        Assert.Equal(
+            ImageLayout.DepthStencilAttachmentOptimal,
+            depth.GetImageLayout(0, 0));
+        GD.SubmitCommands(commandList);
+        GD.WaitForIdle();
+        Assert.Equal(
+            ImageLayout.PresentSrcKhr,
+            color.GetImageLayout(0, 0));
+        Assert.Equal(
+            ImageLayout.DepthStencilAttachmentOptimal,
+            depth.GetImageLayout(0, 0));
+        Assert.Empty(GD.CheckValidation(
+            "swapchain color and depth final-layout tracking"));
+    }
+}
 #endif
 #if TEST_D3D11
 [Trait("Backend", "D3D11")]

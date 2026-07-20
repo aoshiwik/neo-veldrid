@@ -47,10 +47,10 @@ internal abstract class VkFramebufferBase : Framebuffer
         CommandBuffer cb,
         VkRenderPassInitialLayoutKind initialLayoutKind,
         VkImageLayoutTransaction transaction);
-    public abstract void TransitionToIntermediateLayout(
+    public abstract void RecordRenderPassFinalLayouts(
         CommandBuffer cb,
         VkImageLayoutTransaction transaction);
-    public abstract void TransitionToFinalLayout(
+    public abstract void TransitionToExternalLayouts(
         CommandBuffer cb,
         VkImageLayoutTransaction transaction);
 }
