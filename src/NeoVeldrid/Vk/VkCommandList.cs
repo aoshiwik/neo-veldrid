@@ -69,7 +69,7 @@ internal unsafe class VkCommandList : CommandList
     public override bool IsDisposed => _destroyed;
 
     public VkCommandList(VkGraphicsDevice gd, ref CommandListDescription description)
-        : base(ref description, gd.Features, gd.UniformBufferMinOffsetAlignment, gd.StructuredBufferMinOffsetAlignment)
+        : base(ref description, gd, gd.Features, gd.UniformBufferMinOffsetAlignment, gd.StructuredBufferMinOffsetAlignment)
     {
         _gd = gd;
         _maximumInFlightSubmissionCount = ResolveCapacity(
@@ -343,7 +343,8 @@ internal unsafe class VkCommandList : CommandList
             SType = StructureType.CommandBufferBeginInfo,
             Flags = CommandBufferUsageFlags.OneTimeSubmitBit
         };
-        _gd.Vk.BeginCommandBuffer(_cb, in beginInfo);
+        Result result = _gd.Vk.BeginCommandBuffer(_cb, in beginInfo);
+        CheckResult(result);
         _commandBufferBegun = true;
 
         ClearCachedState();

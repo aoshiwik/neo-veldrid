@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using NeoVeldrid.Sdl2;
 using NeoVeldrid.StartupUtilities;
 using NeoVeldrid.Utilities;
@@ -10,7 +11,9 @@ public static class TestUtils
 #if TEST_VULKAN
     public static GraphicsDevice CreateVulkanDevice()
     {
-        return GraphicsDevice.CreateVulkan(new GraphicsDeviceOptions(true));
+        return GraphicsDevice.CreateVulkan(
+            new GraphicsDeviceOptions(true),
+            GetVulkanDeviceOptions());
     }
 
     public static void CreateVulkanDeviceWithSwapchain(out Sdl2Window window, out GraphicsDevice gd)
@@ -24,7 +27,29 @@ public static class TestUtils
 
         GraphicsDeviceOptions options = new GraphicsDeviceOptions(true, PixelFormat.R16_UNorm, false);
 
-        NeoVeldridStartup.CreateWindowAndGraphicsDevice(wci, options, GraphicsBackend.Vulkan, out window, out gd);
+        NeoVeldridStartup.CreateWindowAndVulkanGraphicsDevice(
+            wci,
+            options,
+            GetVulkanDeviceOptions(),
+            out window,
+            out gd);
+    }
+
+    private static VulkanDeviceOptions GetVulkanDeviceOptions()
+    {
+        string configuredMode = Environment.GetEnvironmentVariable("NEOVELDRID_VULKAN_VALIDATION");
+        if (string.IsNullOrWhiteSpace(configuredMode))
+        {
+            return new VulkanDeviceOptions();
+        }
+
+        if (!Enum.TryParse(configuredMode, ignoreCase: true, out VulkanValidationMode mode))
+        {
+            throw new InvalidOperationException(
+                $"Unknown NEOVELDRID_VULKAN_VALIDATION mode '{configuredMode}'.");
+        }
+
+        return new VulkanDeviceOptions(null, null, mode);
     }
 #endif
 
@@ -104,7 +129,24 @@ public abstract class GraphicsDeviceTestBase<T> : IDisposable where T : Graphics
             _renderDoc.DebugOutputMute = false;
         }
         Activator.CreateInstance<T>().CreateGraphicsDevice(out _window, out _gd);
-        _factory = new DisposeCollectorResourceFactory(_gd.ResourceFactory);
+        try
+        {
+            _factory = new DisposeCollectorResourceFactory(_gd.ResourceFactory);
+            GraphicsDeviceValidationRequirements.EnsureSatisfied(_gd);
+            _gd.CheckValidation("test-fixture initialization");
+        }
+        catch
+        {
+            try
+            {
+                _gd?.Dispose();
+            }
+            finally
+            {
+                _window?.Close();
+            }
+            throw;
+        }
     }
 
     protected DeviceBuffer GetReadback(DeviceBuffer buffer)
@@ -159,11 +201,80 @@ public abstract class GraphicsDeviceTestBase<T> : IDisposable where T : Graphics
 
     public void Dispose()
     {
-        GD.WaitForIdle();
-        _factory.DisposeCollector.DisposeAll();
-        GD.Dispose();
-        _window?.Close();
+        List<Exception> failures = null;
+        AttemptCleanup(GD.WaitForIdle, ref failures);
+        AttemptCleanup(_factory.DisposeCollector.DisposeAll, ref failures);
+        AttemptCleanup(GD.Dispose, ref failures);
+        AttemptCleanup(() => _window?.Close(), ref failures);
+
+        if (failures?.Count == 1)
+        {
+            throw failures[0];
+        }
+        if (failures?.Count > 1)
+        {
+            throw new AggregateException("Graphics test teardown encountered multiple failures.", failures);
+        }
     }
+
+    private static void AttemptCleanup(Action action, ref List<Exception> failures)
+    {
+        try
+        {
+            action();
+        }
+        catch (Exception exception)
+        {
+            failures ??= new List<Exception>();
+            failures.Add(exception);
+        }
+    }
+}
+
+internal static class GraphicsDeviceValidationRequirements
+{
+    public static bool IsApiValidationRequired => IsEnabled("NEOVELDRID_REQUIRE_API_VALIDATION");
+
+    public static void EnsureSatisfied(GraphicsDevice graphicsDevice)
+    {
+        GraphicsDeviceValidationStatus status = graphicsDevice.Validation.Status;
+        if (IsApiValidationRequired && !status.IsActive)
+        {
+            throw new InvalidOperationException(
+                $"{graphicsDevice.BackendType} API validation is required but inactive: {status}");
+        }
+
+        if ((graphicsDevice.BackendType == GraphicsBackend.OpenGL
+                || graphicsDevice.BackendType == GraphicsBackend.OpenGLES)
+            && IsEnabled("NEOVELDRID_REQUIRE_OPENGL_DEBUG")
+            && !status.HasFeature(GraphicsDeviceValidationFeatures.SynchronousMessageDelivery))
+        {
+            throw new InvalidOperationException(
+                $"{graphicsDevice.BackendType} synchronous debug output is required but inactive: {status}");
+        }
+
+        if (graphicsDevice.BackendType == GraphicsBackend.Vulkan
+            && string.Equals(
+                Environment.GetEnvironmentVariable("NEOVELDRID_VULKAN_VALIDATION"),
+                "RequiredSynchronization",
+                StringComparison.OrdinalIgnoreCase)
+            && !status.HasFeature(GraphicsDeviceValidationFeatures.SynchronizationValidation))
+        {
+            throw new InvalidOperationException(
+                $"Vulkan synchronization validation is required but inactive: {status}");
+        }
+
+        if (graphicsDevice.BackendType == GraphicsBackend.Direct3D11
+            && IsEnabled("NEOVELDRID_REQUIRE_D3D11_DEBUG")
+            && !status.HasFeature(GraphicsDeviceValidationFeatures.LiveObjectTracking))
+        {
+            throw new InvalidOperationException(
+                $"D3D11 live-object tracking is required but inactive: {status}");
+        }
+    }
+
+    private static bool IsEnabled(string name) =>
+        string.Equals(Environment.GetEnvironmentVariable(name), "1", StringComparison.Ordinal);
 }
 
 public interface GraphicsDeviceCreator

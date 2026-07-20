@@ -106,8 +106,6 @@ internal unsafe class VkDeviceMemoryManager : IDisposable
             // Round up to the nearest multiple of bufferImageGranularity.
             size = ((size / _bufferImageGranularity) + 1) * _bufferImageGranularity;
         }
-        _totalAllocatedBytes += size;
-
         lock (_lock)
         {
             if (!TryFindMemoryType(memProperties, memoryTypeBits, flags, out var memoryTypeIndex))
@@ -153,10 +151,16 @@ internal unsafe class VkDeviceMemoryManager : IDisposable
                     Result mapResult = _vk.MapMemory(_device, memory, 0, size, 0, &mappedPtr);
                     if (mapResult != Result.Success)
                     {
-                        throw new NeoVeldridException("Unable to map newly-allocated Vulkan memory.");
+                        VulkanCleanupCollector cleanup = new VulkanCleanupCollector();
+                        cleanup.Attempt(() => _vk.FreeMemory(_device, memory, null));
+                        cleanup.ThrowWithPrimary(
+                            new NeoVeldridException(
+                                "Unable to map newly-allocated Vulkan memory."),
+                            "Vulkan memory mapping and allocation cleanup both failed.");
                     }
                 }
 
+                _totalAllocatedBytes += size;
                 return new VkMemoryBlock(memory, 0, size, memoryTypeBits, mappedPtr, true);
             }
             else
@@ -168,6 +172,7 @@ internal unsafe class VkDeviceMemoryManager : IDisposable
                     throw new NeoVeldridException("Unable to allocate sufficient Vulkan memory.");
                 }
 
+                _totalAllocatedBytes += size;
                 return ret;
             }
         }
@@ -175,9 +180,9 @@ internal unsafe class VkDeviceMemoryManager : IDisposable
 
     public void Free(VkMemoryBlock block)
     {
-        _totalAllocatedBytes -= block.Size;
         lock (_lock)
         {
+            _totalAllocatedBytes -= block.Size;
             if (block.DedicatedAllocation)
             {
                 _vk.FreeMemory(_device, block.DeviceMemory, null);
@@ -238,8 +243,23 @@ internal unsafe class VkDeviceMemoryManager : IDisposable
                 }
             }
 
-            ChunkAllocator newAllocator = new ChunkAllocator(_vk, _device, _memoryTypeIndex, _persistentMapped);
-            _allocators.Add(newAllocator);
+            ChunkAllocator newAllocator = new ChunkAllocator(
+                _vk,
+                _device,
+                _memoryTypeIndex,
+                _persistentMapped);
+            try
+            {
+                _allocators.Add(newAllocator);
+            }
+            catch (Exception insertionError)
+            {
+                VulkanCleanupCollector cleanup = new VulkanCleanupCollector();
+                cleanup.Attempt(newAllocator.Dispose);
+                cleanup.ThrowWithPrimary(
+                    insertionError,
+                    "Vulkan memory-chunk ownership transfer and cleanup both failed.");
+            }
             return newAllocator.Allocate(size, alignment, out block);
         }
 
@@ -294,25 +314,57 @@ internal unsafe class VkDeviceMemoryManager : IDisposable
             };
             memoryAI.AllocationSize = _totalMemorySize;
             memoryAI.MemoryTypeIndex = _memoryTypeIndex;
-            Result result = _vk.AllocateMemory(_device, in memoryAI, null, out _memory);
+            DeviceMemory createdMemory;
+            Result result = _vk.AllocateMemory(
+                _device,
+                in memoryAI,
+                null,
+                out createdMemory);
             CheckResult(result);
 
             void* mappedPtr = null;
-            if (persistentMapped)
+            bool mappingEstablished = false;
+            try
             {
-                result = _vk.MapMemory(_device, _memory, 0, _totalMemorySize, 0, &mappedPtr);
-                CheckResult(result);
-            }
-            _mappedPtr = mappedPtr;
+                if (persistentMapped)
+                {
+                    result = _vk.MapMemory(
+                        _device,
+                        createdMemory,
+                        0,
+                        _totalMemorySize,
+                        0,
+                        &mappedPtr);
+                    CheckResult(result);
+                    mappingEstablished = true;
+                }
 
-            VkMemoryBlock initialBlock = new VkMemoryBlock(
-                _memory,
-                0,
-                _totalMemorySize,
-                _memoryTypeIndex,
-                _mappedPtr,
-                false);
-            _freeBlocks.Add(initialBlock);
+                VkMemoryBlock initialBlock = new VkMemoryBlock(
+                    createdMemory,
+                    0,
+                    _totalMemorySize,
+                    _memoryTypeIndex,
+                    mappedPtr,
+                    false);
+                _freeBlocks.Add(initialBlock);
+            }
+            catch (Exception initializationError)
+            {
+                VulkanCleanupCollector cleanup = new VulkanCleanupCollector();
+                if (mappingEstablished)
+                {
+                    cleanup.Attempt(() =>
+                        _vk.UnmapMemory(_device, createdMemory));
+                }
+                cleanup.Attempt(() =>
+                    _vk.FreeMemory(_device, createdMemory, null));
+                cleanup.ThrowWithPrimary(
+                    initializationError,
+                    "Vulkan memory-chunk initialization and cleanup both failed.");
+            }
+
+            _memory = createdMemory;
+            _mappedPtr = mappedPtr;
         }
 
         public bool Allocate(ulong size, ulong alignment, out VkMemoryBlock block)

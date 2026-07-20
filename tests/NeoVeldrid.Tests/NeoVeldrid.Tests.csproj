@@ -12,6 +12,7 @@
     </PropertyGroup>
 
     <ItemGroup>
+        <ProjectReference Include="$(RootDir)\eng\NeoVeldrid.TestResultValidator\NeoVeldrid.TestResultValidator.csproj" />
         <ProjectReference Include="$(RootDir)\src\NeoVeldrid.RenderDoc\NeoVeldrid.RenderDoc.csproj" />
         <ProjectReference Include="$(RootDir)\src\NeoVeldrid.StartupUtilities\NeoVeldrid.StartupUtilities.csproj" />
         <ProjectReference Include="$(RootDir)\src\NeoVeldrid.Utilities\NeoVeldrid.Utilities.csproj" />

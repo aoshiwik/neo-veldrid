@@ -32,7 +32,8 @@ internal class OpenGLExtensions : IReadOnlyCollection<string>
             || IsExtensionSupported("GL_OES_copy_image")
             || IsExtensionSupported("GL_EXT_copy_image");
         ARB_DebugOutput = IsExtensionSupported("GL_ARB_debug_output");
-        KHR_Debug = IsExtensionSupported("GL_KHR_debug");
+        KHR_DebugExtension = IsExtensionSupported("GL_KHR_debug");
+        KHR_Debug = GLVersion(4, 3) || GLESVersion(3, 2) || KHR_DebugExtension;
 
         ComputeShaders = IsExtensionSupported("GL_ARB_compute_shader") || GLESVersion(3, 1);
 
@@ -70,6 +71,7 @@ internal class OpenGLExtensions : IReadOnlyCollection<string>
     public readonly bool ARB_MultiBind;
     public readonly bool ARB_TextureView;
     public readonly bool ARB_DebugOutput;
+    public readonly bool KHR_DebugExtension;
     public readonly bool KHR_Debug;
     public readonly bool ARB_ViewportArray;
     public readonly bool ARB_ClipControl;

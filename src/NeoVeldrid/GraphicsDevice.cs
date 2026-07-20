@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Runtime.ExceptionServices;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 namespace NeoVeldrid;
 
@@ -11,12 +13,49 @@ namespace NeoVeldrid;
 /// </summary>
 public abstract class GraphicsDevice : IDisposable
 {
+    private static readonly Action<CommandSubmissionBoundary> s_submitCommandsBoundary =
+        static state => state.Device.SubmitCommandsAndCompleteDiagnostics(
+            state.CommandList,
+            state.Fence);
+    private static readonly Action<SwapchainBoundary> s_swapBuffersBoundary =
+        static state => state.Device.SwapBuffersCore(state.Swapchain);
+    private static readonly Action<GraphicsDevice> s_waitForIdleBoundary =
+        static device => device.WaitForIdleAndFlushDeferredDisposals();
+
     private readonly object _deferredDisposalLock = new object();
-    private readonly List<IDisposable> _disposables = new List<IDisposable>();
+    private readonly Queue<IDisposable> _disposables = new Queue<IDisposable>();
+    private DeferredDisposalQueueState _deferredDisposalState;
+    private int _deferredDisposalDrainOwnerThreadId;
     private Sampler _aniso4xSampler;
-    private bool _disposed;
+    private int _disposeSignaled;
+    private int _disposeOwnerThreadId;
+    private bool _disposeCompleted;
+    private ExceptionDispatchInfo _disposeFailure;
+    private bool _deviceCreationComplete;
+    private GraphicsDeviceValidation _validation;
+    private Action _collectValidationMessages;
 
     internal GraphicsDevice() { }
+
+    /// <summary>
+    /// Gets the device-owned validation status and native-message history.
+    /// </summary>
+    public GraphicsDeviceValidation Validation => _validation
+        ?? throw new InvalidOperationException("The graphics backend has not initialized validation diagnostics.");
+
+    /// <summary>
+    /// Initializes the single validation authority for this device.
+    /// </summary>
+    protected void InitializeValidation(GraphicsBackend backend, bool requested)
+    {
+        if (_validation != null)
+        {
+            throw new InvalidOperationException("Validation diagnostics have already been initialized.");
+        }
+
+        _validation = new GraphicsDeviceValidation(backend, requested);
+        _collectValidationMessages = CollectValidationMessages;
+    }
 
     /// <summary>
     /// Gets the name of the device.
@@ -62,14 +101,61 @@ public abstract class GraphicsDevice : IDisposable
     /// <see cref="GraphicsDeviceOptions.Debug"/>. A true value does not guarantee that debugging is actually
     /// active; see <see cref="IsDebugActive"/> for that.
     /// </summary>
-    public bool IsDebugRequested { get; protected set; }
+    public bool IsDebugRequested => _validation?.Status.Requested ?? false;
 
     /// <summary>
     /// Gets a value indicating whether the graphics API's debug or validation facilities are actually active for
     /// this device. Unlike <see cref="IsDebugRequested"/>, this requires the backend, driver, and any needed SDK or
     /// validation layers to support and enable debugging, so it can be false even when debug mode was requested.
     /// </summary>
-    public abstract bool IsDebugActive { get; }
+    public bool IsDebugActive => _validation?.Status.IsActive ?? false;
+
+    internal bool RequiresValidationBoundary =>
+        _validation?.RequiresBoundaryChecks ?? false;
+
+    /// <summary>
+    /// Gets the number of backend work items admitted ahead of the current
+    /// execution point. Thread-affine backends override this for lifecycle
+    /// diagnostics and deterministic concurrency tests.
+    /// </summary>
+    internal virtual int PendingBackendWorkItemCount => 0;
+
+    /// <summary>
+    /// Collects any backend-polled messages and fails if new native validation errors have been observed.
+    /// </summary>
+    /// <param name="boundary">A stable description of the lifecycle boundary being checked.</param>
+    public IReadOnlyList<GraphicsDeviceValidationMessage> CheckValidation(string boundary)
+    {
+        if (IsDisposed)
+        {
+            throw new ObjectDisposedException(nameof(GraphicsDevice));
+        }
+
+        return CheckValidationCore(boundary);
+    }
+
+    private protected virtual IReadOnlyList<GraphicsDeviceValidationMessage> CheckValidationCore(
+        string boundary) =>
+        Validation.Checkpoint(boundary, _collectValidationMessages);
+
+    /// <summary>
+    /// Runs one native lifecycle operation and its validation checkpoint under
+    /// the device-owned boundary lock. Operation and validation failures are
+    /// preserved together instead of deferring evidence to another caller.
+    /// </summary>
+    internal virtual void ExecuteValidationBoundary<TState>(
+        string boundary,
+        TState state,
+        Action<TState> operation) =>
+        Validation.ExecuteBoundary(boundary, state, operation, _collectValidationMessages);
+
+    /// <summary>
+    /// Gives polling backends an opportunity to copy native diagnostics into <see cref="Validation"/>.
+    /// Callback-based backends do not need to override this method.
+    /// </summary>
+    protected virtual void CollectValidationMessages()
+    {
+    }
 
     /// <summary>
     /// Gets the <see cref="ResourceFactory"/> controlled by this instance.
@@ -134,8 +220,17 @@ public abstract class GraphicsDevice : IDisposable
     /// been previously called on this object.</param>
     public void SubmitCommands(CommandList commandList)
     {
-        SubmitCommandsCore(commandList, null);
-        commandList.CompleteSuccessfulSubmissionDiagnostics();
+        if (RequiresValidationBoundary)
+        {
+            ExecuteValidationBoundary(
+                "command submission",
+                new CommandSubmissionBoundary(this, commandList, null),
+                s_submitCommandsBoundary);
+        }
+        else
+        {
+            SubmitCommandsAndCompleteDiagnostics(commandList, null);
+        }
     }
 
     /// <summary>
@@ -150,7 +245,25 @@ public abstract class GraphicsDevice : IDisposable
     /// execution.</param>
     public void SubmitCommands(CommandList commandList, Fence fence)
     {
+        if (RequiresValidationBoundary)
+        {
+            ExecuteValidationBoundary(
+                "command submission",
+                new CommandSubmissionBoundary(this, commandList, fence),
+                s_submitCommandsBoundary);
+        }
+        else
+        {
+            SubmitCommandsAndCompleteDiagnostics(commandList, fence);
+        }
+    }
+
+    private void SubmitCommandsAndCompleteDiagnostics(CommandList commandList, Fence fence)
+    {
         SubmitCommandsCore(commandList, fence);
+        // Native submission has committed at this point. Finalize managed
+        // submission ownership even if the following validation checkpoint
+        // reports an API error to the caller.
         commandList.CompleteSuccessfulSubmissionDiagnostics();
     }
 
@@ -250,7 +363,20 @@ public abstract class GraphicsDevice : IDisposable
     /// Swaps the buffers of the given swapchain.
     /// </summary>
     /// <param name="swapchain">The <see cref="Swapchain"/> to swap and present.</param>
-    public void SwapBuffers(Swapchain swapchain) => SwapBuffersCore(swapchain);
+    public void SwapBuffers(Swapchain swapchain)
+    {
+        if (RequiresValidationBoundary)
+        {
+            ExecuteValidationBoundary(
+                "presentation",
+                new SwapchainBoundary(this, swapchain),
+                s_swapBuffersBoundary);
+        }
+        else
+        {
+            SwapBuffersCore(swapchain);
+        }
+    }
 
     private protected abstract void SwapBuffersCore(Swapchain swapchain);
 
@@ -282,7 +408,28 @@ public abstract class GraphicsDevice : IDisposable
     /// <summary>
     /// A blocking method that returns when all submitted <see cref="CommandList"/> objects have fully completed.
     /// </summary>
-    public void WaitForIdle()
+    public void WaitForIdle() => ExecuteWaitForIdle(WaitForIdleTransaction);
+
+    /// <summary>
+    /// Gives a thread-affine backend ownership of the complete idle transaction,
+    /// including deferred resource disposal. The default backend executes inline.
+    /// </summary>
+    private protected virtual void ExecuteWaitForIdle(Action waitForIdle) =>
+        waitForIdle();
+
+    private void WaitForIdleTransaction()
+    {
+        if (RequiresValidationBoundary)
+        {
+            ExecuteValidationBoundary("device idle", this, s_waitForIdleBoundary);
+        }
+        else
+        {
+            WaitForIdleAndFlushDeferredDisposals();
+        }
+    }
+
+    private void WaitForIdleAndFlushDeferredDisposals()
     {
         WaitForIdleCore();
         FlushDeferredDisposals();
@@ -914,22 +1061,155 @@ public abstract class GraphicsDevice : IDisposable
     /// <param name="disposable">An object to dispose when this instance becomes idle.</param>
     public void DisposeWhenIdle(IDisposable disposable)
     {
+        ArgumentNullException.ThrowIfNull(disposable);
+
         lock (_deferredDisposalLock)
         {
-            _disposables.Add(disposable);
+            bool drainReentry =
+                _deferredDisposalDrainOwnerThreadId == Environment.CurrentManagedThreadId;
+            bool finalDrainReentry =
+                _deferredDisposalState == DeferredDisposalQueueState.Closing
+                && drainReentry;
+            if (_deferredDisposalState == DeferredDisposalQueueState.Closed
+                || (_deferredDisposalState == DeferredDisposalQueueState.Closing
+                    && !finalDrainReentry)
+                || (_disposeSignaled != 0 && !drainReentry))
+            {
+                throw new ObjectDisposedException(
+                    nameof(GraphicsDevice),
+                    "Deferred disposal is closed because the graphics device is being torn down.");
+            }
+
+            _disposables.Enqueue(disposable);
         }
     }
 
-    private void FlushDeferredDisposals()
+    private void FlushDeferredDisposals() =>
+        DrainDeferredDisposals(closeQueue: false);
+
+    private void CloseAndDrainDeferredDisposals() =>
+        DrainDeferredDisposals(closeQueue: true);
+
+    private void DrainDeferredDisposals(bool closeQueue)
     {
+        int currentThreadId = Environment.CurrentManagedThreadId;
+        int remainingInIdleBatch = 0;
+
         lock (_deferredDisposalLock)
         {
-            foreach (IDisposable disposable in _disposables)
+            while (_deferredDisposalDrainOwnerThreadId != 0)
             {
-                disposable.Dispose();
+                if (_deferredDisposalDrainOwnerThreadId == currentThreadId)
+                {
+                    if (closeQueue)
+                    {
+                        throw new InvalidOperationException(
+                            "The final deferred-disposal drain cannot reenter itself.");
+                    }
+
+                    // The outer drain owns this idle-boundary batch. Let it
+                    // finish without recursively consuming later additions.
+                    return;
+                }
+
+                Monitor.Wait(_deferredDisposalLock);
             }
-            _disposables.Clear();
+
+            if (closeQueue)
+            {
+                if (_deferredDisposalState == DeferredDisposalQueueState.Closed)
+                {
+                    return;
+                }
+
+                _deferredDisposalState = DeferredDisposalQueueState.Closing;
+            }
+            else
+            {
+                if (_deferredDisposalState != DeferredDisposalQueueState.Open)
+                {
+                    return;
+                }
+
+                remainingInIdleBatch = _disposables.Count;
+                if (remainingInIdleBatch == 0)
+                {
+                    return;
+                }
+            }
+
+            // Exactly one thread owns dequeueing. Ordinary idle-boundary
+            // drains consume their captured batch; the final owner consumes
+            // through a locked empty-to-closed transition.
+            _deferredDisposalDrainOwnerThreadId = currentThreadId;
         }
+
+        List<Exception> failures = null;
+        try
+        {
+            while (true)
+            {
+                IDisposable disposable;
+                lock (_deferredDisposalLock)
+                {
+                    if (closeQueue)
+                    {
+                        if (_disposables.Count == 0)
+                        {
+                            // The empty check and closed transition share the
+                            // enqueue lock, so no producer can slip an item past
+                            // the final drain.
+                            _deferredDisposalState = DeferredDisposalQueueState.Closed;
+                            Monitor.PulseAll(_deferredDisposalLock);
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        if (remainingInIdleBatch == 0 || _disposables.Count == 0)
+                        {
+                            break;
+                        }
+
+                        remainingInIdleBatch--;
+                    }
+
+                    disposable = _disposables.Dequeue();
+                }
+
+                // User-controlled disposal is never invoked under the queue
+                // lock. During final closing, reentrant additions are accepted
+                // and consumed by a later iteration of this same drain.
+                AttemptCleanup(disposable, ref failures);
+            }
+        }
+        finally
+        {
+            lock (_deferredDisposalLock)
+            {
+                if (closeQueue)
+                {
+                    // All ordinary disposal failures are captured above. This
+                    // fallback closes admission if an exceptional runtime
+                    // failure interrupts the drain itself.
+                    if (_deferredDisposalState == DeferredDisposalQueueState.Closing)
+                    {
+                        _deferredDisposalState = DeferredDisposalQueueState.Closed;
+                    }
+                }
+                else
+                {
+                    Debug.Assert(
+                        _deferredDisposalState == DeferredDisposalQueueState.Open,
+                        "An ordinary deferred-disposal drain cannot own a closing queue.");
+                }
+
+                _deferredDisposalDrainOwnerThreadId = 0;
+                Monitor.PulseAll(_deferredDisposalLock);
+            }
+        }
+
+        ThrowDeferredDisposalFailures(failures);
     }
 
     /// <summary>
@@ -938,9 +1218,11 @@ public abstract class GraphicsDevice : IDisposable
     protected abstract void PlatformDispose();
 
     /// <summary>
-    /// Creates and caches common device resources after device creation completes.
+    /// Creates and caches common device resources and gates initialization diagnostics.
+    /// Backend constructors own the surrounding initialization transaction and must call
+    /// <see cref="FailDeviceCreation"/> if any acquisition step fails.
     /// </summary>
-    protected void PostDeviceCreated()
+    protected void CompleteDeviceCreation()
     {
         PointSampler = ResourceFactory.CreateSampler(SamplerDescription.Point);
         LinearSampler = ResourceFactory.CreateSampler(SamplerDescription.Linear);
@@ -948,6 +1230,34 @@ public abstract class GraphicsDevice : IDisposable
         {
             _aniso4xSampler = ResourceFactory.CreateSampler(SamplerDescription.Aniso4x);
         }
+
+        CheckValidation("device initialization");
+        _deviceCreationComplete = true;
+    }
+
+    /// <summary>
+    /// Aborts a backend constructor, preserving both the initialization failure and any
+    /// independent failures encountered while releasing partially acquired native state.
+    /// </summary>
+    [System.Diagnostics.CodeAnalysis.DoesNotReturn]
+    protected void FailDeviceCreation(Exception initializationError)
+    {
+        ArgumentNullException.ThrowIfNull(initializationError);
+
+        try
+        {
+            Dispose();
+        }
+        catch (Exception cleanupError)
+        {
+            throw new AggregateException(
+                "Graphics-device initialization and cleanup both failed.",
+                initializationError,
+                cleanupError);
+        }
+
+        ExceptionDispatchInfo.Capture(initializationError).Throw();
+        throw new UnreachableException();
     }
 
     /// <summary>
@@ -985,25 +1295,232 @@ public abstract class GraphicsDevice : IDisposable
     /// <summary>
     /// A bool indicating whether this instance has been disposed.
     /// </summary>
-    public bool IsDisposed => _disposed;
+    public bool IsDisposed => Volatile.Read(ref _disposeSignaled) != 0;
 
     /// <summary>
     /// Frees unmanaged resources controlled by this device.
     /// All created child resources must be Disposed prior to calling this method.
     /// </summary>
-    public void Dispose()
+    public void Dispose() => ExecuteDeviceDisposal(DisposeCore);
+
+    /// <summary>
+    /// Gives a thread-affine backend ownership of the thread on which the shared
+    /// disposal transaction begins. The default backend executes inline.
+    /// </summary>
+    private protected virtual void ExecuteDeviceDisposal(Action disposeCore) =>
+        disposeCore();
+
+    /// <summary>
+    /// Joins a disposal transaction which a backend has already admitted on
+    /// behalf of the current caller. Unlike an ordinary repeated
+    /// <see cref="Dispose"/> call, an admitted caller owns the outcome of that
+    /// transaction and must observe its failure even if teardown completed
+    /// before the caller resumed.
+    /// </summary>
+    private protected void JoinPublishedDeviceDisposal()
     {
-        if (_disposed)
+        ExceptionDispatchInfo failure;
+        int currentThreadId = Environment.CurrentManagedThreadId;
+        lock (_deferredDisposalLock)
+        {
+            if (_disposeSignaled == 0)
+            {
+                throw new InvalidOperationException(
+                    "Cannot join a graphics-device disposal transaction before it has been published.");
+            }
+
+            if (!_disposeCompleted && _disposeOwnerThreadId == currentThreadId)
+            {
+                throw new InvalidOperationException(
+                    "The graphics-device disposal owner cannot join its own active transaction.");
+            }
+
+            while (!_disposeCompleted)
+            {
+                Monitor.Wait(_deferredDisposalLock);
+            }
+
+            failure = _disposeFailure;
+        }
+
+        failure?.Throw();
+    }
+
+    private void DisposeCore()
+    {
+        int currentThreadId = Environment.CurrentManagedThreadId;
+        ExceptionDispatchInfo concurrentFailure = null;
+        bool ownsDisposal = false;
+
+        lock (_deferredDisposalLock)
+        {
+            if (_deferredDisposalDrainOwnerThreadId == currentThreadId)
+            {
+                throw new InvalidOperationException(
+                    "A graphics device cannot be disposed reentrantly from a deferred resource disposal.");
+            }
+
+            if (_disposeSignaled != 0)
+            {
+                if (_disposeCompleted || _disposeOwnerThreadId == currentThreadId)
+                {
+                    return;
+                }
+
+                // A concurrent Dispose call joins the active teardown instead
+                // of returning while native resources are still being released.
+                while (!_disposeCompleted)
+                {
+                    Monitor.Wait(_deferredDisposalLock);
+                }
+
+                concurrentFailure = _disposeFailure;
+            }
+            else
+            {
+                // Publish disposal while holding the same lock used to inspect
+                // the drain owner and to join concurrent Dispose calls.
+                Volatile.Write(ref _disposeSignaled, 1);
+                _disposeOwnerThreadId = currentThreadId;
+                ownsDisposal = true;
+            }
+        }
+
+        if (!ownsDisposal)
+        {
+            concurrentFailure?.Throw();
+            return;
+        }
+
+        ExceptionDispatchInfo completionFailure = null;
+        try
+        {
+            List<Exception> failures = null;
+            if (_deviceCreationComplete)
+            {
+                AttemptCleanup(WaitForIdle, ref failures);
+            }
+            AttemptCleanup(CloseAndDrainDeferredDisposals, ref failures);
+            AttemptCleanup(() => PointSampler?.Dispose(), ref failures);
+            AttemptCleanup(() => LinearSampler?.Dispose(), ref failures);
+            AttemptCleanup(() => _aniso4xSampler?.Dispose(), ref failures);
+            AttemptCleanup(PlatformDispose, ref failures);
+            if (_validation != null)
+            {
+                AttemptCleanup(
+                    () => _validation.Seal("device teardown", _collectValidationMessages),
+                    ref failures);
+            }
+
+            if (failures?.Count == 1)
+            {
+                completionFailure = ExceptionDispatchInfo.Capture(failures[0]);
+            }
+            else if (failures?.Count > 1)
+            {
+                completionFailure = ExceptionDispatchInfo.Capture(
+                    new AggregateException(
+                        "Graphics-device teardown encountered multiple failures.",
+                        failures));
+            }
+        }
+        catch (Exception exception)
+        {
+            // Preserve an unexpected orchestration failure for concurrent
+            // callers and still publish completion in the finally block.
+            completionFailure = ExceptionDispatchInfo.Capture(exception);
+        }
+        finally
+        {
+            lock (_deferredDisposalLock)
+            {
+                _disposeFailure = completionFailure;
+                _disposeOwnerThreadId = 0;
+                _disposeCompleted = true;
+                Monitor.PulseAll(_deferredDisposalLock);
+            }
+        }
+
+        completionFailure?.Throw();
+    }
+
+    private enum DeferredDisposalQueueState
+    {
+        Open,
+        Closing,
+        Closed,
+    }
+
+    private readonly struct CommandSubmissionBoundary
+    {
+        public CommandSubmissionBoundary(
+            GraphicsDevice device,
+            CommandList commandList,
+            Fence fence)
+        {
+            Device = device;
+            CommandList = commandList;
+            Fence = fence;
+        }
+
+        public GraphicsDevice Device { get; }
+        public CommandList CommandList { get; }
+        public Fence Fence { get; }
+    }
+
+    private readonly struct SwapchainBoundary
+    {
+        public SwapchainBoundary(GraphicsDevice device, Swapchain swapchain)
+        {
+            Device = device;
+            Swapchain = swapchain;
+        }
+
+        public GraphicsDevice Device { get; }
+        public Swapchain Swapchain { get; }
+    }
+
+    private static void AttemptCleanup(Action action, ref List<Exception> failures)
+    {
+        try
+        {
+            action();
+        }
+        catch (Exception exception)
+        {
+            failures ??= new List<Exception>();
+            failures.Add(exception);
+        }
+    }
+
+    private static void AttemptCleanup(IDisposable disposable, ref List<Exception> failures)
+    {
+        try
+        {
+            disposable.Dispose();
+        }
+        catch (Exception exception)
+        {
+            failures ??= new List<Exception>();
+            failures.Add(exception);
+        }
+    }
+
+    private static void ThrowDeferredDisposalFailures(List<Exception> failures)
+    {
+        if (failures == null || failures.Count == 0)
         {
             return;
         }
-        _disposed = true;
 
-        WaitForIdle();
-        PointSampler.Dispose();
-        LinearSampler.Dispose();
-        _aniso4xSampler?.Dispose();
-        PlatformDispose();
+        if (failures.Count == 1)
+        {
+            ExceptionDispatchInfo.Capture(failures[0]).Throw();
+        }
+
+        throw new AggregateException(
+            "Deferred resource disposal encountered multiple failures.",
+            failures);
     }
 
 #if !EXCLUDE_D3D11_BACKEND

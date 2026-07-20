@@ -1,7 +1,6 @@
 using Silk.NET.Vulkan;
 using static NeoVeldrid.Vk.VulkanUtil;
 using System;
-using System.Linq;
 using System.Collections.Generic;
 using VkFramebufferHandle = Silk.NET.Vulkan.Framebuffer;
 
@@ -67,6 +66,8 @@ internal unsafe class VkSwapchainFramebuffer : VkFramebufferBase
         _swapchain = swapchain;
         _surface = surface;
         _depthFormat = depthFormat;
+        _desiredWidth = width;
+        _desiredHeight = height;
 
         AttachmentCount = depthFormat.HasValue ? 2u : 1u; // 1 Color + 1 Depth
     }
@@ -83,6 +84,16 @@ internal unsafe class VkSwapchainFramebuffer : VkFramebufferBase
         SurfaceFormatKHR surfaceFormat,
         Extent2D swapchainExtent)
     {
+        if (_destroyed)
+        {
+            throw new ObjectDisposedException(nameof(VkSwapchainFramebuffer));
+        }
+        if (_scFramebuffers != null || _depthAttachment != null)
+        {
+            throw new InvalidOperationException(
+                "A VkSwapchainFramebuffer must be empty before it is initialized for a swapchain.");
+        }
+
         _desiredWidth = width;
         _desiredHeight = height;
 
@@ -90,10 +101,12 @@ internal unsafe class VkSwapchainFramebuffer : VkFramebufferBase
         uint scImageCount = 0;
         Result result = _gd.KhrSwapchain.GetSwapchainImages(_gd.Device, deviceSwapchain, ref scImageCount, null);
         CheckResult(result);
-        if (_scImages.Length < scImageCount)
+        if (scImageCount == 0)
         {
-            _scImages = new Image[(int)scImageCount];
+            throw new NeoVeldridException("The Vulkan swapchain did not expose any images.");
         }
+
+        _scImages = new Image[(int)scImageCount];
         result = _gd.KhrSwapchain.GetSwapchainImages(_gd.Device, deviceSwapchain, ref scImageCount, out _scImages[0]);
         CheckResult(result);
 
@@ -106,24 +119,43 @@ internal unsafe class VkSwapchainFramebuffer : VkFramebufferBase
         _outputDescription = OutputDescription.CreateFromFramebuffer(this);
     }
 
-    private void DestroySwapchainFramebuffers()
+    /// <summary>
+    /// Atomically exchanges the native framebuffer graphs of two wrappers for
+    /// the same logical swapchain. This keeps the public framebuffer identity
+    /// stable while a fully prepared replacement is committed.
+    /// </summary>
+    internal void SwapStateWith(VkSwapchainFramebuffer other)
     {
-        if (_scFramebuffers != null)
+        ArgumentNullException.ThrowIfNull(other);
+        if (_destroyed || other._destroyed)
         {
-            for (int i = 0; i < _scFramebuffers.Length; i++)
-            {
-                _scFramebuffers[i]?.Dispose();
-                _scFramebuffers[i] = null;
-            }
-            Array.Clear(_scFramebuffers, 0, _scFramebuffers.Length);
+            throw new ObjectDisposedException(nameof(VkSwapchainFramebuffer));
         }
+        if (!ReferenceEquals(_gd, other._gd)
+            || !ReferenceEquals(_swapchain, other._swapchain)
+            || _surface.Handle != other._surface.Handle
+            || _depthFormat != other._depthFormat)
+        {
+            throw new InvalidOperationException(
+                "Only framebuffer states belonging to the same Vulkan swapchain can be exchanged.");
+        }
+
+        (_scFramebuffers, other._scFramebuffers) = (other._scFramebuffers, _scFramebuffers);
+        (_scImages, other._scImages) = (other._scImages, _scImages);
+        (_scImageFormat, other._scImageFormat) = (other._scImageFormat, _scImageFormat);
+        (_scExtent, other._scExtent) = (other._scExtent, _scExtent);
+        (_scColorTextures, other._scColorTextures) = (other._scColorTextures, _scColorTextures);
+        (_depthAttachment, other._depthAttachment) = (other._depthAttachment, _depthAttachment);
+        (_desiredWidth, other._desiredWidth) = (other._desiredWidth, _desiredWidth);
+        (_desiredHeight, other._desiredHeight) = (other._desiredHeight, _desiredHeight);
+        (_currentImageIndex, other._currentImageIndex) = (other._currentImageIndex, _currentImageIndex);
+        (_outputDescription, other._outputDescription) = (other._outputDescription, _outputDescription);
     }
 
     private void CreateDepthTexture()
     {
         if (_depthFormat.HasValue)
         {
-            _depthAttachment?.Target.Dispose();
             VkTexture depthTexture = (VkTexture)_gd.ResourceFactory.CreateTexture(TextureDescription.Texture2D(
                 Math.Max(1, _scExtent.Width),
                 Math.Max(1, _scExtent.Height),
@@ -137,18 +169,8 @@ internal unsafe class VkSwapchainFramebuffer : VkFramebufferBase
 
     private void CreateFramebuffers()
     {
-        if (_scFramebuffers != null)
-        {
-            for (int i = 0; i < _scFramebuffers.Length; i++)
-            {
-                _scFramebuffers[i]?.Dispose();
-                _scFramebuffers[i] = null;
-            }
-            Array.Clear(_scFramebuffers, 0, _scFramebuffers.Length);
-        }
-
-        Util.EnsureArrayMinimumSize(ref _scFramebuffers, (uint)_scImages.Length);
-        Util.EnsureArrayMinimumSize(ref _scColorTextures, (uint)_scImages.Length);
+        _scFramebuffers = new VkFramebuffer[_scImages.Length];
+        _scColorTextures = new FramebufferAttachment[_scImages.Length][];
         for (uint i = 0; i < _scImages.Length; i++)
         {
             VkTexture colorTex = new VkTexture(
@@ -228,9 +250,64 @@ internal unsafe class VkSwapchainFramebuffer : VkFramebufferBase
     {
         if (!_destroyed)
         {
-            _destroyed = true;
-            _depthAttachment?.Target.Dispose();
-            DestroySwapchainFramebuffers();
+            VulkanCleanupCollector cleanup = new VulkanCleanupCollector();
+            bool framebuffersReleased = true;
+            if (_scFramebuffers != null)
+            {
+                for (int i = 0; i < _scFramebuffers.Length; i++)
+                {
+                    VkFramebuffer framebuffer = _scFramebuffers[i];
+                    if (framebuffer != null)
+                    {
+                        bool framebufferReleased = framebuffer.IsDisposed
+                            || (cleanup.Attempt(framebuffer.Dispose)
+                                && framebuffer.IsDisposed);
+                        if (framebufferReleased)
+                        {
+                            _scFramebuffers[i] = null;
+                        }
+                        else
+                        {
+                            framebuffersReleased = false;
+                            if (!framebuffer.IsDisposed)
+                            {
+                                cleanup.Add(new InvalidOperationException(
+                                    "A Vulkan framebuffer retained native children during swapchain cleanup."));
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (framebuffersReleased)
+            {
+                _scFramebuffers = null;
+                _scColorTextures = null;
+                _scImages = Array.Empty<Image>();
+            }
+
+            // VkFramebuffer objects reference the depth image and its view, so
+            // the depth texture is retired only after every framebuffer child.
+            if (framebuffersReleased && _depthAttachment != null)
+            {
+                Texture depthTexture = _depthAttachment.Value.Target;
+                bool depthReleased = depthTexture.IsDisposed
+                    || (cleanup.Attempt(depthTexture.Dispose)
+                        && depthTexture.IsDisposed);
+                if (depthReleased)
+                {
+                    _depthAttachment = null;
+                }
+                else if (!depthTexture.IsDisposed)
+                {
+                    cleanup.Add(new InvalidOperationException(
+                        "The Vulkan swapchain depth texture retained native resources during cleanup."));
+                }
+            }
+
+            _destroyed = framebuffersReleased && _depthAttachment == null;
+            cleanup.ThrowIfAny(
+                "Vulkan swapchain framebuffer cleanup encountered multiple failures.");
         }
     }
 }

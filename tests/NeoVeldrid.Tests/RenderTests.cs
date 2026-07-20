@@ -723,13 +723,12 @@ public abstract class RenderTests<T> : GraphicsDeviceTestBase<T> where T : Graph
         GD.Unmap(staging);
     }
 
-    [Fact]
+    [SkippableFact]
     public void ComputeGeneratedVertices()
     {
-        if (!GD.Features.ComputeShader)
-        {
-            return;
-        }
+        Skip.IfNot(
+            GD.Features.ComputeShader,
+            $"NV-SKIP-COMPUTE-SHADER: Compute shaders are unavailable on {GD.BackendType}.");
 
         uint width = 512;
         uint height = 512;
@@ -909,7 +908,9 @@ public abstract class RenderTests<T> : GraphicsDeviceTestBase<T> where T : Graph
     [SkippableFact]
     public void ComputeGeneratedTexture()
     {
-        Skip.IfNot(GD.Features.ComputeShader);
+        Skip.IfNot(
+            GD.Features.ComputeShader,
+            $"NV-SKIP-COMPUTE-SHADER: Compute shaders are unavailable on {GD.BackendType}.");
 
         uint width = 4;
         uint height = 1;
@@ -975,7 +976,9 @@ public abstract class RenderTests<T> : GraphicsDeviceTestBase<T> where T : Graph
     [SkippableFact]
     public void CommandListTextureUpdateSynchronizesBothDirectionsWithComputeSampling()
     {
-        Skip.IfNot(GD.Features.ComputeShader);
+        Skip.IfNot(
+            GD.Features.ComputeShader,
+            $"NV-SKIP-COMPUTE-SHADER: Compute shaders are unavailable on {GD.BackendType}.");
 
         Texture sampledTexture = RF.CreateTexture(
             TextureDescription.Texture2D(
@@ -1157,7 +1160,9 @@ public abstract class RenderTests<T> : GraphicsDeviceTestBase<T> where T : Graph
     [InlineData(6)]
     public void ComputeBindTextureWithArrayLayersAsWriteable(uint ArrayLayers)
     {
-        Skip.IfNot(GD.Features.ComputeShader);
+        Skip.IfNot(
+            GD.Features.ComputeShader,
+            $"NV-SKIP-COMPUTE-SHADER: Compute shaders are unavailable on {GD.BackendType}.");
 
         uint TexSize = 32;
         uint MipLevels = 1;
@@ -1214,12 +1219,14 @@ public abstract class RenderTests<T> : GraphicsDeviceTestBase<T> where T : Graph
         }
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(false)]
     [InlineData(true)]
     public void SampleTexture1D(bool arrayTexture)
     {
-        if (!GD.Features.Texture1D) { return; }
+        Skip.IfNot(
+            GD.Features.Texture1D,
+            $"NV-SKIP-TEXTURE1D: One-dimensional textures are unavailable on {GD.BackendType}.");
 
         Texture target = RF.CreateTexture(TextureDescription.Texture2D(
             50, 50, 1, 1, PixelFormat.R32_G32_B32_A32_Float, TextureUsage.RenderTarget));
@@ -1599,7 +1606,9 @@ public abstract class RenderTests<T> : GraphicsDeviceTestBase<T> where T : Graph
     [SkippableFact]
     public void UseBlendFactor()
     {
-        Skip.If(GD.BackendType == GraphicsBackend.Vulkan, "Upstream: Vulkan image layout validation error");
+        Skip.If(
+            GD.BackendType == GraphicsBackend.Vulkan,
+            "NV-SKIP-KNOWN-VULKAN-BLEND-LAYOUT: Vulkan image layout validation error.");
         const uint width = 512;
         const uint height = 512;
         using var output = RF.CreateTexture(

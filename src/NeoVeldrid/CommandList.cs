@@ -24,6 +24,10 @@ namespace NeoVeldrid;
 /// </summary>
 public abstract class CommandList : DeviceResource, IDisposable
 {
+    private static readonly Action<CommandList> s_endRecordingBoundary =
+        static commandList => commandList.EndRecording();
+
+    private readonly GraphicsDevice _graphicsDevice;
     private readonly GraphicsDeviceFeatures _features;
     private readonly uint _uniformBufferAlignment;
     private readonly uint _structuredBufferAlignment;
@@ -42,10 +46,12 @@ public abstract class CommandList : DeviceResource, IDisposable
 
     internal CommandList(
         ref CommandListDescription description,
+        GraphicsDevice graphicsDevice,
         GraphicsDeviceFeatures features,
         uint uniformAlignment,
         uint structuredAlignment)
     {
+        _graphicsDevice = graphicsDevice;
         _features = features;
         _uniformBufferAlignment = uniformAlignment;
         _structuredBufferAlignment = structuredAlignment;
@@ -135,6 +141,21 @@ public abstract class CommandList : DeviceResource, IDisposable
     /// It is an error to call this function in succession, unless <see cref="Begin"/> has been called in between invocations.
     /// </summary>
     public void End()
+    {
+        if (_graphicsDevice.RequiresValidationBoundary)
+        {
+            _graphicsDevice.ExecuteValidationBoundary(
+                "command-list recording",
+                this,
+                s_endRecordingBoundary);
+        }
+        else
+        {
+            EndRecording();
+        }
+    }
+
+    private void EndRecording()
     {
         try
         {

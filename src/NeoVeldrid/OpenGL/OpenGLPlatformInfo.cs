@@ -19,6 +19,12 @@ public class OpenGLPlatformInfo
     public Func<string, IntPtr> GetProcAddress { get; }
 
     /// <summary>
+    /// Gets whether the platform verified that the native context was created with its debug flag.
+    /// A null value means that the platform cannot attest the context creation flags.
+    /// </summary>
+    public bool? IsDebugContext { get; }
+
+    /// <summary>
     /// A delegate which can be used to make the given OpenGL context current on the calling thread.
     /// </summary>
     public Action<IntPtr> MakeCurrent { get; }
@@ -74,6 +80,7 @@ public class OpenGLPlatformInfo
     /// context.</param>
     /// <param name="setSyncToVerticalBlank">A delegate which can be used to set the synchronization behavior of the OpenGL
     /// context.</param>
+    /// <param name="isDebugContext">Whether the platform verified that the context was created with its debug flag.</param>
     public OpenGLPlatformInfo(
         IntPtr openGLContextHandle,
         Func<string, IntPtr> getProcAddress,
@@ -82,16 +89,21 @@ public class OpenGLPlatformInfo
         Action clearCurrentContext,
         Action<IntPtr> deleteContext,
         Action swapBuffers,
-        Action<bool> setSyncToVerticalBlank)
+        Action<bool> setSyncToVerticalBlank,
+        bool? isDebugContext = null)
+        : this(
+            openGLContextHandle,
+            getProcAddress,
+            makeCurrent,
+            getCurrentContext,
+            clearCurrentContext,
+            deleteContext,
+            swapBuffers,
+            setSyncToVerticalBlank,
+            setSwapchainFramebuffer: null,
+            resizeSwapchain: null,
+            isDebugContext: isDebugContext)
     {
-        OpenGLContextHandle = openGLContextHandle;
-        GetProcAddress = getProcAddress;
-        MakeCurrent = makeCurrent;
-        GetCurrentContext = getCurrentContext;
-        ClearCurrentContext = clearCurrentContext;
-        DeleteContext = deleteContext;
-        SwapBuffers = swapBuffers;
-        SetSyncToVerticalBlank = setSyncToVerticalBlank;
     }
 
     /// <summary>
@@ -112,6 +124,7 @@ public class OpenGLPlatformInfo
     /// application Swapchain.</param>
     /// <param name="resizeSwapchain">A delegate which is invoked when the main Swapchain is resized. This may be null,
     /// in which case no special action is taken when the Swapchain is resized.</param>
+    /// <param name="isDebugContext">Whether the platform verified that the context was created with its debug flag.</param>
     public OpenGLPlatformInfo(
         IntPtr openGLContextHandle,
         Func<string, IntPtr> getProcAddress,
@@ -122,8 +135,24 @@ public class OpenGLPlatformInfo
         Action swapBuffers,
         Action<bool> setSyncToVerticalBlank,
         Action setSwapchainFramebuffer,
-        Action<uint, uint> resizeSwapchain)
+        Action<uint, uint> resizeSwapchain,
+        bool? isDebugContext = null)
     {
+        if (openGLContextHandle == IntPtr.Zero)
+        {
+            throw new ArgumentException(
+                "An owned OpenGL context handle must be nonzero.",
+                nameof(openGLContextHandle));
+        }
+
+        ArgumentNullException.ThrowIfNull(getProcAddress);
+        ArgumentNullException.ThrowIfNull(makeCurrent);
+        ArgumentNullException.ThrowIfNull(getCurrentContext);
+        ArgumentNullException.ThrowIfNull(clearCurrentContext);
+        ArgumentNullException.ThrowIfNull(deleteContext);
+        ArgumentNullException.ThrowIfNull(swapBuffers);
+        ArgumentNullException.ThrowIfNull(setSyncToVerticalBlank);
+
         OpenGLContextHandle = openGLContextHandle;
         GetProcAddress = getProcAddress;
         MakeCurrent = makeCurrent;
@@ -134,5 +163,6 @@ public class OpenGLPlatformInfo
         SetSyncToVerticalBlank = setSyncToVerticalBlank;
         SetSwapchainFramebuffer = setSwapchainFramebuffer;
         ResizeSwapchain = resizeSwapchain;
+        IsDebugContext = isDebugContext;
     }
 }

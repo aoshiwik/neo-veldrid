@@ -11,6 +11,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Threading;
 using System.Runtime.CompilerServices;
+using System.Runtime.ExceptionServices;
 
 namespace NeoVeldrid.OpenGL;
 
@@ -28,20 +29,25 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
     private readonly ConcurrentQueue<OpenGLDeferredResource> _resourcesToDispose
         = new ConcurrentQueue<OpenGLDeferredResource>();
     private IntPtr _glContext;
-    private bool _glContextDestroyed;
+    private bool _glContextUnavailable;
+    private bool _glContextDestructionConfirmed;
+    private Func<string, IntPtr> _getProcAddress;
     private Action<IntPtr> _makeCurrent;
     private Func<IntPtr> _getCurrentContext;
+    private Action _clearCurrentContext;
     private Action<IntPtr> _deleteContext;
     private Action _swapBuffers;
     private Action<bool> _setSyncToVBlank;
     private OpenGLSwapchainFramebuffer _swapchainFramebuffer;
     private OpenGLTextureSamplerManager _textureSamplerManager;
     private OpenGLCommandExecutor _commandExecutor;
-    private DebugProc _debugMessageCallback;
+    private OpenGLDebugOutput _debugOutput;
     public GL GL { get; private set; }
     private OpenGLExtensions _extensions;
     private bool _isDepthRangeZeroToOne;
-    private bool _debugActive;
+    private bool _isDebugContext;
+    private bool _debugContextStatusKnown;
+    private int _contextFlags;
 
     // EXT_debug_marker (GLES extension for GPU profiling tools like Xcode GPU debugger).
     internal ExtDebugMarker _extDebugMarker;
@@ -105,8 +111,6 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
 
     public override bool IsClipSpaceYInverted => false;
 
-    public override bool IsDebugActive => _debugActive;
-
     public override ResourceFactory ResourceFactory => _resourceFactory;
 
     public OpenGLExtensions Extensions => _extensions;
@@ -130,6 +134,18 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
 
     public string ShadingLanguageVersion => _shadingLanguageVersion;
 
+    internal bool IsDebugContext => _isDebugContext;
+
+    internal bool IsDebugContextStatusKnown => _debugContextStatusKnown;
+
+    internal int ContextFlags => _contextFlags;
+
+    internal string DebugOutputTransport => _debugOutput?.Transport ?? string.Empty;
+
+    internal bool IsDebugOutputSynchronous => _debugOutput?.SynchronousDelivery ?? false;
+
+    internal bool DebugOutputProbePassed => _debugOutput?.ProbePassed ?? false;
+
     public OpenGLTextureSamplerManager TextureSamplerManager => _textureSamplerManager;
 
     public override GraphicsDeviceFeatures Features => _features;
@@ -142,7 +158,16 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
         uint width,
         uint height)
     {
-        Init(options, platformInfo, width, height, true);
+        ArgumentNullException.ThrowIfNull(platformInfo);
+
+        try
+        {
+            Init(options, platformInfo, width, height, true);
+        }
+        catch (Exception initializationError)
+        {
+            FailDeviceCreation(initializationError);
+        }
     }
 
     private void Init(
@@ -152,14 +177,22 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
         uint height,
         bool loadFunctions)
     {
-        IsDebugRequested = options.Debug;
+        // Device bootstrap has no active debug callback to report native failures.
+        // Intentionally shadow the debug-only hot-path helper in this scope so every
+        // initialization call is checked in Release as well as Debug builds.
+        void CheckLastError() => CheckInitializationError("device bootstrap");
+
         _syncToVBlank = options.SyncToVerticalBlank;
         _glContext = platformInfo.OpenGLContextHandle;
+        _getProcAddress = platformInfo.GetProcAddress;
         _makeCurrent = platformInfo.MakeCurrent;
         _getCurrentContext = platformInfo.GetCurrentContext;
+        _clearCurrentContext = platformInfo.ClearCurrentContext;
         _deleteContext = platformInfo.DeleteContext;
         _swapBuffers = platformInfo.SwapBuffers;
         _setSyncToVBlank = platformInfo.SetSyncToVerticalBlank;
+
+        MakeOwnedContextCurrent("device initialization");
         if (loadFunctions)
         {
             GL = GL.GetApi(platformInfo.GetProcAddress);
@@ -167,10 +200,15 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
         }
         Debug.Assert(GL != null, "GL instance must be set before Init(). If loadFunctions=false, the caller must set GL beforehand.");
         _version = GL.GetStringS(StringName.Version);
+        CheckInitializationError("GL_VERSION query");
         _shadingLanguageVersion = GL.GetStringS(StringName.ShadingLanguageVersion);
+        CheckInitializationError("GL_SHADING_LANGUAGE_VERSION query");
         _vendorName = GL.GetStringS(StringName.Vendor);
+        CheckInitializationError("GL_VENDOR query");
         _deviceName = GL.GetStringS(StringName.Renderer);
+        CheckInitializationError("GL_RENDERER query");
         _backendType = _version.StartsWith("OpenGL ES") ? GraphicsBackend.OpenGLES : GraphicsBackend.OpenGL;
+        InitializeValidation(_backendType, options.Debug);
 
         // ClearDepthf/DepthRangef are available via GL.ClearDepth(float)/GL.DepthRange(float, float)
         // (core in GL 4.1+ from ARB_ES2_compatibility, and always available in GLES).
@@ -207,6 +245,20 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
 
         _extensions = new OpenGLExtensions(extensions, _backendType, majorVersion, minorVersion);
         OpenGLUtil.HasGlObjectLabel = _extensions.KHR_Debug;
+
+        if (_extensions.GLVersion(3, 0) || _extensions.GLESVersion(3, 2))
+        {
+            GL.GetInteger((GetPName)0x821E, out _contextFlags); // GL_CONTEXT_FLAGS
+            CheckLastError();
+            _debugContextStatusKnown = true;
+            _isDebugContext = (_contextFlags & 0x00000002) != 0; // GL_CONTEXT_FLAG_DEBUG_BIT
+        }
+        else if (platformInfo.IsDebugContext.HasValue)
+        {
+            _debugContextStatusKnown = true;
+            _isDebugContext = platformInfo.IsDebugContext.Value;
+            _contextFlags = _isDebugContext ? 0x00000002 : 0;
+        }
 
         if (_extensions.EXT_DebugMarker)
         {
@@ -256,10 +308,10 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
         GL.BindVertexArray(_vao);
         CheckLastError();
 
-        _debugActive = options.Debug && (_extensions.KHR_Debug || _extensions.ARB_DebugOutput);
-        if (_debugActive)
+        if (options.Debug)
         {
-            EnableDebugCallback();
+            ActivateDebugOutput();
+            CheckLastError();
         }
 
         bool backbufferIsSrgb = ManualSrgbBackbufferQuery();
@@ -357,15 +409,103 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
             platformInfo.ResizeSwapchain);
 
         _workItems = new BlockingCollection<ExecutionThreadWorkItem>(new ConcurrentQueue<ExecutionThreadWorkItem>());
-        platformInfo.ClearCurrentContext();
-        _executionThread = new ExecutionThread(this, _workItems, _makeCurrent, _glContext);
+        ClearOwnedContext("execution-thread handoff");
+        _executionThread = new ExecutionThread(
+            this,
+            _workItems,
+            _makeCurrent,
+            _getCurrentContext,
+            _glContext);
         _openglInfo = new BackendInfoOpenGL(this);
 
-        PostDeviceCreated();
+        CompleteDeviceCreation();
+        _executionThread.Run(
+            () => CheckInitializationError("common device-resource bootstrap"));
+    }
+
+    private void MakeOwnedContextCurrent(string operation)
+    {
+        _makeCurrent(_glContext);
+        IntPtr currentContext = _getCurrentContext();
+        if (currentContext != _glContext)
+        {
+            throw new NeoVeldridException(
+                $"The platform did not make the owned OpenGL context current during {operation}. "
+                + $"Expected 0x{_glContext.ToInt64():X}, but observed 0x{currentContext.ToInt64():X}.");
+        }
+    }
+
+    private void ClearOwnedContext(string operation)
+    {
+        _clearCurrentContext();
+        IntPtr currentContext = _getCurrentContext();
+        if (currentContext != IntPtr.Zero)
+        {
+            throw new NeoVeldridException(
+                $"The platform did not clear the OpenGL context during {operation}. "
+                + $"Context 0x{currentContext.ToInt64():X} remained current.");
+        }
+    }
+
+    private void CheckInitializationError(string operation)
+    {
+        uint error = (uint)GL.GetError();
+        if (error != 0)
+        {
+            throw new NeoVeldridException(
+                $"OpenGL initialization failed during {operation}: glGetError returned {(ErrorCode)error}.");
+        }
+    }
+
+    private void ActivateDebugOutput()
+    {
+        if (!_debugContextStatusKnown)
+        {
+            Validation.SetInactive(
+                "the platform could not attest whether this OpenGL context was created with the debug flag");
+            return;
+        }
+
+        if (!_isDebugContext)
+        {
+            Validation.SetInactive("the OpenGL context was created without the debug flag");
+            return;
+        }
+
+        _debugOutput = OpenGLDebugOutput.TryCreate(
+            GL,
+            _getProcAddress,
+            _extensions,
+            _backendType,
+            Validation);
+        if (_debugOutput == null)
+        {
+            string reason = _extensions.ARB_DebugOutput
+                ? "GL_ARB_debug_output is available, but its ARB-only transport is not implemented"
+                : "KHR/core OpenGL debug output is unavailable or its required entry points could not be loaded";
+            Validation.SetInactive(reason);
+            return;
+        }
+
+        if (_debugOutput.TryActivate(_isDebugContext, out string inactiveReason))
+        {
+            Validation.SetActive(
+                GraphicsDeviceValidationFeatures.ApiDebugOutput
+                | GraphicsDeviceValidationFeatures.SynchronousMessageDelivery,
+                _debugOutput.Transport);
+        }
+        else
+        {
+            Validation.SetInactive(inactiveReason);
+        }
     }
 
     private bool ManualSrgbBackbufferQuery()
     {
+        // This probe runs before ownership moves to the execution thread and before
+        // device creation is committed, so its errors must be visible in Release builds.
+        void CheckLastError() => CheckInitializationError("sRGB backbuffer probe");
+
         if (_backendType == GraphicsBackend.OpenGLES && !_extensions.EXT_sRGBWriteControl)
         {
             return false;
@@ -434,7 +574,9 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
         }
 
         GL.DeleteFramebuffer(copySrcFb);
+        CheckLastError();
         GL.DeleteTexture(copySrc);
+        CheckLastError();
 
         return data[0] > 0.6f;
     }
@@ -456,17 +598,14 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
         CommandList cl,
         Fence fence)
     {
-        lock (_commandListDisposalLock)
-        {
-            OpenGLCommandList glCommandList = Util.AssertSubtype<CommandList, OpenGLCommandList>(cl);
-            OpenGLCommandEntryList entryList = glCommandList.CurrentCommands;
-            IncrementCount(glCommandList);
-            _executionThread.ExecuteCommands(entryList);
-            if (fence is OpenGLFence glFence)
-            {
-                glFence.Set();
-            }
-        }
+        OpenGLCommandList glCommandList = Util.AssertSubtype<CommandList, OpenGLCommandList>(cl);
+        OpenGLFence glFence = fence == null
+            ? null
+            : Util.AssertSubtype<Fence, OpenGLFence>(fence);
+        _executionThread.ExecuteCommands(
+            glCommandList.CurrentCommands,
+            glFence,
+            waitForNativeCompletion: RequiresValidationBoundary);
     }
 
     private int IncrementCount(OpenGLCommandList glCommandList)
@@ -520,16 +659,130 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
 
     private protected override void WaitForIdleCore()
     {
+        _executionThread.WaitForIdle();
+    }
+
+    private protected override void ExecuteWaitForIdle(Action waitForIdle)
+    {
+        ExecutionThread executionThread = _executionThread;
+        executionThread?.ThrowIfExecutingGpuWork("wait for the device to become idle");
+        if (executionThread == null
+            || (executionThread.IsExecutionThread
+                && executionThread.IsExecutingSynchronousWorkItem))
+        {
+            waitForIdle();
+            return;
+        }
+
+        executionThread.Run(waitForIdle);
+    }
+
+    internal override void ExecuteValidationBoundary<TState>(
+        string boundary,
+        TState state,
+        Action<TState> operation)
+    {
+        ExecutionThread executionThread = _executionThread;
+        executionThread?.ThrowIfExecutingGpuWork(
+            $"execute the '{boundary}' validation boundary");
+        if (executionThread == null
+            || (executionThread.IsExecutionThread
+                && executionThread.IsExecutingSynchronousWorkItem))
+        {
+            base.ExecuteValidationBoundary(boundary, state, operation);
+            return;
+        }
+
+        executionThread.Run(
+            () => base.ExecuteValidationBoundary(boundary, state, operation));
+    }
+
+    private protected override IReadOnlyList<GraphicsDeviceValidationMessage> CheckValidationCore(
+        string boundary)
+    {
+        ExecutionThread executionThread = _executionThread;
+        executionThread?.ThrowIfExecutingGpuWork(
+            $"check validation at the '{boundary}' boundary");
+        if (executionThread == null
+            || (executionThread.IsExecutionThread
+                && executionThread.IsExecutingSynchronousWorkItem))
+        {
+            return base.CheckValidationCore(boundary);
+        }
+
+        IReadOnlyList<GraphicsDeviceValidationMessage> observed = null;
+        executionThread.Run(() => observed = base.CheckValidationCore(boundary));
+        return observed;
+    }
+
+    private protected override void ExecuteDeviceDisposal(Action disposeCore)
+    {
+        ExecutionThread executionThread = _executionThread;
+        executionThread?.ThrowIfExecutingGpuWork("dispose the graphics device");
+        if (executionThread == null || executionThread.IsExecutionThread)
+        {
+            disposeCore();
+            return;
+        }
+
+        if (IsDisposed)
+        {
+            disposeCore();
+            return;
+        }
+
+        if (!executionThread.TryRunDisposal(
+            disposeCore,
+            out ExceptionDispatchInfo proxyFailure,
+            out bool ownsTerminatedThreadJoin))
+        {
+            // Admission may close after the optimistic IsDisposed check. In
+            // that case the execution-thread owner no longer depends on this
+            // caller, so joining the already-published shared transaction is safe.
+            disposeCore();
+            return;
+        }
+
+        // The admitted action may have encountered a disposal transaction
+        // already owned by this same GL thread and therefore returned
+        // reentrantly. The admission token makes this caller a participant in
+        // that transaction, so it must join the published outcome rather than
+        // taking DisposeCore's intentionally idempotent repeated-call path.
+        ExceptionDispatchInfo transactionFailure = null;
         try
         {
-            _executionThread.WaitForIdle();
+            JoinPublishedDeviceDisposal();
         }
-        catch (NeoVeldridException)
+        catch (Exception exception)
         {
-            // The GL context may already be destroyed by SDL_DestroyWindow.
-            // Silk.NET throws SymbolLoadingException for unresolved GL functions
-            // on a dead context. Safe to ignore - the OS reclaims all GL objects.
+            transactionFailure = ExceptionDispatchInfo.Capture(exception);
         }
+
+        if (ownsTerminatedThreadJoin)
+        {
+            // The proxy which caused termination is the only admitted disposal
+            // caller that can safely join. Reentrant/concurrent proxies complete
+            // while their owning outer worker action is still active.
+            executionThread.JoinTerminatedThread();
+        }
+
+        if (proxyFailure == null)
+        {
+            transactionFailure?.Throw();
+            return;
+        }
+
+        if (transactionFailure == null
+            || ReferenceEquals(proxyFailure.SourceException, transactionFailure.SourceException))
+        {
+            proxyFailure.Throw();
+            return;
+        }
+
+        throw new AggregateException(
+            "OpenGL disposal proxy and owning teardown both failed.",
+            proxyFailure.SourceException,
+            transactionFailure.SourceException);
     }
 
     public override TextureSampleCount GetSampleCountLimit(PixelFormat format, bool depthFormat)
@@ -637,7 +890,16 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
         uint arrayLayer)
     {
         StagingBlock textureData = _stagingMemoryPool.Stage(source, sizeInBytes);
-        StagingBlock argBlock = _stagingMemoryPool.GetStagingBlock(UpdateTextureArgsSize);
+        StagingBlock argBlock;
+        try
+        {
+            argBlock = _stagingMemoryPool.GetStagingBlock(UpdateTextureArgsSize);
+        }
+        catch
+        {
+            _stagingMemoryPool.Free(textureData);
+            throw;
+        }
         ref UpdateTextureArgs args = ref Unsafe.AsRef<UpdateTextureArgs>(argBlock.Data);
         args.Data = (IntPtr)textureData.Data;
         args.X = x;
@@ -669,11 +931,14 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
 
     public override bool WaitForFence(Fence fence, ulong nanosecondTimeout)
     {
+        ThrowIfExecutionThreadWouldBlock("wait for an OpenGL fence", nanosecondTimeout);
         return Util.AssertSubtype<Fence, OpenGLFence>(fence).Wait(nanosecondTimeout);
     }
 
     public override bool WaitForFences(Fence[] fences, bool waitAll, ulong nanosecondTimeout)
     {
+        ThrowIfExecutionThreadWouldBlock("wait for OpenGL fences", nanosecondTimeout);
+
         int msTimeout;
         if (nanosecondTimeout == ulong.MaxValue)
         {
@@ -685,31 +950,54 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
         }
 
         ManualResetEvent[] events = GetResetEventArray(fences.Length);
-        for (int i = 0; i < fences.Length; i++)
+        int acquiredCount = 0;
+        try
         {
-            events[i] = Util.AssertSubtype<Fence, OpenGLFence>(fences[i]).ResetEvent;
-        }
-        bool result;
-        if (waitAll)
-        {
-            result = WaitHandle.WaitAll(events, msTimeout);
-        }
-        else
-        {
-            int index = WaitHandle.WaitAny(events, msTimeout);
-            result = index != WaitHandle.WaitTimeout;
-        }
+            for (int i = 0; i < fences.Length; i++)
+            {
+                OpenGLFence glFence = Util.AssertSubtype<Fence, OpenGLFence>(fences[i]);
+                events[i] = glFence.AcquireWaitHandle();
+                acquiredCount++;
+            }
 
-        ReturnResetEventArray(events);
+            bool result;
+            if (waitAll)
+            {
+                result = WaitHandle.WaitAll(events, msTimeout);
+            }
+            else
+            {
+                int index = WaitHandle.WaitAny(events, msTimeout);
+                result = index != WaitHandle.WaitTimeout;
+            }
 
-        return result;
+            if (result)
+            {
+                for (int i = 0; i < fences.Length; i++)
+                {
+                    Util.AssertSubtype<Fence, OpenGLFence>(fences[i])
+                        .ThrowSubmissionExceptionIfSignaled();
+                }
+            }
+
+            return result;
+        }
+        finally
+        {
+            for (int i = 0; i < acquiredCount; i++)
+            {
+                Util.AssertSubtype<Fence, OpenGLFence>(fences[i]).ReleaseWaitHandle();
+                events[i] = null;
+            }
+            ReturnResetEventArray(events);
+        }
     }
 
     private ManualResetEvent[] GetResetEventArray(int length)
     {
         lock (_resetEventsLock)
         {
-            for (int i = _resetEvents.Count - 1; i > 0; i--)
+            for (int i = _resetEvents.Count - 1; i >= 0; i--)
             {
                 ManualResetEvent[] array = _resetEvents[i];
                 if (array.Length == length)
@@ -735,6 +1023,17 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
     public override void ResetFence(Fence fence)
     {
         Util.AssertSubtype<Fence, OpenGLFence>(fence).Reset();
+    }
+
+    private void ThrowIfExecutionThreadWouldBlock(string operation, ulong nanosecondTimeout)
+    {
+        if (nanosecondTimeout != 0 && _executionThread?.IsExecutionThread == true)
+        {
+            throw new InvalidOperationException(
+                $"The OpenGL execution thread cannot {operation}; blocking it would prevent "
+                + "queued submissions from reaching their completion boundary. Use a zero timeout "
+                + "for a non-blocking query or wait from another thread.");
+        }
     }
 
     internal void EnqueueDisposal(OpenGLDeferredResource resource)
@@ -778,66 +1077,229 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
 
     private void FlushDisposables()
     {
-        if (_glContextDestroyed) return;
+        if (_glContextUnavailable) return;
 
-        try
+        while (_resourcesToDispose.TryDequeue(out OpenGLDeferredResource resource))
         {
-            while (_resourcesToDispose.TryDequeue(out OpenGLDeferredResource resource))
-            {
-                resource.DestroyGLResources();
-            }
-        }
-        catch (SymbolLoadingException)
-        {
-            // GL context already gone (SDL_DestroyWindow ran or the OS reclaimed it).
-            // Silk.NET's lazy symbol loader throws on any unresolved GL call. Stop
-            // attempting GL cleanup; remaining resources stay in the queue and the
-            // OS reclaims their GL objects on process exit.
-            _glContextDestroyed = true;
+            resource.DestroyGLResources();
         }
     }
 
-    public void EnableDebugCallback() => EnableDebugCallback(DebugSeverity.DebugSeverityNotification);
-    public void EnableDebugCallback(DebugSeverity minimumSeverity) => EnableDebugCallback(DefaultDebugCallback(minimumSeverity));
-    public void EnableDebugCallback(DebugProc callback)
+    internal void InsertValidationTestMessage(DebugSeverity severity, uint id, string text)
     {
-        GL.Enable(EnableCap.DebugOutput);
-        CheckLastError();
-        // The debug callback delegate must be persisted, otherwise errors will occur
-        // when the OpenGL drivers attempt to call it after it has been collected.
-        _debugMessageCallback = callback;
-        GL.DebugMessageCallback(_debugMessageCallback, null);
-        CheckLastError();
-    }
-
-    private DebugProc DefaultDebugCallback(DebugSeverity minimumSeverity)
-    {
-        return (source, type, id, severity, length, message, userParam) =>
+        ArgumentNullException.ThrowIfNull(text);
+        if (_debugOutput == null || !Validation.Status.IsActive)
         {
-            if ((DebugSeverity)severity >= minimumSeverity
-                && (DebugType)type != DebugType.DebugTypeMarker
-                && (DebugType)type != DebugType.DebugTypePushGroup
-                && (DebugType)type != DebugType.DebugTypePopGroup)
-            {
-                string messageString = Marshal.PtrToStringAnsi(message, length);
-                Debug.WriteLine($"GL DEBUG MESSAGE: {source}, {type}, {id}. {severity}: {messageString}");
-            }
-        };
+            throw new InvalidOperationException("OpenGL debug output is not active.");
+        }
+
+        ExecuteOnGLThread(() => _debugOutput.InsertTestMessage(severity, id, text));
     }
 
     protected override void PlatformDispose()
     {
+        List<Exception> failures = null;
+        if (_executionThread == null)
+        {
+            DisposePartiallyConstructedContext(ref failures);
+        }
+        else
+        {
+            DisposeExecutionThreadContext(ref failures);
+        }
+
+        if (_debugOutput?.IsCallbackRootRetained == true)
+        {
+            string ownershipFailure = _glContextDestructionConfirmed
+                ? "The OpenGL context was confirmed destroyed, but its debug callback root "
+                    + "remained retained. This violates the callback ownership invariant."
+                : "The OpenGL debug callback could not be safely released because neither "
+                    + "native unregistration nor context destruction was confirmed. Its managed "
+                    + "callback root has been deliberately retained.";
+            AddPlatformCleanupFailure(
+                new NeoVeldridException(ownershipFailure),
+                ref failures);
+        }
+        else
+        {
+            _debugOutput = null;
+        }
+        _glContext = IntPtr.Zero;
+        _glContextUnavailable = true;
+        AttemptPlatformCleanup(
+            () => _workItems?.Dispose(),
+            ignoreContextUnavailable: false,
+            ref failures);
+
+        ThrowPlatformCleanupFailures(failures);
+    }
+
+    private void DisposeExecutionThreadContext(ref List<Exception> failures)
+    {
+        AttemptPlatformCleanup(
+            FlushAndFinish,
+            ignoreContextUnavailable: true,
+            ref failures);
+        if (_debugOutput != null)
+        {
+            AttemptPlatformCleanup(
+                () => ExecuteOnGLThread(_debugOutput.Unregister),
+                ignoreContextUnavailable: false,
+                ref failures);
+        }
+
+        // Termination owns context deletion and must run even when flushing,
+        // callback removal, or a previously queued command failed.
+        AttemptPlatformCleanup(
+            _executionThread.Terminate,
+            ignoreContextUnavailable: false,
+            ref failures);
+        AttemptPlatformCleanup(
+            _stagingMemoryPool.Dispose,
+            ignoreContextUnavailable: false,
+            ref failures);
+    }
+
+    private void DisposePartiallyConstructedContext(ref List<Exception> failures)
+    {
+        bool contextAvailable = _glContext != IntPtr.Zero && !_glContextUnavailable;
+        bool contextCurrent = false;
+        if (contextAvailable)
+        {
+            contextCurrent = AttemptPlatformCleanup(
+                () =>
+                {
+                    _makeCurrent(_glContext);
+                    IntPtr currentContext = _getCurrentContext();
+                    if (currentContext != _glContext)
+                    {
+                        throw new NeoVeldridException(
+                            "The platform did not make the owned OpenGL context current during teardown.");
+                    }
+                },
+                ignoreContextUnavailable: false,
+                ref failures);
+        }
+
+        if (contextCurrent)
+        {
+            AttemptPlatformCleanup(
+                FlushDisposables,
+                ignoreContextUnavailable: true,
+                ref failures);
+        }
+
+        if (contextCurrent && _debugOutput != null)
+        {
+            AttemptPlatformCleanup(
+                _debugOutput.Unregister,
+                ignoreContextUnavailable: false,
+                ref failures);
+        }
+
+        if (contextCurrent)
+        {
+            AttemptPlatformCleanup(
+                () => ClearOwnedContext("partial device teardown"),
+                ignoreContextUnavailable: false,
+                ref failures);
+        }
+
+        AttemptPlatformCleanup(
+            _stagingMemoryPool.Dispose,
+            ignoreContextUnavailable: false,
+            ref failures);
+        if (_glContext != IntPtr.Zero)
+        {
+            AttemptPlatformCleanup(
+                () =>
+                {
+                    _deleteContext(_glContext);
+                    ConfirmContextDestroyed();
+                },
+                ignoreContextUnavailable: false,
+                ref failures);
+        }
+    }
+
+    private static bool AttemptPlatformCleanup(
+        Action cleanup,
+        bool ignoreContextUnavailable,
+        ref List<Exception> failures)
+    {
         try
         {
-            FlushAndFinish();
+            cleanup();
+            return true;
         }
-        catch (NeoVeldridException)
+        catch (Exception exception)
         {
-            // The GL context may already be destroyed by SDL_DestroyWindow.
-            // Silk.NET throws SymbolLoadingException for unresolved GL functions
-            // on a dead context. Safe to ignore during shutdown.
+            if (ignoreContextUnavailable && IsContextUnavailable(exception))
+            {
+                return false;
+            }
+
+            AddPlatformCleanupFailure(exception, ref failures);
+            return false;
         }
-        _executionThread.Terminate();
+    }
+
+    private static void AddPlatformCleanupFailure(Exception exception, ref List<Exception> failures)
+    {
+        failures ??= new List<Exception>();
+        failures.Add(exception);
+    }
+
+    private void ConfirmContextDestroyed()
+    {
+        _glContextDestructionConfirmed = true;
+        _glContextUnavailable = true;
+        _debugOutput?.ConfirmContextDestroyed();
+    }
+
+    private static bool IsContextUnavailable(Exception exception)
+    {
+        if (exception is SymbolLoadingException)
+        {
+            return true;
+        }
+
+        if (exception is AggregateException aggregateException)
+        {
+            if (aggregateException.InnerExceptions.Count == 0)
+            {
+                return false;
+            }
+
+            foreach (Exception innerException in aggregateException.InnerExceptions)
+            {
+                if (!IsContextUnavailable(innerException))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        return exception.InnerException != null
+            && IsContextUnavailable(exception.InnerException);
+    }
+
+    private static void ThrowPlatformCleanupFailures(List<Exception> failures)
+    {
+        if (failures == null || failures.Count == 0)
+        {
+            return;
+        }
+
+        if (failures.Count == 1)
+        {
+            ExceptionDispatchInfo.Capture(failures[0]).Throw();
+        }
+
+        throw new AggregateException(
+            "OpenGL teardown encountered multiple failures.",
+            failures);
     }
 
     public override bool GetOpenGLInfo(out BackendInfoOpenGL info)
@@ -849,8 +1311,10 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
     internal void ExecuteOnGLThread(Action action)
     {
         _executionThread.Run(action);
-        _executionThread.WaitForIdle();
     }
+
+    internal override int PendingBackendWorkItemCount =>
+        _executionThread?.PendingWorkItemCount ?? 0;
 
     internal void FlushAndFinish()
     {
@@ -870,40 +1334,206 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
     {
         private readonly OpenGLGraphicsDevice _gd;
         private readonly BlockingCollection<ExecutionThreadWorkItem> _workItems;
+        private readonly Queue<ExecutionThreadWorkItem> _deferredOrderedWorkItems =
+            new Queue<ExecutionThreadWorkItem>();
+        private readonly HashSet<WorkItemCompletion> _activeSnapshotBoundaries =
+            new HashSet<WorkItemCompletion>();
         private readonly Action<IntPtr> _makeCurrent;
+        private readonly Func<IntPtr> _getCurrentContext;
         private readonly IntPtr _context;
+        private readonly Thread _thread;
+        private readonly object _admissionLock = new object();
+        private ExecutionThreadState _state = ExecutionThreadState.Running;
+        private bool _started;
         private bool _terminated;
-        private readonly ManualResetEventSlim _terminatedEvent = new ManualResetEventSlim();
         private readonly List<Exception> _exceptions = new List<Exception>();
         private readonly object _exceptionsLock = new object();
+        private Exception _startupException;
+        private Exception _terminationException;
+        private int _synchronousWorkItemDepth;
+        private int _gpuWorkItemDepth;
+        private int _deferredOrderedWorkItemCount;
 
         public ExecutionThread(
             OpenGLGraphicsDevice gd,
             BlockingCollection<ExecutionThreadWorkItem> workItems,
             Action<IntPtr> makeCurrent,
+            Func<IntPtr> getCurrentContext,
             IntPtr context)
         {
             _gd = gd;
             _workItems = workItems;
             _makeCurrent = makeCurrent;
+            _getCurrentContext = getCurrentContext;
             _context = context;
-            Thread thread = new Thread(Run);
-            thread.IsBackground = true;
-            thread.Start();
+            _thread = new Thread(Run);
+            _thread.IsBackground = true;
+            _thread.Start();
+
+            lock (_admissionLock)
+            {
+                while (!_started)
+                {
+                    Monitor.Wait(_admissionLock);
+                }
+            }
+            if (_startupException != null)
+            {
+                _thread.Join();
+                throw new NeoVeldridException(
+                    "The OpenGL execution thread could not acquire its context.",
+                    _startupException);
+            }
         }
 
         private void Run()
         {
-            _makeCurrent(_context);
+            try
+            {
+                _makeCurrent(_context);
+                IntPtr currentContext = _getCurrentContext();
+                if (currentContext != _context)
+                {
+                    throw new NeoVeldridException(
+                        "The platform did not make the owned OpenGL context current on the execution thread. "
+                        + $"Expected 0x{_context.ToInt64():X}, but observed 0x{currentContext.ToInt64():X}.");
+                }
+            }
+            catch (Exception exception)
+            {
+                lock (_admissionLock)
+                {
+                    _startupException = exception;
+                    _terminated = true;
+                    _state = ExecutionThreadState.Closed;
+                    _workItems.CompleteAdding();
+                    Monitor.PulseAll(_admissionLock);
+                }
+            }
+            finally
+            {
+                lock (_admissionLock)
+                {
+                    _started = true;
+                    Monitor.PulseAll(_admissionLock);
+                }
+            }
+
             while (!_terminated)
             {
-                ExecutionThreadWorkItem workItem = _workItems.Take();
+                if (!TryTakeNextWorkItem(out ExecutionThreadWorkItem workItem))
+                {
+                    break;
+                }
                 ExecuteWorkItem(workItem);
+            }
+
+            if (!_terminated)
+            {
+                FailExecutionThread(
+                    new NeoVeldridException(
+                        "The OpenGL execution queue completed without a termination work item."));
+            }
+        }
+
+        internal bool IsExecutionThread => Thread.CurrentThread == _thread;
+
+        internal bool IsExecutingSynchronousWorkItem =>
+            IsExecutionThread && _synchronousWorkItemDepth != 0;
+
+        private bool IsExecutingGpuWork =>
+            IsExecutionThread && _gpuWorkItemDepth != 0;
+
+        internal int PendingWorkItemCount =>
+            _workItems.Count + Volatile.Read(ref _deferredOrderedWorkItemCount);
+
+        internal void ThrowIfExecutingGpuWork(string operation)
+        {
+            if (IsExecutingGpuWork)
+            {
+                throw new InvalidOperationException(
+                    $"The OpenGL execution thread cannot {operation} from inside submitted GPU work. "
+                    + "The active command or update must return before a lifecycle boundary can begin.");
+            }
+        }
+
+        private bool TryTakeNextWorkItem(out ExecutionThreadWorkItem workItem)
+        {
+            if (TryTakeDeferredOrderedWorkItem(out workItem))
+            {
+                return true;
+            }
+
+            try
+            {
+                workItem = _workItems.Take();
+                return true;
+            }
+            catch (InvalidOperationException) when (_workItems.IsCompleted)
+            {
+                workItem = default;
+                return false;
+            }
+        }
+
+        private bool TryTakeAcceptedWork(out ExecutionThreadWorkItem workItem)
+        {
+            if (TryTakeDeferredOrderedWorkItem(out workItem))
+            {
+                return true;
+            }
+
+            return _workItems.TryTake(out workItem);
+        }
+
+        private bool TryTakeDeferredOrderedWorkItem(out ExecutionThreadWorkItem workItem)
+        {
+            if (_deferredOrderedWorkItems.Count == 0)
+            {
+                workItem = default;
+                return false;
+            }
+
+            workItem = _deferredOrderedWorkItems.Dequeue();
+            Interlocked.Decrement(ref _deferredOrderedWorkItemCount);
+            return true;
+        }
+
+        private void DeferOrderedWorkItem(ExecutionThreadWorkItem workItem)
+        {
+            _deferredOrderedWorkItems.Enqueue(workItem);
+            Interlocked.Increment(ref _deferredOrderedWorkItemCount);
+        }
+
+        private void QueueWorkItem(ExecutionThreadWorkItem workItem)
+        {
+            lock (_admissionLock)
+            {
+                if (_state != ExecutionThreadState.Running)
+                {
+                    throw new ObjectDisposedException(
+                        nameof(OpenGLGraphicsDevice),
+                        "The OpenGL execution thread is no longer accepting work.");
+                }
+
+                _workItems.Add(workItem);
             }
         }
 
         private void ExecuteWorkItem(ExecutionThreadWorkItem workItem)
         {
+            Exception failure = null;
+            bool isSynchronousWorkItem = workItem.Completion != null;
+            bool isGpuWorkItem = workItem.IsGpuWork;
+            if (isSynchronousWorkItem)
+            {
+                _synchronousWorkItemDepth++;
+            }
+            if (isGpuWorkItem)
+            {
+                _gpuWorkItemDepth++;
+            }
+
             try
             {
                 switch (workItem.Type)
@@ -911,36 +1541,78 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
                     case WorkItemType.ExecuteList:
                     {
                         OpenGLCommandEntryList list = (OpenGLCommandEntryList)workItem.Object0;
+                        OpenGLFence fence = (OpenGLFence)workItem.Object1;
+                        List<Exception> failures = null;
                         try
                         {
                             list.ExecuteAll(_gd._commandExecutor);
                         }
-                        finally
+                        catch (Exception exception)
+                        {
+                            AddFailure(exception, ref failures);
+                        }
+
+                        if (fence != null || workItem.Completion != null)
+                        {
+                            try
+                            {
+                                // OpenGLFence is a CPU event, so it is only truthful after
+                                // all commands issued by this list have completed on the GPU.
+                                // Validation boundaries also wait here so asynchronous driver
+                                // failures are observable before their checkpoint runs.
+                                _gd.GL.Flush();
+                                _gd.GL.Finish();
+                            }
+                            catch (Exception exception)
+                            {
+                                AddFailure(exception, ref failures);
+                            }
+                        }
+
+                        try
                         {
                             if (!_gd.CheckCommandListDisposal(list.Parent))
                             {
                                 list.Parent.OnCompleted(list);
                             }
                         }
+                        catch (Exception exception)
+                        {
+                            AddFailure(exception, ref failures);
+                        }
+
+                        Exception commandFailure = CreateFailure(
+                            "OpenGL command execution encountered multiple failures.",
+                            failures);
+                        if (fence != null)
+                        {
+                            try
+                            {
+                                fence.CompleteSubmission(commandFailure);
+                            }
+                            catch (Exception exception)
+                            {
+                                AddFailure(exception, ref failures);
+                            }
+                        }
+
+                        ThrowFailures(
+                            "OpenGL command execution encountered multiple failures.",
+                            failures);
                     }
                     break;
                     case WorkItemType.Map:
                     {
                         MappableResource resourceToMap = (MappableResource)workItem.Object0;
-                        ManualResetEventSlim mre = (ManualResetEventSlim)workItem.Object1;
-
                         MapParams* resultPtr = (MapParams*)Util.UnpackIntPtr(workItem.UInt0, workItem.UInt1);
 
                         if (resultPtr->Map)
                         {
-                            ExecuteMapResource(
-                                resourceToMap,
-                                mre,
-                                resultPtr);
+                            ExecuteMapResource(resourceToMap, resultPtr);
                         }
                         else
                         {
-                            ExecuteUnmapResource(resourceToMap, resultPtr->Subresource, mre);
+                            ExecuteUnmapResource(resourceToMap, resultPtr->Subresource);
                         }
                     }
                     break;
@@ -950,55 +1622,50 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
                         uint offsetInBytes = workItem.UInt0;
                         StagingBlock stagingBlock = _gd.StagingMemoryPool.RetrieveById(workItem.UInt1);
 
-                        _gd._commandExecutor.UpdateBuffer(
-                            updateBuffer,
-                            offsetInBytes,
-                            (IntPtr)stagingBlock.Data,
-                            stagingBlock.SizeInBytes);
-
-                        _gd.StagingMemoryPool.Free(stagingBlock);
+                        try
+                        {
+                            _gd._commandExecutor.UpdateBuffer(
+                                updateBuffer,
+                                offsetInBytes,
+                                (IntPtr)stagingBlock.Data,
+                                stagingBlock.SizeInBytes);
+                        }
+                        finally
+                        {
+                            _gd.StagingMemoryPool.Free(stagingBlock);
+                        }
                     }
                     break;
                     case WorkItemType.UpdateTexture:
+                    {
                         Texture texture = (Texture)workItem.Object0;
                         StagingMemoryPool pool = _gd.StagingMemoryPool;
                         StagingBlock argBlock = pool.RetrieveById(workItem.UInt0);
                         StagingBlock textureData = pool.RetrieveById(workItem.UInt1);
                         ref UpdateTextureArgs args = ref Unsafe.AsRef<UpdateTextureArgs>(argBlock.Data);
 
-                        _gd._commandExecutor.UpdateTexture(
-                            texture, args.Data, args.X, args.Y, args.Z,
-                            args.Width, args.Height, args.Depth, args.MipLevel, args.ArrayLayer);
-
-                        pool.Free(argBlock);
-                        pool.Free(textureData);
+                        try
+                        {
+                            _gd._commandExecutor.UpdateTexture(
+                                texture, args.Data, args.X, args.Y, args.Z,
+                                args.Width, args.Height, args.Depth, args.MipLevel, args.ArrayLayer);
+                        }
+                        finally
+                        {
+                            pool.Free(argBlock);
+                            pool.Free(textureData);
+                        }
+                    }
                         break;
                     case WorkItemType.GenericAction:
+                    case WorkItemType.DisposalAction:
                     {
                         ((Action)workItem.Object0)();
                     }
                     break;
                     case WorkItemType.TerminateAction:
                     {
-                        try
-                        {
-                            try
-                            {
-                                _makeCurrent(_gd._glContext);
-                                _gd.FlushDisposables();
-                                _gd._deleteContext(_gd._glContext);
-                            }
-                            catch (SymbolLoadingException)
-                            {
-                                // Context already destroyed by the OS. Nothing to clean up via GL.
-                            }
-                            _gd.StagingMemoryPool.Dispose();
-                        }
-                        finally
-                        {
-                            _terminated = true;
-                            _terminatedEvent.Set();
-                        }
+                        ExecuteTermination();
                     }
                     break;
                     case WorkItemType.SetSyncToVerticalBlank:
@@ -1015,61 +1682,82 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
                     break;
                     case WorkItemType.WaitForIdle:
                     {
-                        // Set() must be in finally so the main thread never deadlocks
-                        // if FlushDisposables or glFinish throws on a destroyed context.
+                        List<Exception> failures = null;
                         try
                         {
                             _gd.FlushDisposables();
-                            bool isFullFlush = workItem.UInt0 != 0;
-                            if (isFullFlush)
+                        }
+                        catch (Exception exception)
+                        {
+                            AddFailure(exception, ref failures);
+                        }
+
+                        bool isFullFlush = workItem.UInt0 != 0;
+                        if (isFullFlush)
+                        {
+                            try
                             {
                                 _gd.GL.Flush();
                                 _gd.GL.Finish();
                             }
+                            catch (Exception exception)
+                            {
+                                AddFailure(exception, ref failures);
+                            }
                         }
-                        catch (SymbolLoadingException)
-                        {
-                            // Context destroyed before the work item ran. Flush is moot; finally releases the caller.
-                        }
-                        finally
-                        {
-                            ((ManualResetEventSlim)workItem.Object0).Set();
-                        }
+
+                        ThrowFailures(
+                            "OpenGL idle work encountered multiple failures.",
+                            failures);
                     }
                     break;
                     case WorkItemType.InitializeResource:
                     {
-                        InitializeResourceInfo info = (InitializeResourceInfo)workItem.Object0;
-                        try
-                        {
-                            info.DeferredResource.EnsureResourcesCreated();
-                        }
-                        catch (Exception e)
-                        {
-                            info.Exception = e;
-                        }
-                        finally
-                        {
-                            info.ResetEvent.Set();
-                        }
+                        ((OpenGLDeferredResource)workItem.Object0).EnsureResourcesCreated();
                     }
                     break;
                     default:
                         throw new InvalidOperationException("Invalid command type: " + workItem.Type);
                 }
             }
-            catch (Exception e) when (!Debugger.IsAttached)
+            catch (Exception exception)
             {
-                lock (_exceptionsLock)
+                failure = exception;
+            }
+            finally
+            {
+                if (isGpuWorkItem)
                 {
-                    _exceptions.Add(e);
+                    _gpuWorkItemDepth--;
                 }
+                if (isSynchronousWorkItem)
+                {
+                    List<Exception> failures = null;
+                    AddFailure(TakePendingException(), ref failures);
+                    AddFailure(failure, ref failures);
+                    failure = CreateFailure(
+                        "OpenGL synchronous work encountered multiple failures.",
+                        failures);
+                    _synchronousWorkItemDepth--;
+                    workItem.Completion.Complete(failure, _terminated);
+                }
+                else if (failure != null)
+                {
+                    AddPendingException(failure);
+                }
+            }
+        }
+
+        private void AddPendingException(Exception exception)
+        {
+            lock (_exceptionsLock)
+            {
+                _exceptions.Add(exception);
             }
         }
 
         private void ExecuteMapResource(
             MappableResource resource,
-            ManualResetEventSlim mre,
             MapParams* result)
         {
             uint subresource = result->Subresource;
@@ -1319,13 +2007,9 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
                 result->Succeeded = false;
                 throw;
             }
-            finally
-            {
-                mre.Set();
-            }
         }
 
-        private void ExecuteUnmapResource(MappableResource resource, uint subresource, ManualResetEventSlim mre)
+        private void ExecuteUnmapResource(MappableResource resource, uint subresource)
         {
             MappedResourceCacheKey key = new MappedResourceCacheKey(resource, subresource);
             lock (_gd._mappedResourceLock)
@@ -1378,141 +2062,869 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
                 }
             }
 
-            mre.Set();
         }
 
         private void CheckExceptions()
         {
+            Exception exception = TakePendingException();
+            if (exception != null)
+            {
+                ExceptionDispatchInfo.Capture(exception).Throw();
+            }
+        }
+
+        private Exception TakePendingException()
+        {
             lock (_exceptionsLock)
             {
-                if (_exceptions.Count > 0)
+                if (_exceptions.Count == 0)
                 {
-                    Exception innerException = _exceptions.Count == 1
-                        ? _exceptions[0]
-                        : new AggregateException(_exceptions.ToArray());
-                    _exceptions.Clear();
-                    throw new NeoVeldridException(
-                        "Error(s) were encountered during the execution of OpenGL commands. See InnerException for more information.",
-                        innerException);
-
+                    return null;
                 }
+
+                Exception innerException = _exceptions.Count == 1
+                    ? _exceptions[0]
+                    : new AggregateException(_exceptions.ToArray());
+                _exceptions.Clear();
+                return new NeoVeldridException(
+                    "Error(s) were encountered during the execution of OpenGL commands. See InnerException for more information.",
+                    innerException);
             }
         }
 
         public MappedResource Map(MappableResource resource, MapMode mode, uint subresource)
         {
-            CheckExceptions();
-
             MapParams mrp = new MapParams();
             mrp.Map = true;
             mrp.Subresource = subresource;
             mrp.MapMode = mode;
 
-            ManualResetEventSlim mre = new ManualResetEventSlim(false);
-            _workItems.Add(new ExecutionThreadWorkItem(resource, &mrp, mre));
-            mre.Wait();
+            WorkItemCompletion completion = new WorkItemCompletion();
+            ExecuteSynchronously(new ExecutionThreadWorkItem(resource, &mrp, completion));
             if (!mrp.Succeeded)
             {
                 throw NeoVeldridMappedResourceException.MapFailed(resource, subresource);
             }
-
-            mre.Dispose();
 
             return new MappedResource(resource, mode, mrp.Data, mrp.DataSize, mrp.Subresource, mrp.RowPitch, mrp.DepthPitch);
         }
 
         internal void Unmap(MappableResource resource, uint subresource)
         {
-            CheckExceptions();
-
             MapParams mrp = new MapParams();
             mrp.Map = false;
             mrp.Subresource = subresource;
 
-            ManualResetEventSlim mre = new ManualResetEventSlim(false);
-            _workItems.Add(new ExecutionThreadWorkItem(resource, &mrp, mre));
-            mre.Wait();
-            mre.Dispose();
+            ExecuteSynchronously(
+                new ExecutionThreadWorkItem(
+                    resource,
+                    &mrp,
+                    new WorkItemCompletion()));
         }
 
-        public void ExecuteCommands(OpenGLCommandEntryList entryList)
+        public void ExecuteCommands(
+            OpenGLCommandEntryList entryList,
+            OpenGLFence fence,
+            bool waitForNativeCompletion)
         {
-            CheckExceptions();
-            entryList.Parent.OnSubmitted(entryList);
-            _workItems.Add(new ExecutionThreadWorkItem(entryList));
+            ThrowIfExecutingGpuWork("submit another command list");
+            WorkItemCompletion completion = waitForNativeCompletion
+                ? new WorkItemCompletion()
+                : null;
+            ExecutionThreadWorkItem workItem = new ExecutionThreadWorkItem(
+                entryList,
+                fence,
+                completion);
+            bool executeInline = IsExecutionThread;
+            bool submitted = false;
+            bool countIncremented = false;
+            bool fencePrepared = false;
+
+            lock (_gd._commandListDisposalLock)
+            {
+                try
+                {
+                    fence?.BeginSubmission();
+                    fencePrepared = fence != null;
+                    _gd.IncrementCount(entryList.Parent);
+                    countIncremented = true;
+                    submitted = true;
+                    entryList.Parent.OnSubmitted(entryList);
+                    if (executeInline)
+                    {
+                        EnsureAdmissionOpen();
+                    }
+                    else
+                    {
+                        QueueWorkItem(workItem);
+                    }
+                }
+                catch (Exception admissionFailure)
+                {
+                    List<Exception> failures = null;
+                    AddFailure(admissionFailure, ref failures);
+                    try
+                    {
+                        if (countIncremented && submitted)
+                        {
+                            if (!_gd.CheckCommandListDisposal(entryList.Parent))
+                            {
+                                entryList.Parent.OnCompleted(entryList);
+                            }
+                        }
+                        else if (countIncremented)
+                        {
+                            _gd.DecrementCount(entryList.Parent);
+                        }
+                    }
+                    catch (Exception ownershipFailure)
+                    {
+                        AddFailure(ownershipFailure, ref failures);
+                    }
+
+                    if (fencePrepared)
+                    {
+                        try
+                        {
+                            fence.CancelSubmission();
+                        }
+                        catch (Exception fenceFailure)
+                        {
+                            AddFailure(fenceFailure, ref failures);
+                        }
+                    }
+                    completion?.Dispose();
+
+                    ThrowFailures(
+                        "OpenGL command submission was rejected and ownership rollback also failed.",
+                        failures);
+                }
+            }
+
+            if (executeInline)
+            {
+                ExecuteWorkItem(workItem);
+                if (completion == null)
+                {
+                    CheckExceptions();
+                }
+            }
+
+            completion?.WaitAndThrow();
         }
 
         internal void UpdateBuffer(DeviceBuffer buffer, uint offsetInBytes, StagingBlock stagingBlock)
         {
-            CheckExceptions();
-
-            _workItems.Add(new ExecutionThreadWorkItem(buffer, offsetInBytes, stagingBlock));
+            ExecutionThreadWorkItem workItem = new ExecutionThreadWorkItem(
+                buffer,
+                offsetInBytes,
+                stagingBlock);
+            bool ownershipTransferred = false;
+            try
+            {
+                DispatchAsynchronous(workItem, out ownershipTransferred);
+            }
+            catch
+            {
+                if (!ownershipTransferred)
+                {
+                    _gd.StagingMemoryPool.Free(stagingBlock);
+                }
+                throw;
+            }
         }
 
         internal void UpdateTexture(Texture texture, uint argBlockId, uint dataBlockId)
         {
-            CheckExceptions();
-
-            _workItems.Add(new ExecutionThreadWorkItem(texture, argBlockId, dataBlockId));
+            ExecutionThreadWorkItem workItem = new ExecutionThreadWorkItem(
+                texture,
+                argBlockId,
+                dataBlockId);
+            bool ownershipTransferred = false;
+            try
+            {
+                DispatchAsynchronous(workItem, out ownershipTransferred);
+            }
+            catch
+            {
+                if (!ownershipTransferred)
+                {
+                    StagingMemoryPool pool = _gd.StagingMemoryPool;
+                    pool.Free(pool.RetrieveById(argBlockId));
+                    pool.Free(pool.RetrieveById(dataBlockId));
+                }
+                throw;
+            }
         }
 
         internal void Run(Action a)
         {
-            CheckExceptions();
+            ArgumentNullException.ThrowIfNull(a);
+            if (IsExecutingGpuWork)
+            {
+                // ExecuteOnGLThread is already on its promised thread. Keeping
+                // the nested action inside the active command preserves command
+                // atomicity; lifecycle calls made by that action are rejected by
+                // the GPU-work guard above.
+                a();
+                return;
+            }
 
-            _workItems.Add(new ExecutionThreadWorkItem(a));
+            ExecuteBoundaryWork(
+                new ExecutionThreadWorkItem(
+                    a,
+                    new WorkItemCompletion()),
+                "OpenGL execution-thread action encountered multiple failures.");
+        }
+
+        internal bool TryRunDisposal(
+            Action disposeCore,
+            out ExceptionDispatchInfo completionFailure,
+            out bool ownsTerminatedThreadJoin)
+        {
+            ArgumentNullException.ThrowIfNull(disposeCore);
+            Debug.Assert(!IsExecutionThread);
+            completionFailure = null;
+            ownsTerminatedThreadJoin = false;
+
+            WorkItemCompletion completion = new WorkItemCompletion();
+            lock (_admissionLock)
+            {
+                if (_state != ExecutionThreadState.Running)
+                {
+                    completion.Dispose();
+                    return false;
+                }
+
+                try
+                {
+                    _workItems.Add(
+                        ExecutionThreadWorkItem.CreateDisposal(
+                            disposeCore,
+                            completion));
+                }
+                catch
+                {
+                    completion.Dispose();
+                    throw;
+                }
+            }
+
+            // Once admitted, the work item's exact teardown failure belongs to
+            // this caller. A false result is reserved for pre-admission closure.
+            try
+            {
+                completion.WaitAndThrow();
+            }
+            catch (Exception exception)
+            {
+                completionFailure = ExceptionDispatchInfo.Capture(exception);
+            }
+            ownsTerminatedThreadJoin = completion.ExecutionThreadTerminatedAtCompletion;
+            return true;
         }
 
         internal void Terminate()
         {
-            CheckExceptions();
+            if (IsExecutionThread)
+            {
+                TerminateOnExecutionThread();
+                return;
+            }
 
-            _workItems.Add(new ExecutionThreadWorkItem(WorkItemType.TerminateAction));
-            _terminatedEvent.Wait();
-            _terminatedEvent.Dispose();
-            CheckExceptions();
+            List<Exception> failures = null;
+            WorkItemCompletion completion = null;
+            bool ownsTermination = false;
+
+            try
+            {
+                lock (_admissionLock)
+                {
+                    if (_state == ExecutionThreadState.Running)
+                    {
+                        _state = ExecutionThreadState.Closing;
+                        completion = new WorkItemCompletion();
+                        try
+                        {
+                            _workItems.Add(
+                                new ExecutionThreadWorkItem(
+                                    WorkItemType.TerminateAction,
+                                    completion));
+                            _workItems.CompleteAdding();
+                            ownsTermination = true;
+                        }
+                        catch
+                        {
+                            completion.Dispose();
+                            completion = null;
+                            if (!_workItems.IsAddingCompleted)
+                            {
+                                _workItems.CompleteAdding();
+                            }
+                            throw;
+                        }
+                    }
+                }
+
+                if (ownsTermination)
+                {
+                    completion.WaitAndThrow();
+                }
+                else
+                {
+                    WaitForTermination();
+                    Exception terminationException;
+                    lock (_admissionLock)
+                    {
+                        terminationException = _terminationException;
+                    }
+                    if (terminationException != null)
+                    {
+                        ExceptionDispatchInfo.Capture(terminationException).Throw();
+                    }
+                }
+            }
+            catch (Exception exception)
+            {
+                AddFailure(exception, ref failures);
+            }
+            finally
+            {
+                JoinTerminatedThread();
+            }
+
+            // The worker is joined, so no active or later boundary can own any
+            // residual terminal error left by catastrophic queue rejection.
+            AddFailure(TakePendingException(), ref failures);
+            ThrowFailures(
+                "OpenGL execution-thread termination encountered multiple failures.",
+                failures);
+        }
+
+        internal void JoinTerminatedThread()
+        {
+            Debug.Assert(!IsExecutionThread);
+            WaitForTermination();
+            _thread.Join();
+        }
+
+        private static void AddFailure(Exception exception, ref List<Exception> failures)
+        {
+            if (exception == null)
+            {
+                return;
+            }
+
+            failures ??= new List<Exception>();
+            failures.Add(exception);
+        }
+
+        private static void ThrowFailures(string aggregateMessage, List<Exception> failures)
+        {
+            Exception failure = CreateFailure(aggregateMessage, failures);
+            if (failure == null)
+            {
+                return;
+            }
+
+            ExceptionDispatchInfo.Capture(failure).Throw();
+        }
+
+        private static Exception CreateFailure(
+            string aggregateMessage,
+            List<Exception> failures)
+        {
+            if (failures == null || failures.Count == 0)
+            {
+                return null;
+            }
+
+            return failures.Count == 1
+                ? failures[0]
+                : new AggregateException(aggregateMessage, failures);
         }
 
         internal void WaitForIdle()
         {
-            ManualResetEventSlim mre = new ManualResetEventSlim();
-            _workItems.Add(new ExecutionThreadWorkItem(mre, isFullFlush: false));
-            mre.Wait();
-            mre.Dispose();
-
-            CheckExceptions();
+            ExecuteBoundaryWork(
+                new ExecutionThreadWorkItem(
+                    new WorkItemCompletion(),
+                    isFullFlush: true),
+                "OpenGL idle synchronization encountered multiple failures.");
         }
 
         internal void SetSyncToVerticalBlank(bool value)
         {
-            _workItems.Add(new ExecutionThreadWorkItem(value));
+            DispatchAsynchronous(new ExecutionThreadWorkItem(value), out _);
         }
 
         internal void SwapBuffers()
         {
-            _workItems.Add(new ExecutionThreadWorkItem(WorkItemType.SwapBuffers));
+            ThrowIfExecutingGpuWork("present a swapchain");
+            ExecuteBoundaryWork(
+                new ExecutionThreadWorkItem(
+                    WorkItemType.SwapBuffers,
+                    new WorkItemCompletion()),
+                "OpenGL presentation encountered multiple failures.");
         }
 
         internal void FlushAndFinish()
         {
-            ManualResetEventSlim mre = new ManualResetEventSlim();
-            _workItems.Add(new ExecutionThreadWorkItem(mre, isFullFlush: true));
-            mre.Wait();
-            mre.Dispose();
-
-            CheckExceptions();
+            ThrowIfExecutingGpuWork("flush and finish the device");
+            ExecuteBoundaryWork(
+                new ExecutionThreadWorkItem(
+                    new WorkItemCompletion(),
+                    isFullFlush: true),
+                "OpenGL flush-and-finish encountered multiple failures.");
         }
 
         internal void InitializeResource(OpenGLDeferredResource deferredResource)
         {
-            InitializeResourceInfo info = new InitializeResourceInfo(deferredResource, new ManualResetEventSlim());
-            _workItems.Add(new ExecutionThreadWorkItem(info));
-            info.ResetEvent.Wait();
-            info.ResetEvent.Dispose();
+            ExecuteSynchronously(
+                new ExecutionThreadWorkItem(
+                    deferredResource,
+                    new WorkItemCompletion()));
+        }
 
-            if (info.Exception != null)
+        private void ExecuteSynchronously(ExecutionThreadWorkItem workItem)
+        {
+            Debug.Assert(workItem.Completion != null);
+            if (IsExecutionThread)
             {
-                throw info.Exception;
+                ExecuteWorkItem(workItem);
+            }
+            else
+            {
+                try
+                {
+                    QueueWorkItem(workItem);
+                }
+                catch
+                {
+                    workItem.Completion.Dispose();
+                    throw;
+                }
+            }
+
+            workItem.Completion.WaitAndThrow();
+        }
+
+        private void ExecuteBoundaryWork(
+            ExecutionThreadWorkItem workItem,
+            string aggregateMessage)
+        {
+            List<Exception> failures = null;
+            bool externalCaller = !IsExecutionThread;
+            try
+            {
+                if (IsExecutionThread)
+                {
+                    ExecuteSnapshotBoundary(workItem);
+                }
+                else
+                {
+                    ExecuteSynchronously(workItem);
+                }
+            }
+            catch (Exception exception)
+            {
+                AddFailure(exception, ref failures);
+            }
+
+            if (externalCaller
+                && workItem.Completion.ExecutionThreadTerminatedAtCompletion)
+            {
+                try
+                {
+                    JoinTerminatedThread();
+                }
+                catch (Exception exception)
+                {
+                    AddFailure(exception, ref failures);
+                }
+            }
+
+            ThrowFailures(aggregateMessage, failures);
+        }
+
+        /// <summary>
+        /// Establishes a FIFO boundary while already running on the GL thread.
+        /// The marker is admitted atomically at the queue tail, then this thread
+        /// pumps all work accepted before it. Completion state, rather than item
+        /// identity, is authoritative so a nested snapshot pump can consume an
+        /// outer marker without stranding the outer caller.
+        /// </summary>
+        private void ExecuteSnapshotBoundary(ExecutionThreadWorkItem boundary)
+        {
+            Debug.Assert(boundary.Completion != null);
+            bool boundaryRegistered = _activeSnapshotBoundaries.Add(boundary.Completion);
+            Debug.Assert(boundaryRegistered);
+            try
+            {
+                try
+                {
+                    QueueWorkItem(boundary);
+                }
+                catch
+                {
+                    boundary.Completion.Dispose();
+                    throw;
+                }
+
+                bool transactionBarrierEncountered = false;
+                bool submittedWorkBlockedByTransaction = false;
+                while (!boundary.Completion.IsCompleted)
+                {
+                    ExecutionThreadWorkItem accepted;
+                    if (!transactionBarrierEncountered
+                        && _deferredOrderedWorkItems.Count != 0)
+                    {
+                        ExecutionThreadWorkItem deferredHead = _deferredOrderedWorkItems.Peek();
+                        bool isActiveDeferredBoundary = deferredHead.Completion != null
+                            && _activeSnapshotBoundaries.Contains(deferredHead.Completion);
+                        if (isActiveDeferredBoundary
+                            || deferredHead.IsSnapshotPumpableNativeWork)
+                        {
+                            bool dequeued = TryTakeDeferredOrderedWorkItem(out accepted);
+                            Debug.Assert(dequeued);
+                        }
+                        else
+                        {
+                            // The active outer transaction cannot reenter this
+                            // earlier admitted API transaction. Leave the FIFO
+                            // prefix intact and inspect it for native work which
+                            // makes this boundary impossible to satisfy.
+                            transactionBarrierEncountered = true;
+                            foreach (ExecutionThreadWorkItem deferred
+                                in _deferredOrderedWorkItems)
+                            {
+                                if (deferred.IsSnapshotPumpableNativeWork)
+                                {
+                                    submittedWorkBlockedByTransaction = true;
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    else
+                    {
+                        try
+                        {
+                            accepted = _workItems.Take();
+                        }
+                        catch (InvalidOperationException exception) when (_workItems.IsCompleted)
+                        {
+                            boundary.Completion.Complete(
+                                new NeoVeldridException(
+                                    "The OpenGL execution queue closed before reaching its snapshot boundary.",
+                                    exception));
+                            break;
+                        }
+                    }
+
+                    bool isCurrentBoundary = ReferenceEquals(
+                        accepted.Completion,
+                        boundary.Completion);
+                    bool isActiveBoundary = accepted.Completion != null
+                        && _activeSnapshotBoundaries.Contains(accepted.Completion);
+                    if (isCurrentBoundary && submittedWorkBlockedByTransaction)
+                    {
+                        List<Exception> failures = null;
+                        AddFailure(TakePendingException(), ref failures);
+                        AddFailure(
+                            new InvalidOperationException(
+                                "The OpenGL execution thread cannot establish a nested boundary "
+                                + "because a previously admitted API transaction separates it "
+                                + "from submitted native work. Complete the outer execution-thread "
+                                + "action before waiting for that work."),
+                            ref failures);
+                        boundary.Completion.Complete(
+                            CreateFailure(
+                                "OpenGL nested-boundary admission encountered multiple failures.",
+                                failures));
+                        continue;
+                    }
+
+                    if (!isActiveBoundary
+                        && (!accepted.IsSnapshotPumpableNativeWork
+                            || transactionBarrierEncountered))
+                    {
+                        // Preserve strict FIFO when a transaction separates this
+                        // snapshot from later native work. The current boundary
+                        // will fail deterministically instead of either reentering
+                        // that transaction or overtaking it and returning a false
+                        // idle/completion result.
+                        if (!accepted.IsSnapshotPumpableNativeWork)
+                        {
+                            transactionBarrierEncountered = true;
+                        }
+                        else
+                        {
+                            submittedWorkBlockedByTransaction = true;
+                        }
+                        DeferOrderedWorkItem(accepted);
+                        continue;
+                    }
+
+                    ExecuteWorkItem(accepted);
+                }
+
+                boundary.Completion.WaitAndThrow();
+            }
+            finally
+            {
+                if (boundaryRegistered)
+                {
+                    _activeSnapshotBoundaries.Remove(boundary.Completion);
+                }
+            }
+        }
+
+        private void DispatchAsynchronous(
+            ExecutionThreadWorkItem workItem,
+            out bool ownershipTransferred)
+        {
+            ownershipTransferred = false;
+            if (IsExecutionThread)
+            {
+                EnsureAdmissionOpen();
+                ownershipTransferred = true;
+                ExecuteWorkItem(workItem);
+                CheckExceptions();
+            }
+            else
+            {
+                QueueWorkItem(workItem);
+                ownershipTransferred = true;
+            }
+        }
+
+        private void EnsureAdmissionOpen()
+        {
+            lock (_admissionLock)
+            {
+                if (_state != ExecutionThreadState.Running)
+                {
+                    throw new ObjectDisposedException(
+                        nameof(OpenGLGraphicsDevice),
+                        "The OpenGL execution thread is no longer accepting work.");
+                }
+            }
+        }
+
+        private void TerminateOnExecutionThread()
+        {
+            List<Exception> failures = null;
+            AddFailure(TakePendingException(), ref failures);
+
+            lock (_admissionLock)
+            {
+                if (_state == ExecutionThreadState.Running)
+                {
+                    _state = ExecutionThreadState.Closing;
+                    _workItems.CompleteAdding();
+                }
+            }
+
+            ObjectDisposedException rejectedByTeardown = new ObjectDisposedException(
+                nameof(OpenGLGraphicsDevice),
+                "The OpenGL graphics device began teardown before this accepted operation executed.");
+            while (!_terminated && TryTakeAcceptedWork(out ExecutionThreadWorkItem acceptedWork))
+            {
+                if (acceptedWork.Type == WorkItemType.DisposalAction)
+                {
+                    // A previously admitted external Dispose call must complete
+                    // its proxy so that caller can join this owning transaction.
+                    ExecuteWorkItem(acceptedWork);
+                }
+                else
+                {
+                    RejectAcceptedWork(acceptedWork, rejectedByTeardown);
+                }
+            }
+
+            if (!_terminated)
+            {
+                try
+                {
+                    ExecuteTermination();
+                }
+                catch (Exception exception)
+                {
+                    AddFailure(exception, ref failures);
+                }
+            }
+            else if (_terminationException != null)
+            {
+                AddFailure(_terminationException, ref failures);
+            }
+
+            AddFailure(TakePendingException(), ref failures);
+            ThrowFailures(
+                "OpenGL execution-thread termination encountered multiple failures.",
+                failures);
+        }
+
+        private void ExecuteTermination()
+        {
+            Exception terminationFailure = null;
+            try
+            {
+                List<Exception> failures = null;
+                bool contextCurrent = AttemptPlatformCleanup(
+                    () =>
+                    {
+                        _makeCurrent(_gd._glContext);
+                        IntPtr currentContext = _getCurrentContext();
+                        if (currentContext != _gd._glContext)
+                        {
+                            throw new NeoVeldridException(
+                                "The platform did not make the owned OpenGL context current during teardown.");
+                        }
+                    },
+                    ignoreContextUnavailable: true,
+                    ref failures);
+                if (contextCurrent)
+                {
+                    // External teardown reaches this point after a queue boundary. Reentrant
+                    // teardown originates inside ExecuteOnGLThread and drains accepted work in
+                    // TerminateOnExecutionThread, so it needs its GPU completion boundary here.
+                    AttemptPlatformCleanup(
+                        () =>
+                        {
+                            _gd.GL.Flush();
+                            _gd.GL.Finish();
+                        },
+                        ignoreContextUnavailable: true,
+                        ref failures);
+                    AttemptPlatformCleanup(
+                        _gd.FlushDisposables,
+                        ignoreContextUnavailable: true,
+                        ref failures);
+                    AttemptPlatformCleanup(
+                        () => _gd.ClearOwnedContext("context destruction"),
+                        ignoreContextUnavailable: false,
+                        ref failures);
+                }
+
+                if (_gd._glContext != IntPtr.Zero)
+                {
+                    AttemptPlatformCleanup(
+                        () =>
+                        {
+                            _gd._deleteContext(_gd._glContext);
+                            _gd.ConfirmContextDestroyed();
+                        },
+                        ignoreContextUnavailable: false,
+                        ref failures);
+                }
+
+                ThrowPlatformCleanupFailures(failures);
+            }
+            catch (Exception exception)
+            {
+                terminationFailure = exception;
+                throw;
+            }
+            finally
+            {
+                lock (_admissionLock)
+                {
+                    _terminationException = terminationFailure;
+                    _terminated = true;
+                    _state = ExecutionThreadState.Closed;
+                    Monitor.PulseAll(_admissionLock);
+                }
+            }
+        }
+
+        private void FailExecutionThread(Exception failure)
+        {
+            lock (_admissionLock)
+            {
+                _terminationException = failure;
+                _state = ExecutionThreadState.Closed;
+                if (!_workItems.IsAddingCompleted)
+                {
+                    _workItems.CompleteAdding();
+                }
+            }
+
+            while (TryTakeAcceptedWork(out ExecutionThreadWorkItem rejectedWork))
+            {
+                RejectAcceptedWork(rejectedWork, failure);
+            }
+
+            AddPendingException(failure);
+            lock (_admissionLock)
+            {
+                _terminated = true;
+                Monitor.PulseAll(_admissionLock);
+            }
+        }
+
+        private void WaitForTermination()
+        {
+            lock (_admissionLock)
+            {
+                while (!_terminated)
+                {
+                    Monitor.Wait(_admissionLock);
+                }
+            }
+        }
+
+        private void RejectAcceptedWork(
+            ExecutionThreadWorkItem workItem,
+            Exception executionThreadFailure)
+        {
+            List<Exception> failures = null;
+            AddFailure(executionThreadFailure, ref failures);
+            try
+            {
+                switch (workItem.Type)
+                {
+                    case WorkItemType.ExecuteList:
+                    {
+                        OpenGLCommandEntryList list = (OpenGLCommandEntryList)workItem.Object0;
+                        if (!_gd.CheckCommandListDisposal(list.Parent))
+                        {
+                            list.Parent.OnCompleted(list);
+                        }
+                        ((OpenGLFence)workItem.Object1)?.CompleteSubmission(
+                            executionThreadFailure);
+                        break;
+                    }
+                    case WorkItemType.UpdateBuffer:
+                        _gd.StagingMemoryPool.Free(
+                            _gd.StagingMemoryPool.RetrieveById(workItem.UInt1));
+                        break;
+                    case WorkItemType.UpdateTexture:
+                        _gd.StagingMemoryPool.Free(
+                            _gd.StagingMemoryPool.RetrieveById(workItem.UInt0));
+                        _gd.StagingMemoryPool.Free(
+                            _gd.StagingMemoryPool.RetrieveById(workItem.UInt1));
+                        break;
+                }
+            }
+            catch (Exception ownershipFailure)
+            {
+                AddFailure(ownershipFailure, ref failures);
+            }
+
+            Exception rejectionFailure = failures.Count == 1
+                ? failures[0]
+                : new AggregateException(
+                    "OpenGL execution-thread failure also prevented accepted-work rollback.",
+                    failures);
+            if (workItem.Completion != null)
+            {
+                workItem.Completion.Complete(rejectionFailure);
+            }
+            else
+            {
+                AddPendingException(rejectionFailure);
             }
         }
     }
@@ -1525,6 +2937,7 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
         UpdateBuffer,
         UpdateTexture,
         GenericAction,
+        DisposalAction,
         TerminateAction,
         SetSyncToVerticalBlank,
         SwapBuffers,
@@ -1540,29 +2953,52 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
         public readonly uint UInt0;
         public readonly uint UInt1;
         public readonly uint UInt2;
+        public readonly WorkItemCompletion Completion;
+
+        // Snapshot waits may advance only bounded native work with no unguarded
+        // user callback. API transactions and arbitrary platform callbacks are
+        // deferred unless their completion identifies an active snapshot marker.
+        public readonly bool IsSnapshotPumpableNativeWork =>
+            Type == WorkItemType.Map
+            || Type == WorkItemType.Unmap
+            || Type == WorkItemType.ExecuteList
+            || Type == WorkItemType.UpdateBuffer
+            || Type == WorkItemType.UpdateTexture
+            || Type == WorkItemType.WaitForIdle
+            || Type == WorkItemType.InitializeResource;
+
+        public readonly bool IsGpuWork =>
+            Type == WorkItemType.ExecuteList
+            || Type == WorkItemType.UpdateBuffer
+            || Type == WorkItemType.UpdateTexture;
 
         public ExecutionThreadWorkItem(
             MappableResource resource,
             MapParams* mapResult,
-            ManualResetEventSlim resetEvent)
+            WorkItemCompletion completion)
         {
             Type = WorkItemType.Map;
             Object0 = resource;
-            Object1 = resetEvent;
+            Object1 = null;
 
             Util.PackIntPtr((IntPtr)mapResult, out UInt0, out UInt1);
             UInt2 = 0;
+            Completion = completion;
         }
 
-        public ExecutionThreadWorkItem(OpenGLCommandEntryList commandList)
+        public ExecutionThreadWorkItem(
+            OpenGLCommandEntryList commandList,
+            OpenGLFence fence,
+            WorkItemCompletion completion)
         {
             Type = WorkItemType.ExecuteList;
             Object0 = commandList;
-            Object1 = null;
+            Object1 = fence;
 
             UInt0 = 0;
             UInt1 = 0;
             UInt2 = 0;
+            Completion = completion;
         }
 
         public ExecutionThreadWorkItem(DeviceBuffer updateBuffer, uint offsetInBytes, StagingBlock stagedSource)
@@ -1574,18 +3010,36 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
             UInt0 = offsetInBytes;
             UInt1 = stagedSource.Id;
             UInt2 = 0;
+            Completion = null;
         }
 
-        public ExecutionThreadWorkItem(Action a, bool isTermination = false)
+        public ExecutionThreadWorkItem(Action a, WorkItemCompletion completion)
+            : this(WorkItemType.GenericAction, a, completion)
         {
-            Type = isTermination ? WorkItemType.TerminateAction : WorkItemType.GenericAction;
-            Object0 = a;
+        }
+
+        private ExecutionThreadWorkItem(
+            WorkItemType type,
+            Action action,
+            WorkItemCompletion completion)
+        {
+            Type = type;
+            Object0 = action;
             Object1 = null;
 
             UInt0 = 0;
             UInt1 = 0;
             UInt2 = 0;
+            Completion = completion;
         }
+
+        public static ExecutionThreadWorkItem CreateDisposal(
+            Action disposeCore,
+            WorkItemCompletion completion) =>
+            new ExecutionThreadWorkItem(
+                WorkItemType.DisposalAction,
+                disposeCore,
+                completion);
 
         public ExecutionThreadWorkItem(Texture texture, uint argBlockId, uint dataBlockId)
         {
@@ -1596,17 +3050,19 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
             UInt0 = argBlockId;
             UInt1 = dataBlockId;
             UInt2 = 0;
+            Completion = null;
         }
 
-        public ExecutionThreadWorkItem(ManualResetEventSlim mre, bool isFullFlush)
+        public ExecutionThreadWorkItem(WorkItemCompletion completion, bool isFullFlush)
         {
             Type = WorkItemType.WaitForIdle;
-            Object0 = mre;
+            Object0 = null;
             Object1 = null;
 
             UInt0 = isFullFlush ? 1u : 0u;
             UInt1 = 0;
             UInt2 = 0;
+            Completion = completion;
         }
 
         public ExecutionThreadWorkItem(bool value)
@@ -1618,9 +3074,12 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
             UInt0 = value ? 1u : 0u;
             UInt1 = 0;
             UInt2 = 0;
+            Completion = null;
         }
 
-        public ExecutionThreadWorkItem(WorkItemType type)
+        public ExecutionThreadWorkItem(
+            WorkItemType type,
+            WorkItemCompletion completion)
         {
             Type = type;
             Object0 = null;
@@ -1629,17 +3088,73 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
             UInt0 = 0;
             UInt1 = 0;
             UInt2 = 0;
+            Completion = completion;
         }
 
-        public ExecutionThreadWorkItem(InitializeResourceInfo info)
+        public ExecutionThreadWorkItem(
+            OpenGLDeferredResource deferredResource,
+            WorkItemCompletion completion)
         {
             Type = WorkItemType.InitializeResource;
-            Object0 = info;
+            Object0 = deferredResource;
             Object1 = null;
 
             UInt0 = 0;
             UInt1 = 0;
             UInt2 = 0;
+            Completion = completion;
+        }
+    }
+
+    private enum ExecutionThreadState : byte
+    {
+        Running,
+        Closing,
+        Closed,
+    }
+
+    private sealed class WorkItemCompletion : IDisposable
+    {
+        private readonly ManualResetEventSlim _completedEvent = new ManualResetEventSlim(false);
+        private Exception _exception;
+        private int _executionThreadTerminatedAtCompletion;
+        private int _completed;
+        private int _disposed;
+
+        public bool IsCompleted => Volatile.Read(ref _completed) != 0;
+        public bool ExecutionThreadTerminatedAtCompletion =>
+            Volatile.Read(ref _executionThreadTerminatedAtCompletion) != 0;
+
+        public void Complete(Exception exception, bool executionThreadTerminated = false)
+        {
+            if (Interlocked.CompareExchange(ref _completed, 1, 0) == 0)
+            {
+                _exception = exception;
+                if (executionThreadTerminated)
+                {
+                    Volatile.Write(ref _executionThreadTerminatedAtCompletion, 1);
+                }
+                _completedEvent.Set();
+            }
+        }
+
+        public void WaitAndThrow()
+        {
+            _completedEvent.Wait();
+            Exception exception = _exception;
+            Dispose();
+            if (exception != null)
+            {
+                ExceptionDispatchInfo.Capture(exception).Throw();
+            }
+        }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) == 0)
+            {
+                _completedEvent.Dispose();
+            }
         }
     }
 
@@ -1663,16 +3178,4 @@ internal unsafe class OpenGLGraphicsDevice : GraphicsDevice
         public StagingBlock StagingBlock;
     }
 
-    private class InitializeResourceInfo
-    {
-        public OpenGLDeferredResource DeferredResource;
-        public ManualResetEventSlim ResetEvent;
-        public Exception Exception;
-
-        public InitializeResourceInfo(OpenGLDeferredResource deferredResource, ManualResetEventSlim mre)
-        {
-            DeferredResource = deferredResource;
-            ResetEvent = mre;
-        }
-    }
 }

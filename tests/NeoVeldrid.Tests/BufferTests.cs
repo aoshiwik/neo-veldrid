@@ -170,13 +170,12 @@ public abstract class BufferTestBase<T> : GraphicsDeviceTestBase<T> where T : Gr
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void MapThenUpdate_Fails()
     {
-        if (GD.BackendType == GraphicsBackend.Vulkan)
-        {
-            return; // TODO
-        }
+        Skip.If(
+            GD.BackendType == GraphicsBackend.Vulkan,
+            "NV-SKIP-VULKAN-MAPPED-UPDATE: Vulkan mapped-resource update validation is not implemented.");
         DeviceBuffer buffer = RF.CreateBuffer(new BufferDescription(1024, BufferUsage.Staging));
         MappedResourceView<int> view = GD.Map<int>(buffer, MapMode.ReadWrite);
         int[] data = Enumerable.Range(0, 256).Select(i => 2 * i).ToArray();
@@ -198,13 +197,12 @@ public abstract class BufferTestBase<T> : GraphicsDeviceTestBase<T> where T : Gr
         GD.Unmap(buffer);
     }
 
-    [Fact]
+    [SkippableFact]
     public void Map_DifferentMode_Fails()
     {
-        if (GD.BackendType == GraphicsBackend.Vulkan)
-        {
-            return; // TODO
-        }
+        Skip.If(
+            GD.BackendType == GraphicsBackend.Vulkan,
+            "NV-SKIP-VULKAN-MAPPED-MODE: Vulkan mapped-resource mode validation is not implemented.");
         DeviceBuffer buffer = RF.CreateBuffer(new BufferDescription(1024, BufferUsage.Staging));
         MappedResource map = GD.Map(buffer, MapMode.Read);
         var ex = Assert.Throws<NeoVeldridMappedResourceException>(() => GD.Map(buffer, MapMode.Write));
@@ -212,14 +210,12 @@ public abstract class BufferTestBase<T> : GraphicsDeviceTestBase<T> where T : Gr
         Assert.Equal(0u, ex.Subresource);
     }
 
-    [Fact]
+    [SkippableFact]
     public void BindMappedBuffer_Fails()
     {
-        // The mapped-buffer pipeline check is OpenGL-only.
-        if (GD.BackendType != GraphicsBackend.OpenGL && GD.BackendType != GraphicsBackend.OpenGLES)
-        {
-            return;
-        }
+        Skip.If(
+            GD.BackendType != GraphicsBackend.OpenGL && GD.BackendType != GraphicsBackend.OpenGLES,
+            "NV-SKIP-GL-MAPPED-BINDING: The mapped-buffer pipeline check is an OpenGL backend contract.");
         DeviceBuffer buffer = RF.CreateBuffer(new BufferDescription(64, BufferUsage.VertexBuffer | BufferUsage.Dynamic));
         CommandList cl = RF.CreateCommandList();
         cl.Begin();
@@ -464,12 +460,6 @@ public abstract class BufferTestBase<T> : GraphicsDeviceTestBase<T> where T : Gr
     [InlineData(BufferUsage.Staging)]
     public void CreateBuffer_UsageFlagsCoverage(BufferUsage usage)
     {
-        if ((usage & BufferUsage.StructuredBufferReadOnly) != 0
-            || (usage & BufferUsage.StructuredBufferReadWrite) != 0)
-        {
-            return;
-        }
-
         BufferDescription description = new BufferDescription(64, usage);
         if ((usage & BufferUsage.StructuredBufferReadOnly) != 0 || (usage & BufferUsage.StructuredBufferReadWrite) != 0)
         {

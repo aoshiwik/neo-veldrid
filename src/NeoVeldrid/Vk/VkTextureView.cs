@@ -72,7 +72,14 @@ internal unsafe class VkTextureView : TextureView
             }
         }
 
-        _gd.Vk.CreateImageView(_gd.Device, in imageViewCI, null, out _imageView);
+        ImageView createdImageView;
+        Result result = _gd.Vk.CreateImageView(
+            _gd.Device,
+            in imageViewCI,
+            null,
+            out createdImageView);
+        VulkanUtil.CheckResult(result);
+        _imageView = createdImageView;
         RefCount = new ResourceRefCount(DisposeCore);
     }
 

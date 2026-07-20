@@ -177,7 +177,9 @@ public sealed class VulkanStagedUploadIsolationTests
     [SkippableFact]
     public void StorageWriteTransitionsToExactRenderPassInitialLayout()
     {
-        Skip.IfNot(GD.Features.ComputeShader);
+        Skip.IfNot(
+            GD.Features.ComputeShader,
+            $"NV-SKIP-COMPUTE-SHADER: Compute shaders are unavailable on {GD.BackendType}.");
 
         const uint width = 4;
         const uint height = 1;

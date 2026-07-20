@@ -1,4 +1,7 @@
 <Solution>
+    <Folder Name="/eng/">
+        <Project Path="eng/NeoVeldrid.TestResultValidator/NeoVeldrid.TestResultValidator.csproj" />
+    </Folder>
     <Folder Name="/samples/">
         <Project Path="samples/common/AssetPrimitives/AssetPrimitives.csproj" />
         <Project Path="samples/common/AssetProcessor/AssetProcessor.csproj" />

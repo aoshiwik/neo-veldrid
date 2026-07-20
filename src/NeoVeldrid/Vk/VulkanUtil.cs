@@ -49,8 +49,9 @@ internal unsafe static class VulkanUtil
         LayerProperties[] props = new LayerProperties[propCount];
         fixed (LayerProperties* propsPtr = props)
         {
-            vk.EnumerateInstanceLayerProperties(ref propCount, propsPtr);
+            result = vk.EnumerateInstanceLayerProperties(ref propCount, propsPtr);
         }
+        CheckResult(result);
 
         string[] ret = new string[propCount];
         for (int i = 0; i < propCount; i++)
@@ -65,6 +66,64 @@ internal unsafe static class VulkanUtil
     }
 
     public static string[] GetInstanceExtensions() => s_instanceExtensions.Value;
+
+    public static uint GetInstanceExtensionSpecVersion(string extensionName, string layerName = null)
+    {
+        if (extensionName == null)
+        {
+            throw new ArgumentNullException(nameof(extensionName));
+        }
+
+        // A layer-specific validation feature must be advertised by that
+        // layer. A same-named implementation extension is not evidence that
+        // the selected layer understands the requested feature revision.
+        return GetInstanceExtensionSpecVersionCore(extensionName, layerName);
+    }
+
+    private static uint GetInstanceExtensionSpecVersionCore(string extensionName, string layerName)
+    {
+        if (!IsVulkanLoaded())
+        {
+            return 0;
+        }
+
+        using var vk = VkApi.GetApi();
+        using FixedUtf8String layerNameUtf8 = layerName == null
+            ? null
+            : new FixedUtf8String(layerName);
+        byte* layerNamePtr = layerNameUtf8 == null ? null : layerNameUtf8.StringPtr;
+
+        uint propertyCount = 0;
+        Result result = vk.EnumerateInstanceExtensionProperties(layerNamePtr, ref propertyCount, null);
+        if (result != Result.Success || propertyCount == 0)
+        {
+            return 0;
+        }
+
+        ExtensionProperties[] properties = new ExtensionProperties[propertyCount];
+        fixed (ExtensionProperties* propertiesPtr = properties)
+        {
+            result = vk.EnumerateInstanceExtensionProperties(layerNamePtr, ref propertyCount, propertiesPtr);
+        }
+        if (result != Result.Success)
+        {
+            return 0;
+        }
+
+        uint version = 0;
+        for (int i = 0; i < propertyCount; i++)
+        {
+            fixed (byte* extensionNamePtr = properties[i].ExtensionName)
+            {
+                if (string.Equals(Util.GetString(extensionNamePtr), extensionName, StringComparison.Ordinal))
+                {
+                    version = Math.Max(version, properties[i].SpecVersion);
+                }
+            }
+        }
+
+        return version;
+    }
 
     private static string[] EnumerateInstanceExtensions()
     {
@@ -89,7 +148,14 @@ internal unsafe static class VulkanUtil
         ExtensionProperties[] props = new ExtensionProperties[propCount];
         fixed (ExtensionProperties* propsPtr = props)
         {
-            vk.EnumerateInstanceExtensionProperties((byte*)null, ref propCount, propsPtr);
+            result = vk.EnumerateInstanceExtensionProperties(
+                (byte*)null,
+                ref propCount,
+                propsPtr);
+        }
+        if (result != Result.Success)
+        {
+            return Array.Empty<string>();
         }
 
         string[] ret = new string[propCount];

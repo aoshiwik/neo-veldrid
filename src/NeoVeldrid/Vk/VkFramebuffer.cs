@@ -10,10 +10,10 @@ namespace NeoVeldrid.Vk;
 internal unsafe class VkFramebuffer : VkFramebufferBase
 {
     private readonly VkGraphicsDevice _gd;
-    private readonly VkFramebufferHandle _deviceFramebuffer;
-    private readonly RenderPass _renderPassNoClearLoad;
-    private readonly RenderPass _renderPassNoClear;
-    private readonly RenderPass _renderPassClear;
+    private VkFramebufferHandle _deviceFramebuffer;
+    private RenderPass _renderPassNoClearLoad;
+    private RenderPass _renderPassNoClear;
+    private RenderPass _renderPassClear;
     private readonly List<ImageView> _attachmentViews = new List<ImageView>();
     private readonly ImageLayout[] _firstUseColorLayouts;
     private readonly ImageLayout? _firstUseDepthLayout;
@@ -36,7 +36,8 @@ internal unsafe class VkFramebuffer : VkFramebufferBase
         : base(description.DepthTarget, description.ColorTargets)
     {
         _gd = gd;
-
+        try
+        {
         RenderPassCreateInfo renderPassCI = new RenderPassCreateInfo
         {
             SType = StructureType.RenderPassCreateInfo
@@ -123,8 +124,14 @@ internal unsafe class VkFramebuffer : VkFramebufferBase
         renderPassCI.DependencyCount = 1;
         renderPassCI.PDependencies = &subpassDependency;
 
-        Result creationResult = _gd.Vk.CreateRenderPass(_gd.Device, in renderPassCI, null, out _renderPassNoClear);
+        RenderPass createdRenderPass;
+        Result creationResult = _gd.Vk.CreateRenderPass(
+            _gd.Device,
+            in renderPassCI,
+            null,
+            out createdRenderPass);
         CheckResult(creationResult);
+        _renderPassNoClear = createdRenderPass;
 
         for (int i = 0; i < colorAttachmentCount; i++)
         {
@@ -142,8 +149,13 @@ internal unsafe class VkFramebuffer : VkFramebufferBase
             }
 
         }
-        creationResult = _gd.Vk.CreateRenderPass(_gd.Device, in renderPassCI, null, out _renderPassNoClearLoad);
+        creationResult = _gd.Vk.CreateRenderPass(
+            _gd.Device,
+            in renderPassCI,
+            null,
+            out createdRenderPass);
         CheckResult(creationResult);
+        _renderPassNoClearLoad = createdRenderPass;
 
 
         // Load version
@@ -165,8 +177,13 @@ internal unsafe class VkFramebuffer : VkFramebufferBase
             attachments[i].InitialLayout = ImageLayout.Undefined;
         }
 
-        creationResult = _gd.Vk.CreateRenderPass(_gd.Device, in renderPassCI, null, out _renderPassClear);
+        creationResult = _gd.Vk.CreateRenderPass(
+            _gd.Device,
+            in renderPassCI,
+            null,
+            out createdRenderPass);
         CheckResult(creationResult);
+        _renderPassClear = createdRenderPass;
 
         FramebufferCreateInfo fbCI = new FramebufferCreateInfo
         {
@@ -195,10 +212,15 @@ internal unsafe class VkFramebuffer : VkFramebufferBase
                     description.ColorTargets[i].ArrayLayer,
                     1)
             };
-            ImageView* dest = (fbAttachments + i);
-            Result result = _gd.Vk.CreateImageView(_gd.Device, in imageViewCI, null, dest);
+            ImageView createdView = default;
+            Result result = _gd.Vk.CreateImageView(
+                _gd.Device,
+                in imageViewCI,
+                null,
+                &createdView);
             CheckResult(result);
-            _attachmentViews.Add(*dest);
+            fbAttachments[i] = createdView;
+            _attachmentViews.Add(createdView);
         }
 
         // Depth
@@ -221,10 +243,15 @@ internal unsafe class VkFramebuffer : VkFramebufferBase
                     description.DepthTarget.Value.ArrayLayer,
                     1)
             };
-            ImageView* dest = (fbAttachments + (fbAttachmentsCount - 1));
-            Result result = _gd.Vk.CreateImageView(_gd.Device, in depthViewCI, null, dest);
+            ImageView createdView = default;
+            Result result = _gd.Vk.CreateImageView(
+                _gd.Device,
+                in depthViewCI,
+                null,
+                &createdView);
             CheckResult(result);
-            _attachmentViews.Add(*dest);
+            fbAttachments[fbAttachmentsCount - 1] = createdView;
+            _attachmentViews.Add(createdView);
         }
 
         Texture dimTex;
@@ -256,14 +283,27 @@ internal unsafe class VkFramebuffer : VkFramebufferBase
         fbCI.Layers = 1;
         fbCI.RenderPass = _renderPassNoClear;
 
-        creationResult = _gd.Vk.CreateFramebuffer(_gd.Device, in fbCI, null, out _deviceFramebuffer);
+        VkFramebufferHandle createdFramebuffer;
+        creationResult = _gd.Vk.CreateFramebuffer(
+            _gd.Device,
+            in fbCI,
+            null,
+            out createdFramebuffer);
         CheckResult(creationResult);
+        _deviceFramebuffer = createdFramebuffer;
 
         if (DepthTarget != null)
         {
             AttachmentCount += 1;
         }
         AttachmentCount += (uint)ColorTargets.Count;
+        }
+        catch (Exception initializationError)
+        {
+            DestroyNativeResources().ThrowWithPrimary(
+                initializationError,
+                "Vulkan framebuffer initialization and cleanup both failed.");
+        }
     }
 
     public override void PrepareForRenderPass(
@@ -410,16 +450,73 @@ internal unsafe class VkFramebuffer : VkFramebufferBase
     {
         if (!_destroyed)
         {
-            _gd.Vk.DestroyFramebuffer(_gd.Device, _deviceFramebuffer, null);
-            _gd.Vk.DestroyRenderPass(_gd.Device, _renderPassNoClear, null);
-            _gd.Vk.DestroyRenderPass(_gd.Device, _renderPassNoClearLoad, null);
-            _gd.Vk.DestroyRenderPass(_gd.Device, _renderPassClear, null);
-            foreach (ImageView view in _attachmentViews)
+            VulkanCleanupCollector cleanup = DestroyNativeResources();
+            _destroyed = NativeResourcesReleased;
+            cleanup.ThrowIfAny(
+                "Vulkan framebuffer cleanup encountered multiple failures.");
+        }
+    }
+
+    private bool NativeResourcesReleased =>
+        _deviceFramebuffer.Handle == 0
+        && _attachmentViews.Count == 0
+        && _renderPassNoClear.Handle == 0
+        && _renderPassNoClearLoad.Handle == 0
+        && _renderPassClear.Handle == 0;
+
+    private VulkanCleanupCollector DestroyNativeResources()
+    {
+        VulkanCleanupCollector cleanup = new VulkanCleanupCollector();
+        bool framebufferReleased = true;
+        if (_deviceFramebuffer.Handle != 0)
+        {
+            framebufferReleased = cleanup.Attempt(() =>
             {
-                _gd.Vk.DestroyImageView(_gd.Device, view, null);
+                _gd.Vk.DestroyFramebuffer(_gd.Device, _deviceFramebuffer, null);
+                _deviceFramebuffer = default;
+            });
+        }
+
+        // Image views and render passes are referenced by VkFramebuffer. Do not
+        // retire them if that child could not be destroyed.
+        if (framebufferReleased)
+        {
+            for (int i = _attachmentViews.Count - 1; i >= 0; i--)
+            {
+                ImageView view = _attachmentViews[i];
+                if (cleanup.Attempt(() =>
+                    _gd.Vk.DestroyImageView(_gd.Device, view, null)))
+                {
+                    _attachmentViews.RemoveAt(i);
+                }
             }
 
-            _destroyed = true;
+            if (_renderPassNoClear.Handle != 0)
+            {
+                cleanup.Attempt(() =>
+                {
+                    _gd.Vk.DestroyRenderPass(_gd.Device, _renderPassNoClear, null);
+                    _renderPassNoClear = default;
+                });
+            }
+            if (_renderPassNoClearLoad.Handle != 0)
+            {
+                cleanup.Attempt(() =>
+                {
+                    _gd.Vk.DestroyRenderPass(_gd.Device, _renderPassNoClearLoad, null);
+                    _renderPassNoClearLoad = default;
+                });
+            }
+            if (_renderPassClear.Handle != 0)
+            {
+                cleanup.Attempt(() =>
+                {
+                    _gd.Vk.DestroyRenderPass(_gd.Device, _renderPassClear, null);
+                    _renderPassClear = default;
+                });
+            }
         }
+
+        return cleanup;
     }
 }

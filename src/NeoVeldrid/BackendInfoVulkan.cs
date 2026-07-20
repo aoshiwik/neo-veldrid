@@ -62,6 +62,33 @@ public class BackendInfoVulkan
     /// </summary>
     public string DriverInfo => _gd.DriverInfo;
 
+    /// <summary>
+    /// Gets the validation facilities that this Vulkan device proved are active.
+    /// </summary>
+    public GraphicsDeviceValidationStatus ValidationStatus => _gd.Validation.Status;
+
+    /// <summary>
+    /// Gets the validation mode requested when this Vulkan device was created.
+    /// </summary>
+    public VulkanValidationMode ValidationMode => _gd.ValidationMode;
+
+    /// <summary>
+    /// Gets the active Vulkan validation layer name, or an empty string when no validation layer is active.
+    /// </summary>
+    public string ActiveValidationLayer => _gd.ActiveValidationLayerName;
+
+    /// <summary>
+    /// Gets the advertised revision of VK_EXT_validation_features. Synchronization validation requires revision 4.
+    /// </summary>
+    public uint ValidationFeaturesSpecVersion => _gd.ValidationFeaturesSpecVersion;
+
+    /// <summary>
+    /// Gets whether Vulkan synchronization validation was explicitly activated and its message transport verified.
+    /// </summary>
+    public bool IsSynchronizationValidationActive =>
+        ValidationStatus.HasFeature(
+            GraphicsDeviceValidationFeatures.SynchronizationValidation);
+
     public ReadOnlyCollection<string> AvailableInstanceLayers => _instanceLayers.Value;
 
     public ReadOnlyCollection<string> AvailableInstanceExtensions => _instanceExtensions;

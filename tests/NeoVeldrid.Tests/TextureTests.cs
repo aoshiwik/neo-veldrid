@@ -199,7 +199,7 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
         Skip.IfNot(
             GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Sampled) &&
             GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Staging),
-            $"{format} does not support compressed staging readback on {GD.BackendType}.");
+            $"NV-SKIP-COMPRESSED-STAGING: {format} compressed staging readback is unavailable on {GD.BackendType}.");
 
         TextureDescription description = TextureDescription.Texture2D(
             7,
@@ -256,7 +256,7 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
         Skip.IfNot(
             GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Sampled) &&
             GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Staging),
-            $"{format} does not support compressed staging readback on {GD.BackendType}.");
+            $"NV-SKIP-COMPRESSED-STAGING: {format} compressed staging readback is unavailable on {GD.BackendType}.");
 
         TextureDescription description = TextureDescription.Texture2D(
             10,
@@ -1015,7 +1015,7 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
         Skip.IfNot(
             GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Sampled)
                 && GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Staging),
-            $"{format} does not support compressed staging readback on {GD.BackendType}.");
+            $"NV-SKIP-COMPRESSED-STAGING: {format} compressed staging readback is unavailable on {GD.BackendType}.");
 
         Texture copySrc = RF.CreateTexture(TextureDescription.Texture2D(
             64, 64, 1, 1, format, TextureUsage.Sampled));
@@ -1066,7 +1066,7 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
         PixelFormat format = PixelFormat.BC3_UNorm;
         Skip.IfNot(
             GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Sampled),
-            $"{format} sampling is not supported on {GD.BackendType}.");
+            $"NV-SKIP-COMPRESSED-SAMPLING: {format} sampling is unavailable on {GD.BackendType}.");
 
         bool supportsCompressedStaging = GD.GetPixelFormatSupport(
             format,
@@ -1089,7 +1089,7 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
             && GD.GetPixelFormatSupport(rawBlockFormat, TextureType.Texture2D, TextureUsage.Staging);
         Skip.IfNot(
             supportsCompressedStaging || useCompatibleRawReadback,
-            $"Exact compressed copy readback is not supported on {GD.BackendType}.");
+            $"NV-SKIP-COMPRESSED-COPY-READBACK: Exact compressed copy readback is unavailable on {GD.BackendType}.");
 
         TextureDescription texDesc = TextureDescription.Texture2D(
             16, 16,
@@ -1228,10 +1228,12 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
         GD.Unmap(tex3D);
     }
 
-    [Fact]
+    [SkippableFact]
     public unsafe void Update_ThenMapRead_1D()
     {
-        if (!GD.Features.Texture1D) { return; }
+        Skip.IfNot(
+            GD.Features.Texture1D,
+            $"NV-SKIP-TEXTURE1D: One-dimensional textures are unavailable on {GD.BackendType}.");
 
         Texture tex1D = RF.CreateTexture(
             TextureDescription.Texture1D(100, 1, 1, PixelFormat.R16_UNorm, TextureUsage.Staging));
@@ -1249,10 +1251,12 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
         GD.Unmap(tex1D);
     }
 
-    [Fact]
+    [SkippableFact]
     public unsafe void MapWrite_ThenMapRead_1D()
     {
-        if (!GD.Features.Texture1D) { return; }
+        Skip.IfNot(
+            GD.Features.Texture1D,
+            $"NV-SKIP-TEXTURE1D: One-dimensional textures are unavailable on {GD.BackendType}.");
 
         Texture tex1D = RF.CreateTexture(
             TextureDescription.Texture1D(100, 1, 1, PixelFormat.R16_UNorm, TextureUsage.Staging));
@@ -1272,10 +1276,12 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
         GD.Unmap(tex1D);
     }
 
-    [Fact]
+    [SkippableFact]
     public unsafe void Copy_1DTo2D()
     {
-        if (!GD.Features.Texture1D) { return; }
+        Skip.IfNot(
+            GD.Features.Texture1D,
+            $"NV-SKIP-TEXTURE1D: One-dimensional textures are unavailable on {GD.BackendType}.");
 
         Texture tex1D = RF.CreateTexture(
             TextureDescription.Texture1D(100, 1, 1, PixelFormat.R16_UNorm, TextureUsage.Staging));
@@ -1308,10 +1314,12 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
         GD.Unmap(tex2D);
     }
 
-    [Fact]
+    [SkippableFact]
     public void Update_MultipleMips_1D()
     {
-        if (!GD.Features.Texture1D) { return; }
+        Skip.IfNot(
+            GD.Features.Texture1D,
+            $"NV-SKIP-TEXTURE1D: One-dimensional textures are unavailable on {GD.BackendType}.");
 
         Texture tex1D = RF.CreateTexture(TextureDescription.Texture1D(
             100, 5, 1, PixelFormat.R8_G8_B8_A8_UNorm, TextureUsage.Staging));
@@ -1337,10 +1345,12 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
         }
     }
 
-    [Fact]
+    [SkippableFact]
     public void Copy_DifferentMip_1DTo2D()
     {
-        if (!GD.Features.Texture1D) { return; }
+        Skip.IfNot(
+            GD.Features.Texture1D,
+            $"NV-SKIP-TEXTURE1D: One-dimensional textures are unavailable on {GD.BackendType}.");
 
         Texture tex1D = RF.CreateTexture(
             TextureDescription.Texture1D(200, 2, 1, PixelFormat.R16_UNorm, TextureUsage.Staging));
@@ -1638,7 +1648,7 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
         GD.Unmap(dst);
     }
 
-    [Theory]
+    [SkippableTheory]
     [MemberData(nameof(FormatCoverageData))]
     public unsafe void FormatCoverage_CopyThenRead(
         PixelFormat format, int rBits, int gBits, int bBits, int aBits,
@@ -1652,10 +1662,9 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
         uint dstX, uint dstY, uint dstZ,
         uint dstMipLevel, uint dstArrayLayer)
     {
-        if (!GD.GetPixelFormatSupport(format, srcType, TextureUsage.Staging))
-        {
-            return;
-        }
+        Skip.IfNot(
+            GD.GetPixelFormatSupport(format, srcType, TextureUsage.Staging),
+            $"NV-SKIP-STAGING-FORMAT: {format}/{srcType} staging is unavailable on {GD.BackendType}.");
 
         Texture srcTex = RF.CreateTexture(new TextureDescription(
             srcWidth, srcHeight, srcDepth, srcMipLevels, srcArrayLayers,
@@ -1805,7 +1814,7 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
         Skip.IfNot(
             GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Sampled)
                 && GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Staging),
-            $"{format} does not support compressed staging readback on {GD.BackendType}.");
+            $"NV-SKIP-COMPRESSED-STAGING: {format} compressed staging readback is unavailable on {GD.BackendType}.");
 
         Texture src = RF.CreateTexture(TextureDescription.Texture2D(
             16, 16, 4, 1, format, TextureUsage.Sampled));
@@ -1938,11 +1947,6 @@ public class OpenGLESTextureTests : TextureTestBase<OpenGLESDeviceCreator>
     {
         const PixelFormat format = PixelFormat.BC3_UNorm;
         Assert.False(GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Staging));
-
-        if (!GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Sampled))
-        {
-            return;
-        }
 
         Texture texture = RF.CreateTexture(TextureDescription.Texture2D(
             16, 16, 1, 1, format, TextureUsage.Staging));

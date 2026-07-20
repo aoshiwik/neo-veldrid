@@ -97,7 +97,7 @@ internal unsafe class D3D11CommandList : CommandList
     }
 
     public D3D11CommandList(D3D11GraphicsDevice gd, ref CommandListDescription description)
-        : base(ref description, gd.Features, gd.UniformBufferMinOffsetAlignment, gd.StructuredBufferMinOffsetAlignment)
+        : base(ref description, gd, gd.Features, gd.UniformBufferMinOffsetAlignment, gd.StructuredBufferMinOffsetAlignment)
     {
         _gd = gd;
 

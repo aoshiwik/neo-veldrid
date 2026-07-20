@@ -8,8 +8,8 @@ namespace NeoVeldrid.Vk;
 internal unsafe class VkBuffer : DeviceBuffer
 {
     private readonly VkGraphicsDevice _gd;
-    private readonly VkBufferHandle _deviceBuffer;
-    private readonly VkMemoryBlock _memory;
+    private VkBufferHandle _deviceBuffer;
+    private VkMemoryBlock _memory;
     private readonly MemoryRequirements _bufferMemoryRequirements;
     public ResourceRefCount RefCount { get; }
     private bool _destroyed;
@@ -60,70 +60,105 @@ internal unsafe class VkBuffer : DeviceBuffer
             Size = sizeInBytes,
             Usage = vkUsage
         };
-        Result result = _gd.Vk.CreateBuffer(gd.Device, in bufferCI, null, out _deviceBuffer);
+        VkBufferHandle createdBuffer;
+        Result result = _gd.Vk.CreateBuffer(
+            gd.Device,
+            in bufferCI,
+            null,
+            out createdBuffer);
         CheckResult(result);
 
-        bool prefersDedicatedAllocation;
-        if (_gd.GetBufferMemoryRequirements2 != null)
+        VkMemoryBlock allocatedMemory = default;
+        bool memoryAllocated = false;
+        MemoryRequirements memoryRequirements = default;
+        try
         {
-            BufferMemoryRequirementsInfo2KHR memReqInfo2 = new BufferMemoryRequirementsInfo2KHR
+            bool prefersDedicatedAllocation;
+            if (_gd.GetBufferMemoryRequirements2 != null)
             {
-                SType = StructureType.BufferMemoryRequirementsInfo2Khr,
-                Buffer = _deviceBuffer
-            };
-            MemoryRequirements2KHR memReqs2 = new MemoryRequirements2KHR
-            {
-                SType = StructureType.MemoryRequirements2Khr
-            };
-            MemoryDedicatedRequirementsKHR dedicatedReqs = new MemoryDedicatedRequirementsKHR
-            {
-                SType = StructureType.MemoryDedicatedRequirementsKhr
-            };
-            memReqs2.PNext = &dedicatedReqs;
-            _gd.GetBufferMemoryRequirements2(_gd.Device, &memReqInfo2, &memReqs2);
-            _bufferMemoryRequirements = memReqs2.MemoryRequirements;
-            prefersDedicatedAllocation = dedicatedReqs.PrefersDedicatedAllocation || dedicatedReqs.RequiresDedicatedAllocation;
-        }
-        else
-        {
-            _gd.Vk.GetBufferMemoryRequirements(gd.Device, _deviceBuffer, out _bufferMemoryRequirements);
-            prefersDedicatedAllocation = false;
-        }
-
-        var isStaging = (usage & BufferUsage.Staging) == BufferUsage.Staging;
-        var hostVisible = isStaging || (usage & BufferUsage.Dynamic) == BufferUsage.Dynamic;
-
-        MemoryPropertyFlags memoryPropertyFlags =
-            hostVisible
-            ? MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit
-            : MemoryPropertyFlags.DeviceLocalBit;
-        if (isStaging)
-        {
-            // Use "host cached" memory for staging when available, for better performance of GPU -> CPU transfers
-            var hostCachedAvailable = TryFindMemoryType(
-                gd.PhysicalDeviceMemProperties,
-                _bufferMemoryRequirements.MemoryTypeBits,
-                memoryPropertyFlags | MemoryPropertyFlags.HostCachedBit,
-                out _);
-            if (hostCachedAvailable)
-            {
-                memoryPropertyFlags |= MemoryPropertyFlags.HostCachedBit;
+                BufferMemoryRequirementsInfo2KHR memReqInfo2 = new BufferMemoryRequirementsInfo2KHR
+                {
+                    SType = StructureType.BufferMemoryRequirementsInfo2Khr,
+                    Buffer = createdBuffer
+                };
+                MemoryRequirements2KHR memReqs2 = new MemoryRequirements2KHR
+                {
+                    SType = StructureType.MemoryRequirements2Khr
+                };
+                MemoryDedicatedRequirementsKHR dedicatedReqs = new MemoryDedicatedRequirementsKHR
+                {
+                    SType = StructureType.MemoryDedicatedRequirementsKhr
+                };
+                memReqs2.PNext = &dedicatedReqs;
+                _gd.GetBufferMemoryRequirements2(_gd.Device, &memReqInfo2, &memReqs2);
+                memoryRequirements = memReqs2.MemoryRequirements;
+                prefersDedicatedAllocation = dedicatedReqs.PrefersDedicatedAllocation || dedicatedReqs.RequiresDedicatedAllocation;
             }
+            else
+            {
+                _gd.Vk.GetBufferMemoryRequirements(
+                    gd.Device,
+                    createdBuffer,
+                    out memoryRequirements);
+                prefersDedicatedAllocation = false;
+            }
+
+            var isStaging = (usage & BufferUsage.Staging) == BufferUsage.Staging;
+            var hostVisible = isStaging || (usage & BufferUsage.Dynamic) == BufferUsage.Dynamic;
+
+            MemoryPropertyFlags memoryPropertyFlags =
+                hostVisible
+                ? MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit
+                : MemoryPropertyFlags.DeviceLocalBit;
+            if (isStaging)
+            {
+                // Use "host cached" memory for staging when available, for better performance of GPU -> CPU transfers
+                var hostCachedAvailable = TryFindMemoryType(
+                    gd.PhysicalDeviceMemProperties,
+                    memoryRequirements.MemoryTypeBits,
+                    memoryPropertyFlags | MemoryPropertyFlags.HostCachedBit,
+                    out _);
+                if (hostCachedAvailable)
+                {
+                    memoryPropertyFlags |= MemoryPropertyFlags.HostCachedBit;
+                }
+            }
+
+            allocatedMemory = gd.MemoryManager.Allocate(
+                gd.PhysicalDeviceMemProperties,
+                memoryRequirements.MemoryTypeBits,
+                memoryPropertyFlags,
+                hostVisible,
+                memoryRequirements.Size,
+                memoryRequirements.Alignment,
+                prefersDedicatedAllocation,
+                default(Image),
+                createdBuffer);
+            memoryAllocated = true;
+            result = _gd.Vk.BindBufferMemory(
+                gd.Device,
+                createdBuffer,
+                allocatedMemory.DeviceMemory,
+                allocatedMemory.Offset);
+            CheckResult(result);
+        }
+        catch (Exception initializationError)
+        {
+            VulkanCleanupCollector cleanup = new VulkanCleanupCollector();
+            cleanup.Attempt(() =>
+                _gd.Vk.DestroyBuffer(gd.Device, createdBuffer, null));
+            if (memoryAllocated)
+            {
+                cleanup.Attempt(() => gd.MemoryManager.Free(allocatedMemory));
+            }
+            cleanup.ThrowWithPrimary(
+                initializationError,
+                "Vulkan buffer initialization and cleanup both failed.");
         }
 
-        VkMemoryBlock memoryToken = gd.MemoryManager.Allocate(
-            gd.PhysicalDeviceMemProperties,
-            _bufferMemoryRequirements.MemoryTypeBits,
-            memoryPropertyFlags,
-            hostVisible,
-            _bufferMemoryRequirements.Size,
-            _bufferMemoryRequirements.Alignment,
-            prefersDedicatedAllocation,
-            default(Image),
-            _deviceBuffer);
-        _memory = memoryToken;
-        result = _gd.Vk.BindBufferMemory(gd.Device, _deviceBuffer, _memory.DeviceMemory, _memory.Offset);
-        CheckResult(result);
+        _deviceBuffer = createdBuffer;
+        _memory = allocatedMemory;
+        _bufferMemoryRequirements = memoryRequirements;
 
         RefCount = new ResourceRefCount(DisposeCore);
     }
@@ -147,9 +182,28 @@ internal unsafe class VkBuffer : DeviceBuffer
     {
         if (!_destroyed)
         {
-            _destroyed = true;
-            _gd.Vk.DestroyBuffer(_gd.Device, _deviceBuffer, null);
-            _gd.MemoryManager.Free(Memory);
+            VulkanCleanupCollector cleanup = new VulkanCleanupCollector();
+            if (_deviceBuffer.Handle != 0)
+            {
+                cleanup.Attempt(() =>
+                {
+                    _gd.Vk.DestroyBuffer(_gd.Device, _deviceBuffer, null);
+                    _deviceBuffer = default;
+                });
+            }
+            if (_deviceBuffer.Handle == 0 && _memory.DeviceMemory.Handle != 0)
+            {
+                cleanup.Attempt(() =>
+                {
+                    _gd.MemoryManager.Free(_memory);
+                    _memory = default;
+                });
+            }
+
+            _destroyed = _deviceBuffer.Handle == 0
+                && _memory.DeviceMemory.Handle == 0;
+            cleanup.ThrowIfAny(
+                "Vulkan buffer cleanup encountered multiple failures.");
         }
     }
 }

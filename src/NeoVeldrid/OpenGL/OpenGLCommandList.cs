@@ -23,7 +23,7 @@ internal class OpenGLCommandList : CommandList
     public override bool IsDisposed => _disposed;
 
     public OpenGLCommandList(OpenGLGraphicsDevice gd, ref CommandListDescription description)
-        : base(ref description, gd.Features, gd.UniformBufferMinOffsetAlignment, gd.StructuredBufferMinOffsetAlignment)
+        : base(ref description, gd, gd.Features, gd.UniformBufferMinOffsetAlignment, gd.StructuredBufferMinOffsetAlignment)
     {
         _gd = gd;
     }

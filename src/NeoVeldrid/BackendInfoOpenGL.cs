@@ -69,6 +69,37 @@ public class BackendInfoOpenGL
     public ReadOnlyCollection<string> Extensions => _extensions;
 
     /// <summary>
+    /// Gets the raw GL_CONTEXT_FLAGS value when it is queryable, or the platform-attested
+    /// debug bit for an older OpenGL ES context.
+    /// </summary>
+    public int ContextFlags => _gd.ContextFlags;
+
+    /// <summary>
+    /// Gets whether the backend could verify the context's debug creation state.
+    /// </summary>
+    public bool IsDebugContextStatusKnown => _gd.IsDebugContextStatusKnown;
+
+    /// <summary>
+    /// Gets whether the native context was verified to have debug behavior enabled.
+    /// </summary>
+    public bool IsDebugContext => _gd.IsDebugContext;
+
+    /// <summary>
+    /// Gets the exact core or KHR transport selected for native debug messages.
+    /// </summary>
+    public string DebugOutputTransport => _gd.DebugOutputTransport;
+
+    /// <summary>
+    /// Gets whether synchronous debug-message delivery was enabled and queried successfully.
+    /// </summary>
+    public bool IsDebugOutputSynchronous => _gd.IsDebugOutputSynchronous;
+
+    /// <summary>
+    /// Gets whether the native callback synchronously returned NeoVeldrid's activation probe.
+    /// </summary>
+    public bool DebugOutputProbePassed => _gd.DebugOutputProbePassed;
+
+    /// <summary>
     /// Executes the given delegate in the OpenGL device's main execution thread. In the delegate, OpenGL commands can be
     /// executed directly. This method does not return until the delegate's execution is fully completed.
     /// </summary>
