@@ -13,7 +13,7 @@ internal unsafe class D3D11ResourceFactory : ResourceFactory, IDisposable
     public override GraphicsBackend BackendType => GraphicsBackend.Direct3D11;
 
     public D3D11ResourceFactory(D3D11GraphicsDevice gd)
-        : base(gd.Features)
+        : base(gd)
     {
         _gd = gd;
         _device = gd.Device;
@@ -69,8 +69,12 @@ internal unsafe class D3D11ResourceFactory : ResourceFactory, IDisposable
     protected override Texture CreateTextureCore(ulong nativeTexture, ref TextureDescription description)
     {
         ID3D11Texture2D* existingTexture = (ID3D11Texture2D*)(void*)nativeTexture;
-        return new D3D11Texture(existingTexture, description.Type, description.Format);
+        return new D3D11Texture(_device, existingTexture, ref description);
     }
+
+    protected override bool SupportsNativeTextureImport(
+        in TextureDescription description) =>
+        description.Type == TextureType.Texture2D;
 
     protected override TextureView CreateTextureViewCore(ref TextureViewDescription description)
     {

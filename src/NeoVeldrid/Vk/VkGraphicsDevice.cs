@@ -2271,23 +2271,26 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
         return TextureSampleCount.Count1;
     }
 
-    private protected override bool GetPixelFormatSupportCore(
-        PixelFormat format,
-        TextureType type,
-        TextureUsage usage,
-        out PixelFormatProperties properties)
+    private protected override TextureSupportResult GetTextureSupportCore(
+        in TextureDescription description)
     {
-        Format vkFormat = VkFormats.VdToVkPixelFormat(format, (usage & TextureUsage.DepthStencil) != 0);
-        ImageType vkType = VkFormats.VdToVkTextureType(type);
+        TextureUsage usage = description.Usage;
         bool isStaging = usage == TextureUsage.Staging;
-        if (isStaging && FormatHelpers.IsStencilFormat(format))
+        bool isCubemap = (usage & TextureUsage.Cubemap) != 0;
+        bool isAttachment =
+            (usage & (TextureUsage.RenderTarget | TextureUsage.DepthStencil)) != 0;
+
+        // VkFramebuffer currently materializes attachment views as 2D views.
+        // Do not advertise native image combinations which that public usage
+        // cannot actually consume through the Vulkan backend.
+        if (isAttachment && description.Type != TextureType.Texture2D)
         {
-            // Buffer-image copies expose one Vulkan aspect at a time. The
-            // public staging layout does not define separate packed depth and
-            // stencil planes, so advertising either combined format would be
-            // a false copy/readback contract.
-            properties = default;
-            return false;
+            TextureSupportReason reason = (usage & TextureUsage.DepthStencil) != 0
+                ? TextureSupportReason.DepthStencilUsage
+                : TextureSupportReason.RenderTargetUsage;
+            return TextureSupportResult.Unsupported(
+                TextureSupportClassification.BackendContract,
+                reason);
         }
 
         // Vulkan staging textures are host-visible buffers, not linear images.
@@ -2296,37 +2299,148 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
         // linear image support here incorrectly rejected compressed staging on
         // devices whose compressed formats are transfer-capable but cannot use
         // linear tiling.
-        ImageTiling tiling = ImageTiling.Optimal;
+        Format vkFormat = VkFormats.VdToVkPixelFormat(
+            description.Format,
+            (usage & TextureUsage.DepthStencil) != 0);
+        ImageType vkType = VkFormats.VdToVkTextureType(description.Type);
         ImageUsageFlags vkUsage = isStaging
             ? ImageUsageFlags.TransferSrcBit | ImageUsageFlags.TransferDstBit
             : VkFormats.VdToVkTextureUsage(usage);
+        ImageCreateFlags imageFlags = ImageCreateFlags.CreateMutableFormatBit;
+        if (isCubemap)
+        {
+            imageFlags |= ImageCreateFlags.CreateCubeCompatibleBit;
+        }
 
         Result result = _vk.GetPhysicalDeviceImageFormatProperties(
             _physicalDevice,
             vkFormat,
             vkType,
-            tiling,
+            ImageTiling.Optimal,
             vkUsage,
-            ImageCreateFlags.None,
+            imageFlags,
             out ImageFormatProperties vkProps);
 
         if (result == Result.ErrorFormatNotSupported)
         {
-            properties = default(PixelFormatProperties);
-            return false;
+            return TextureSupportResult.Unsupported(
+                TextureSupportClassification.DeviceCapability,
+                TextureSupportReason.PixelFormat);
         }
         CheckResult(result);
 
-        properties = new PixelFormatProperties(
-           vkProps.MaxExtent.Width,
-           vkProps.MaxExtent.Height,
-           vkProps.MaxExtent.Depth,
-           vkProps.MaxMipLevels,
-           vkProps.MaxArrayLayers,
-           isStaging
-               ? (uint)SampleCountFlags.Count1Bit
-               : (uint)vkProps.SampleCounts);
-        return true;
+        if (isCubemap
+            && description.ArrayLayers > 1
+            && !_physicalDeviceFeatures.ImageCubeArray)
+        {
+            return TextureSupportResult.Unsupported(
+                TextureSupportClassification.DeviceCapability,
+                TextureSupportReason.CubemapUsage);
+        }
+
+        if ((usage & TextureUsage.Storage) != 0
+            && description.SampleCount != TextureSampleCount.Count1
+            && !_physicalDeviceFeatures.ShaderStorageImageMultisample)
+        {
+            return TextureSupportResult.Unsupported(
+                TextureSupportClassification.DeviceCapability,
+                TextureSupportReason.StorageUsage);
+        }
+
+        if ((usage & TextureUsage.GenerateMipmaps) != 0
+            && description.MipLevels > 1)
+        {
+            _vk.GetPhysicalDeviceFormatProperties(
+                _physicalDevice,
+                vkFormat,
+                out FormatProperties vkFormatProps);
+            const FormatFeatureFlags requiredBlitFeatures =
+                FormatFeatureFlags.BlitSrcBit | FormatFeatureFlags.BlitDstBit;
+            if ((vkFormatProps.OptimalTilingFeatures & requiredBlitFeatures)
+                != requiredBlitFeatures)
+            {
+                return TextureSupportResult.Unsupported(
+                    TextureSupportClassification.DeviceCapability,
+                    TextureSupportReason.MipmapGeneration);
+            }
+        }
+
+        uint maxWidth = vkProps.MaxExtent.Width;
+        uint maxHeight = vkProps.MaxExtent.Height;
+        if (isAttachment)
+        {
+            maxWidth = Math.Min(
+                maxWidth,
+                _physicalDeviceProperties.Limits.MaxFramebufferWidth);
+            maxHeight = Math.Min(
+                maxHeight,
+                _physicalDeviceProperties.Limits.MaxFramebufferHeight);
+        }
+
+        uint maxLogicalArrayLayers = isCubemap
+            ? vkProps.MaxArrayLayers / 6u
+            : vkProps.MaxArrayLayers;
+        if (isCubemap && !_physicalDeviceFeatures.ImageCubeArray)
+        {
+            maxLogicalArrayLayers = Math.Min(maxLogicalArrayLayers, 1u);
+        }
+
+        uint supportedSampleCounts = isStaging
+            ? (uint)SampleCountFlags.Count1Bit
+            : (uint)vkProps.SampleCounts;
+        if (description.Type != TextureType.Texture2D
+            || isCubemap
+            || description.MipLevels > 1
+            || ((usage & TextureUsage.Storage) != 0
+                && !_physicalDeviceFeatures.ShaderStorageImageMultisample))
+        {
+            supportedSampleCounts &= (uint)SampleCountFlags.Count1Bit;
+        }
+
+        PixelFormatProperties properties = new PixelFormatProperties(
+            maxWidth,
+            maxHeight,
+            vkProps.MaxExtent.Depth,
+            vkProps.MaxMipLevels,
+            maxLogicalArrayLayers,
+            supportedSampleCounts,
+            isStaging ? ulong.MaxValue : vkProps.MaxResourceSize);
+        return TextureSupportResult.Supported(properties);
+    }
+
+    private protected override TextureSupportResult ValidateTextureSupportDescriptorCore(
+        in TextureDescription description,
+        in TextureSupportResult capabilityResult)
+    {
+        // Staging textures are buffers in this backend. The image-format query
+        // establishes transfer-format compatibility for them, but its image
+        // resource-size limit does not constrain the staging buffer itself.
+        if (description.Usage == TextureUsage.Staging)
+        {
+            return capabilityResult;
+        }
+
+        // Vulkan exposes an upper bound for the total native image size but no
+        // API which reports that native size before image creation. The packed
+        // texel-block payload is nevertheless a sound lower bound: if it
+        // overflows or exceeds MaxResourceSize, the native image necessarily
+        // exceeds the advertised limit as well. Passing this check cannot
+        // guarantee that vkCreateImage will succeed because native alignment
+        // and implementation metadata are intentionally opaque.
+        bool hasRepresentableMinimum =
+            TextureStorageFootprint.TryCalculateMinimumSizeInBytes(
+                description,
+                out ulong minimumSizeInBytes);
+        if (!hasRepresentableMinimum
+            || minimumSizeInBytes
+                > capabilityResult.Properties.MaxResourceSizeInBytes)
+        {
+            return TextureSupportResult.Unsupported(
+                TextureSupportClassification.DeviceCapability,
+                TextureSupportReason.ResourceSizeLimit);
+        }
+
+        return capabilityResult;
     }
 
     internal Filter GetFormatFilter(Format format)

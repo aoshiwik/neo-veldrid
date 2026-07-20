@@ -45,21 +45,15 @@ internal unsafe class OpenGLTexture : Texture, OpenGLDeferredResource
 
         GLPixelFormat = OpenGLFormats.VdToGLPixelFormat(Format);
         GLPixelType = OpenGLFormats.VdToGLPixelType(Format);
-        GLInternalFormat = OpenGLFormats.VdToGLPixelInternalFormat(Format);
+        bool isDepthTexture =
+            (Usage & TextureUsage.DepthStencil) == TextureUsage.DepthStencil;
+        GLInternalFormat = GetMutableInternalFormat(Format, isDepthTexture);
 
-        if ((Usage & TextureUsage.DepthStencil) == TextureUsage.DepthStencil)
+        if (isDepthTexture)
         {
             GLPixelFormat = FormatHelpers.IsStencilFormat(Format)
                 ? GLPixelFormat.DepthStencil
                 : GLPixelFormat.DepthComponent;
-            if (Format == PixelFormat.R16_UNorm)
-            {
-                GLInternalFormat = InternalFormat.DepthComponent16;
-            }
-            else if (Format == PixelFormat.R32_Float)
-            {
-                GLInternalFormat = InternalFormat.DepthComponent32f;
-            }
         }
 
         if ((Usage & TextureUsage.Cubemap) == TextureUsage.Cubemap)
@@ -108,21 +102,15 @@ internal unsafe class OpenGLTexture : Texture, OpenGLDeferredResource
 
         GLPixelFormat = OpenGLFormats.VdToGLPixelFormat(Format);
         GLPixelType = OpenGLFormats.VdToGLPixelType(Format);
-        GLInternalFormat = OpenGLFormats.VdToGLPixelInternalFormat(Format);
+        bool isDepthTexture =
+            (Usage & TextureUsage.DepthStencil) == TextureUsage.DepthStencil;
+        GLInternalFormat = GetMutableInternalFormat(Format, isDepthTexture);
 
-        if ((Usage & TextureUsage.DepthStencil) == TextureUsage.DepthStencil)
+        if (isDepthTexture)
         {
             GLPixelFormat = FormatHelpers.IsStencilFormat(Format)
                 ? GLPixelFormat.DepthStencil
                 : GLPixelFormat.DepthComponent;
-            if (Format == PixelFormat.R16_UNorm)
-            {
-                GLInternalFormat = InternalFormat.DepthComponent16;
-            }
-            else if (Format == PixelFormat.R32_Float)
-            {
-                GLInternalFormat = InternalFormat.DepthComponent32f;
-            }
         }
 
         if ((Usage & TextureUsage.Cubemap) == TextureUsage.Cubemap)
@@ -185,6 +173,106 @@ internal unsafe class OpenGLTexture : Texture, OpenGLDeferredResource
     public TextureTarget TextureTarget { get; internal set; }
 
     public bool Created { get; private set; }
+
+    internal static InternalFormat GetMutableInternalFormat(
+        PixelFormat format,
+        bool depthFormat)
+    {
+        if (depthFormat && format == PixelFormat.R16_UNorm)
+            return InternalFormat.DepthComponent16;
+
+        if (depthFormat && format == PixelFormat.R32_Float)
+            return InternalFormat.DepthComponent32f;
+
+        return OpenGLFormats.VdToGLPixelInternalFormat(format);
+    }
+
+    internal static void AllocateMultisampleStorage(
+        GL gl,
+        OpenGLExtensions extensions,
+        uint texture,
+        TextureTarget target,
+        uint samples,
+        SizedInternalFormat sizedInternalFormat,
+        InternalFormat mutableInternalFormat,
+        uint width,
+        uint height,
+        uint arrayLayers)
+    {
+        if (target == TextureTarget.Texture2DMultisample)
+        {
+            if (extensions.ARB_DirectStateAccess)
+            {
+                gl.TextureStorage2DMultisample(
+                    texture,
+                    samples,
+                    sizedInternalFormat,
+                    width,
+                    height,
+                    false);
+            }
+            else if (extensions.TextureStorageMultisample)
+            {
+                gl.TexStorage2DMultisample(
+                    target,
+                    samples,
+                    sizedInternalFormat,
+                    width,
+                    height,
+                    false);
+            }
+            else
+            {
+                gl.TexImage2DMultisample(
+                    target,
+                    samples,
+                    mutableInternalFormat,
+                    width,
+                    height,
+                    false);
+            }
+        }
+        else if (target == TextureTarget.Texture2DMultisampleArray)
+        {
+            if (extensions.ARB_DirectStateAccess)
+            {
+                gl.TextureStorage3DMultisample(
+                    texture,
+                    samples,
+                    sizedInternalFormat,
+                    width,
+                    height,
+                    arrayLayers,
+                    false);
+            }
+            else if (extensions.TextureStorageMultisample)
+            {
+                gl.TexStorage3DMultisample(
+                    target,
+                    samples,
+                    sizedInternalFormat,
+                    width,
+                    height,
+                    arrayLayers,
+                    false);
+            }
+            else
+            {
+                gl.TexImage3DMultisample(
+                    target,
+                    samples,
+                    mutableInternalFormat,
+                    width,
+                    height,
+                    arrayLayers,
+                    false);
+            }
+        }
+        else
+        {
+            throw Illegal.Value<TextureTarget>();
+        }
+    }
 
     public void EnsureResourcesCreated()
     {
@@ -360,85 +448,21 @@ internal unsafe class OpenGLTexture : Texture, OpenGLDeferredResource
                 }
             }
         }
-        else if (TextureTarget == TextureTarget.Texture2DMultisample)
+        else if (TextureTarget == TextureTarget.Texture2DMultisample
+            || TextureTarget == TextureTarget.Texture2DMultisampleArray)
         {
-            if (dsa)
-            {
-                _gl.TextureStorage2DMultisample(
-                    _texture,
-                    FormatHelpers.GetSampleCountUInt32(SampleCount),
-                    (SizedInternalFormat)OpenGLFormats.VdToGLSizedInternalFormat(Format, isDepthTex),
-                    Width,
-                    Height,
-                    false);
-                CheckLastError();
-            }
-            else
-            {
-                if (_gd.Extensions.TextureStorageMultisample)
-                {
-                    _gl.TexStorage2DMultisample(
-                        TextureTarget.Texture2DMultisample,
-                        FormatHelpers.GetSampleCountUInt32(SampleCount),
-                        (SizedInternalFormat)OpenGLFormats.VdToGLSizedInternalFormat(Format, isDepthTex),
-                        Width,
-                        Height,
-                        false);
-                    CheckLastError();
-                }
-                else
-                {
-                    _gl.TexImage2DMultisample(
-                        TextureTarget.Texture2DMultisample,
-                        FormatHelpers.GetSampleCountUInt32(SampleCount),
-                        GLInternalFormat,
-                        Width,
-                        Height,
-                        false);
-                }
-                CheckLastError();
-            }
-        }
-        else if (TextureTarget == TextureTarget.Texture2DMultisampleArray)
-        {
-            if (dsa)
-            {
-                _gl.TextureStorage3DMultisample(
-                    _texture,
-                    FormatHelpers.GetSampleCountUInt32(SampleCount),
-                    (SizedInternalFormat)OpenGLFormats.VdToGLSizedInternalFormat(Format, isDepthTex),
-                    Width,
-                    Height,
-                    ArrayLayers,
-                    false);
-                CheckLastError();
-            }
-            else
-            {
-                if (_gd.Extensions.TextureStorageMultisample)
-                {
-                    _gl.TexStorage3DMultisample(
-                        TextureTarget.Texture2DMultisampleArray,
-                        FormatHelpers.GetSampleCountUInt32(SampleCount),
-                        (SizedInternalFormat)OpenGLFormats.VdToGLSizedInternalFormat(Format, isDepthTex),
-                        Width,
-                        Height,
-                        ArrayLayers,
-                        false);
-                }
-                else
-                {
-                    _gl.TexImage3DMultisample(
-                        TextureTarget.Texture2DMultisampleArray,
-                        FormatHelpers.GetSampleCountUInt32(SampleCount),
-                        GLInternalFormat,
-                        Width,
-                        Height,
-                        ArrayLayers,
-                        false);
-                    CheckLastError();
-                }
-            }
+            AllocateMultisampleStorage(
+                _gl,
+                _gd.Extensions,
+                _texture,
+                TextureTarget,
+                FormatHelpers.GetSampleCountUInt32(SampleCount),
+                OpenGLFormats.VdToGLSizedInternalFormat(Format, isDepthTex),
+                GLInternalFormat,
+                Width,
+                Height,
+                ArrayLayers);
+            CheckLastError();
         }
         else if (TextureTarget == TextureTarget.TextureCubeMap)
         {

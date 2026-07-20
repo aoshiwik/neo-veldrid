@@ -1135,6 +1135,7 @@ public abstract class RenderTests<T> : GraphicsDeviceTestBase<T> where T : Graph
         RgbaByte red = RgbaByte.Red;
         RgbaByte[] redPixels = Enumerable.Repeat(red, checked((int)(uploadWidth * size))).ToArray();
         CommandList commandList = RF.CreateCommandList();
+        commandList.EnableSubmissionDiagnostics(initialBufferAccessCapacity: 0);
 
         commandList.Begin();
         commandList.SetFramebuffer(framebuffer);
@@ -1158,6 +1159,7 @@ public abstract class RenderTests<T> : GraphicsDeviceTestBase<T> where T : Graph
             1,
             0,
             0);
+        Array.Fill(redPixels, RgbaByte.Blue);
         // Do not rebind the framebuffer, pipeline, or resources. The resumed
         // render pass must preserve them and restore white only in the right
         // stripe. Removing or reordering any operation changes at least one
@@ -1167,6 +1169,12 @@ public abstract class RenderTests<T> : GraphicsDeviceTestBase<T> where T : Graph
         commandList.End();
         GD.SubmitCommands(commandList);
         GD.WaitForIdle();
+
+        Assert.True(commandList.TryGetLastSubmissionMetrics(
+            out CommandListSubmissionMetrics metrics));
+        Assert.Equal(2, metrics.TotalDrawCallCount);
+        Assert.Equal(1, metrics.UpdateTextureCallCount);
+        Assert.Equal(96UL, metrics.UpdatedTextureBytes);
 
         Texture readback = GetReadback(target);
         MappedResourceView<RgbaByte> mapped =

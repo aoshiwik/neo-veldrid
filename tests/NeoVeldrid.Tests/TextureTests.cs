@@ -9,7 +9,7 @@ namespace NeoVeldrid.Tests;
 public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> where T : GraphicsDeviceCreator
 {
     [Fact]
-    public void CommandListTextureUpdateValidationIsBackendIndependent()
+    public unsafe void CommandListTextureUpdateValidationIsBackendIndependent()
     {
         Texture texture = RF.CreateTexture(
             TextureDescription.Texture2D(
@@ -36,6 +36,330 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
                 0));
 
         Assert.Contains("exactly match", exception.Message);
+
+        Texture stagingTexture = RF.CreateTexture(
+            TextureDescription.Texture2D(
+                4,
+                4,
+                1,
+                1,
+                PixelFormat.R8_UNorm,
+                TextureUsage.Staging));
+        byte[] completeSource = new byte[16];
+
+        commandList.Begin();
+        exception = Assert.Throws<NeoVeldridException>(
+            () => commandList.UpdateTexture(
+                stagingTexture,
+                completeSource,
+                0,
+                0,
+                0,
+                4,
+                4,
+                1,
+                0,
+                0));
+        commandList.End();
+
+        Assert.Equal(
+            "CommandList.UpdateTexture cannot target a staging Texture. "
+                + "Map the staging Texture or copy from it instead.",
+            exception.Message);
+
+        TextureDescription unsupportedDescription = TextureDescription.Texture3D(
+            4,
+            4,
+            4,
+            1,
+            PixelFormat.R8_UNorm,
+            TextureUsage.RenderTarget);
+        TextureSupportResult support =
+            GD.GetTextureSupport(unsupportedDescription);
+        Assert.False(support.IsSupported);
+        Assert.Equal(
+            TextureSupportClassification.BackendContract,
+            support.Classification);
+        Assert.Equal(TextureSupportReason.RenderTargetUsage, support.Reason);
+
+        AssertCreationRejected(
+            () => GD.ResourceFactory.CreateTexture(unsupportedDescription));
+        AssertCreationRejected(
+            () => RF.CreateTexture(ref unsupportedDescription));
+        AssertCreationRejected(
+            () => GD.ResourceFactory.CreateTexture(
+                0,
+                unsupportedDescription));
+        AssertCreationRejected(
+            () => RF.CreateTexture(0, ref unsupportedDescription));
+
+#if TEST_D3D11
+        if (GD.BackendType == GraphicsBackend.Direct3D11)
+        {
+            Assert.False(NeoVeldrid.D3D11.D3D11GraphicsDevice
+                .IsSupportedFeatureLevel(
+                    Silk.NET.Core.Native.D3DFeatureLevel.Level101));
+            Assert.True(NeoVeldrid.D3D11.D3D11GraphicsDevice
+                .IsSupportedFeatureLevel(
+                    Silk.NET.Core.Native.D3DFeatureLevel.Level110));
+            Assert.True(NeoVeldrid.D3D11.D3D11GraphicsDevice
+                .IsSupportedFeatureLevel(
+                    Silk.NET.Core.Native.D3DFeatureLevel.Level111));
+
+            TextureDescription importDescription =
+                TextureDescription.Texture2D(
+                    4,
+                    4,
+                    1,
+                    2,
+                    PixelFormat.R8_UNorm,
+                    TextureUsage.Sampled | TextureUsage.Cubemap);
+            Texture nativeOwner = RF.CreateTexture(importDescription);
+            var nativeOwnerD3D =
+                (NeoVeldrid.D3D11.D3D11Texture)nativeOwner;
+            Texture imported = RF.CreateTexture(
+                (ulong)nativeOwnerD3D.DeviceTexture,
+                importDescription);
+            Assert.Equal(TextureType.Texture2D, imported.Type);
+            Assert.Equal(importDescription.Width, imported.Width);
+            Assert.Equal(importDescription.Height, imported.Height);
+            Assert.Equal(importDescription.ArrayLayers, imported.ArrayLayers);
+            Assert.Equal(importDescription.Usage, imported.Usage);
+
+            Assert.Throws<ArgumentOutOfRangeException>(
+                () => RF.CreateTexture(0, importDescription));
+
+            TextureDescription mismatchedImport = importDescription;
+            mismatchedImport.ArrayLayers++;
+            ArgumentException mismatchException =
+                Assert.Throws<ArgumentException>(
+                    () => RF.CreateTexture(
+                        (ulong)nativeOwnerD3D.DeviceTexture,
+                        mismatchedImport));
+            Assert.Equal("description", mismatchException.ParamName);
+
+            TextureDescription unsupportedImport =
+                TextureDescription.Texture1D(
+                    4,
+                    1,
+                    1,
+                    PixelFormat.R8_UNorm,
+                    TextureUsage.Sampled);
+            TextureNotSupportedException importException =
+                Assert.Throws<TextureNotSupportedException>(
+                    () => RF.CreateTexture(0, unsupportedImport));
+            Assert.Equal(
+                TextureSupportReason.NativeTextureImport,
+                importException.SupportResult.Reason);
+        }
+#endif
+
+#if TEST_VULKAN
+        if (GD.BackendType == GraphicsBackend.Vulkan)
+        {
+            TextureDescription otherwiseSupportedImport =
+                TextureDescription.Texture2D(
+                    4,
+                    4,
+                    1,
+                    1,
+                    PixelFormat.R8_UNorm,
+                    TextureUsage.Sampled);
+            TextureSupportResult otherwiseSupportedResult =
+                GD.GetTextureSupport(otherwiseSupportedImport);
+            Assert.True(otherwiseSupportedResult.IsSupported);
+            Assert.True(
+                otherwiseSupportedResult.Properties.MaxResourceSizeInBytes
+                    >= (1UL << 31));
+
+            TextureDescription resourceLimitProbe =
+                TextureDescription.Texture2D(
+                    2,
+                    2,
+                    2,
+                    2,
+                    PixelFormat.R32_G32_B32_A32_Float,
+                    TextureUsage.Sampled);
+            TextureSupportResult resourceLimitCapability =
+                GD.GetTextureSupport(resourceLimitProbe);
+            Assert.True(resourceLimitCapability.IsSupported);
+            PixelFormatProperties resourceLimits =
+                resourceLimitCapability.Properties;
+            TextureDescription maximalResource =
+                TextureDescription.Texture2D(
+                    resourceLimits.MaxWidth,
+                    resourceLimits.MaxHeight,
+                    resourceLimits.MaxMipLevels,
+                    resourceLimits.MaxArrayLayers,
+                    PixelFormat.R32_G32_B32_A32_Float,
+                    TextureUsage.Sampled);
+            bool hasRepresentableFootprint =
+                TextureStorageFootprint.TryCalculateMinimumSizeInBytes(
+                    maximalResource,
+                    out ulong maximalResourceFootprint);
+            if (!hasRepresentableFootprint
+                || maximalResourceFootprint
+                    > resourceLimits.MaxResourceSizeInBytes)
+            {
+                TextureSupportResult maximalResourceSupport =
+                    GD.GetTextureSupport(maximalResource);
+                Assert.False(maximalResourceSupport.IsSupported);
+                Assert.Equal(
+                    TextureSupportClassification.DeviceCapability,
+                    maximalResourceSupport.Classification);
+                Assert.Equal(
+                    TextureSupportReason.ResourceSizeLimit,
+                    maximalResourceSupport.Reason);
+            }
+
+            TextureNotSupportedException importException =
+                Assert.Throws<TextureNotSupportedException>(
+                    () => RF.CreateTexture(0, otherwiseSupportedImport));
+            Assert.Equal(
+                TextureSupportClassification.BackendContract,
+                importException.SupportResult.Classification);
+            Assert.Equal(
+                TextureSupportReason.NativeTextureImport,
+                importException.SupportResult.Reason);
+        }
+#endif
+
+#if TEST_OPENGLES
+        if (GD.BackendType == GraphicsBackend.OpenGLES)
+        {
+            var openGLESDevice =
+                Assert.IsType<NeoVeldrid.OpenGL.OpenGLGraphicsDevice>(GD);
+            bool renderSNorm = openGLESDevice.Extensions.EXT_RenderSNorm;
+            bool textureNorm16 = openGLESDevice.Extensions.EXT_TextureNorm16;
+            bool colorBufferFloat =
+                openGLESDevice.Extensions.EXT_ColorBufferFloat;
+
+            var noColorBufferExtensions = new NeoVeldrid.OpenGL.OpenGLExtensions(
+                new HashSet<string>(),
+                GraphicsBackend.OpenGLES,
+                3,
+                2);
+            var colorBufferFloatExtensions = new NeoVeldrid.OpenGL.OpenGLExtensions(
+                new HashSet<string> { "GL_EXT_color_buffer_float" },
+                GraphicsBackend.OpenGLES,
+                3,
+                2);
+            Assert.False(NeoVeldrid.OpenGL.OpenGLGraphicsDevice
+                .IsOpenGLESColorRenderable(
+                    PixelFormat.R11_G11_B10_Float,
+                    noColorBufferExtensions));
+            Assert.True(NeoVeldrid.OpenGL.OpenGLGraphicsDevice
+                .IsOpenGLESColorRenderable(
+                    PixelFormat.R11_G11_B10_Float,
+                    colorBufferFloatExtensions));
+
+            AssertSignedNormalizedUsageContract(
+                PixelFormat.R8_SNorm,
+                requiresTextureNorm16: false);
+            AssertSignedNormalizedUsageContract(
+                PixelFormat.R16_SNorm,
+                requiresTextureNorm16: true);
+            AssertFloatUsageContract(PixelFormat.R11_G11_B10_Float);
+
+            void AssertSignedNormalizedUsageContract(
+                PixelFormat format,
+                bool requiresTextureNorm16)
+            {
+                bool expectedSupport = renderSNorm
+                    && (!requiresTextureNorm16 || textureNorm16);
+                TextureUsage[] usages =
+                {
+                    TextureUsage.RenderTarget,
+                    TextureUsage.Staging,
+                    TextureUsage.Sampled | TextureUsage.GenerateMipmaps,
+                };
+
+                foreach (TextureUsage usage in usages)
+                {
+                    uint mipLevels = (usage & TextureUsage.GenerateMipmaps) != 0
+                        ? 3u
+                        : 1u;
+                    TextureDescription signedNormalizedDescription =
+                        TextureDescription.Texture2D(
+                            4,
+                            4,
+                            mipLevels,
+                            1,
+                            format,
+                            usage);
+                    TextureSupportResult signedNormalizedSupport =
+                        GD.GetTextureSupport(signedNormalizedDescription);
+
+                    Assert.Equal(
+                        expectedSupport,
+                        signedNormalizedSupport.IsSupported);
+                    if (!expectedSupport)
+                    {
+                        Assert.Equal(
+                            TextureSupportClassification.DeviceCapability,
+                            signedNormalizedSupport.Classification);
+                        TextureSupportReason expectedReason =
+                            requiresTextureNorm16 && !textureNorm16
+                                ? TextureSupportReason.PixelFormat
+                                : usage == TextureUsage.RenderTarget
+                                    ? TextureSupportReason.RenderTargetUsage
+                                    : usage == TextureUsage.Staging
+                                        ? TextureSupportReason.StagingUsage
+                                        : TextureSupportReason.MipmapGeneration;
+                        Assert.Equal(
+                            expectedReason,
+                            signedNormalizedSupport.Reason);
+                    }
+                }
+            }
+
+            void AssertFloatUsageContract(PixelFormat format)
+            {
+                (TextureUsage Usage, TextureSupportReason Reason)[] cases =
+                {
+                    (TextureUsage.RenderTarget, TextureSupportReason.RenderTargetUsage),
+                    (TextureUsage.Staging, TextureSupportReason.StagingUsage),
+                    (
+                        TextureUsage.Sampled | TextureUsage.GenerateMipmaps,
+                        TextureSupportReason.MipmapGeneration),
+                };
+
+                foreach ((TextureUsage usage, TextureSupportReason reason) in cases)
+                {
+                    uint mipLevels = (usage & TextureUsage.GenerateMipmaps) != 0
+                        ? 3u
+                        : 1u;
+                    TextureDescription description = TextureDescription.Texture2D(
+                        4,
+                        4,
+                        mipLevels,
+                        1,
+                        format,
+                        usage);
+                    TextureSupportResult support = GD.GetTextureSupport(description);
+
+                    Assert.Equal(colorBufferFloat, support.IsSupported);
+                    if (!colorBufferFloat)
+                    {
+                        Assert.Equal(
+                            TextureSupportClassification.DeviceCapability,
+                            support.Classification);
+                        Assert.Equal(reason, support.Reason);
+                    }
+                }
+            }
+        }
+#endif
+
+        void AssertCreationRejected(Func<Texture> create)
+        {
+            TextureNotSupportedException rejected =
+                Assert.Throws<TextureNotSupportedException>(create);
+            Assert.Equal(GD.BackendType, rejected.BackendType);
+            Assert.True(unsupportedDescription.Equals(rejected.Description));
+            Assert.Equal(support.Classification, rejected.SupportResult.Classification);
+            Assert.Equal(support.Reason, rejected.SupportResult.Reason);
+        }
     }
 
     [Fact]
@@ -1200,7 +1524,7 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
         const uint ArrayLayers = 6;
 
         TextureDescription texDesc = TextureDescription.Texture2D(
-            TexSize, TexSize, MipLevels, ArrayLayers, PixelFormat.R8_UNorm, TextureUsage.Storage | TextureUsage.Sampled);
+            TexSize, TexSize, MipLevels, ArrayLayers, PixelFormat.R8_UNorm, TextureUsage.Sampled);
         Texture tex = RF.CreateTexture(texDesc);
 
         for (uint mip = 0; mip < MipLevels; mip++)
@@ -2573,7 +2897,7 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
         GD.WaitForIdle();
     }
 
-    [Theory]
+    [SkippableTheory]
     [InlineData(PixelFormat.BC1_Rgb_UNorm)]
     [InlineData(PixelFormat.BC1_Rgb_UNorm_SRgb)]
     [InlineData(PixelFormat.BC1_Rgba_UNorm)]
@@ -2590,7 +2914,27 @@ public abstract partial class TextureTestBase<T> : GraphicsDeviceTestBase<T> whe
     [InlineData(PixelFormat.BC7_UNorm_SRgb)]
     public void CreateSmallTexture(PixelFormat format)
     {
-        Texture tex = RF.CreateTexture(TextureDescription.Texture2D(1, 1, 1, 1, format, TextureUsage.Sampled));
+        TextureDescription description = TextureDescription.Texture2D(
+            1,
+            1,
+            1,
+            1,
+            format,
+            TextureUsage.Sampled);
+        TextureSupportResult support = GD.GetTextureSupport(description);
+        if (!support.IsSupported)
+        {
+            Assert.True(
+                support.Classification
+                    is TextureSupportClassification.BackendContract
+                    or TextureSupportClassification.DeviceCapability);
+        }
+
+        Skip.IfNot(
+            support.IsSupported,
+            $"NV-SKIP-SAMPLED-FORMAT: {format} sampled Texture2D is {support} on {GD.BackendType}.");
+
+        Texture tex = RF.CreateTexture(description);
         Assert.Equal(1u, tex.Width);
         Assert.Equal(1u, tex.Height);
     }
@@ -2681,7 +3025,7 @@ public class VulkanTextureTests : TextureTestBase<VulkanDeviceCreator>
             TextureType.Texture2D,
             TextureUsage.Staging));
 
-        NeoVeldridException exception = Assert.Throws<NeoVeldridException>(
+        TextureNotSupportedException exception = Assert.Throws<TextureNotSupportedException>(
             () => RF.CreateTexture(TextureDescription.Texture2D(
                 4,
                 4,
@@ -2689,6 +3033,12 @@ public class VulkanTextureTests : TextureTestBase<VulkanDeviceCreator>
                 1,
                 format,
                 TextureUsage.Staging)));
+        Assert.Equal(
+            TextureSupportClassification.LibraryContract,
+            exception.SupportResult.Classification);
+        Assert.Equal(
+            TextureSupportReason.PackedDepthStencilStaging,
+            exception.SupportResult.Reason);
         Assert.Contains("packed depth-stencil plane layout", exception.Message);
     }
 
@@ -3349,20 +3699,32 @@ public class OpenGLTextureTests : TextureTestBase<OpenGLDeviceCreator>
 #endif
 #if TEST_OPENGLES
 [Trait("Backend", "OpenGLES")]
-public class OpenGLESTextureTests : TextureTestBase<OpenGLESDeviceCreator>
+public partial class OpenGLESTextureTests : TextureTestBase<OpenGLESDeviceCreator>
 {
     [Fact]
     public void CompressedStagingReadback_IsReportedUnsupported()
     {
         const PixelFormat format = PixelFormat.BC3_UNorm;
-        Assert.False(GD.GetPixelFormatSupport(format, TextureType.Texture2D, TextureUsage.Staging));
+        TextureDescription description = TextureDescription.Texture2D(
+            16,
+            16,
+            1,
+            1,
+            format,
+            TextureUsage.Staging);
+        TextureSupportResult support = GD.GetTextureSupport(description);
+        Assert.False(support.IsSupported);
+        Assert.Equal(
+            TextureSupportClassification.BackendContract,
+            support.Classification);
+        Assert.Equal(TextureSupportReason.StagingUsage, support.Reason);
 
-        Texture texture = RF.CreateTexture(TextureDescription.Texture2D(
-            16, 16, 1, 1, format, TextureUsage.Staging));
-        NeoVeldridException exception = Assert.Throws<NeoVeldridException>(
-            () => GD.Map(texture, MapMode.Read));
-
-        Assert.Contains("not supported by the OpenGL ES backend", exception.Message);
+        TextureNotSupportedException exception =
+            Assert.Throws<TextureNotSupportedException>(
+                () => RF.CreateTexture(description));
+        Assert.Equal(support.Classification, exception.SupportResult.Classification);
+        Assert.Equal(support.Reason, exception.SupportResult.Reason);
+        Assert.Equal(GraphicsBackend.OpenGLES, exception.BackendType);
     }
 }
 #endif

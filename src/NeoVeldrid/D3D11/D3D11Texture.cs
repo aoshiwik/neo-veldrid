@@ -41,58 +41,10 @@ internal unsafe class D3D11Texture : Texture
         Type = description.Type;
         SampleCount = description.SampleCount;
 
-        DxgiFormat = D3D11Formats.ToDxgiFormat(
-            description.Format,
-            (description.Usage & TextureUsage.DepthStencil) == TextureUsage.DepthStencil);
-        TypelessDxgiFormat = D3D11Formats.GetTypelessFormat(DxgiFormat);
-
-        CpuAccessFlag cpuFlags = CpuAccessFlag.None;
-        Silk.NET.Direct3D11.Usage resourceUsage = Silk.NET.Direct3D11.Usage.Default;
-        BindFlag bindFlags = BindFlag.None;
-        ResourceMiscFlag optionFlags = ResourceMiscFlag.None;
-
-        if ((description.Usage & TextureUsage.RenderTarget) == TextureUsage.RenderTarget)
-        {
-            bindFlags |= BindFlag.RenderTarget;
-        }
-        if ((description.Usage & TextureUsage.DepthStencil) == TextureUsage.DepthStencil)
-        {
-            bindFlags |= BindFlag.DepthStencil;
-        }
-        if ((description.Usage & TextureUsage.Sampled) == TextureUsage.Sampled)
-        {
-            bindFlags |= BindFlag.ShaderResource;
-        }
-        if ((description.Usage & TextureUsage.Storage) == TextureUsage.Storage)
-        {
-            bindFlags |= BindFlag.UnorderedAccess;
-        }
-        if ((description.Usage & TextureUsage.Staging) == TextureUsage.Staging)
-        {
-            cpuFlags = CpuAccessFlag.Read | CpuAccessFlag.Write;
-            resourceUsage = Silk.NET.Direct3D11.Usage.Staging;
-        }
-
-        if ((description.Usage & TextureUsage.GenerateMipmaps) != 0)
-        {
-            bindFlags |= BindFlag.RenderTarget | BindFlag.ShaderResource;
-            optionFlags |= ResourceMiscFlag.GenerateMips;
-        }
-
-        uint arraySize = description.ArrayLayers;
-        if ((description.Usage & TextureUsage.Cubemap) == TextureUsage.Cubemap)
-        {
-            optionFlags |= ResourceMiscFlag.Texturecube;
-            arraySize *= 6;
-        }
-
-        int roundedWidth = (int)description.Width;
-        int roundedHeight = (int)description.Height;
-        if (FormatHelpers.IsCompressedFormat(description.Format))
-        {
-            roundedWidth = ((roundedWidth + 3) / 4) * 4;
-            roundedHeight = ((roundedHeight + 3) / 4) * 4;
-        }
+        NativeTextureDescription nativeDescription =
+            NativeTextureDescription.Create(description);
+        DxgiFormat = nativeDescription.ViewFormat;
+        TypelessDxgiFormat = nativeDescription.ResourceFormat;
 
         ID3D11Resource* nativeTexture = null;
         try
@@ -101,14 +53,14 @@ internal unsafe class D3D11Texture : Texture
             {
                 Texture1DDesc desc1D = new Texture1DDesc
                 {
-                    Width = (uint)roundedWidth,
+                    Width = nativeDescription.Width,
                     MipLevels = description.MipLevels,
-                    ArraySize = arraySize,
+                    ArraySize = nativeDescription.ArraySize,
                     Format = TypelessDxgiFormat,
-                    BindFlags = (uint)bindFlags,
-                    CPUAccessFlags = (uint)cpuFlags,
-                    Usage = resourceUsage,
-                    MiscFlags = (uint)optionFlags,
+                    BindFlags = (uint)nativeDescription.BindFlags,
+                    CPUAccessFlags = (uint)nativeDescription.CpuAccessFlags,
+                    Usage = nativeDescription.ResourceUsage,
+                    MiscFlags = (uint)nativeDescription.MiscFlags,
                 };
 
                 ID3D11Texture1D* texture = null;
@@ -120,20 +72,20 @@ internal unsafe class D3D11Texture : Texture
             {
                 Texture2DDesc desc2D = new Texture2DDesc
                 {
-                    Width = (uint)roundedWidth,
-                    Height = (uint)roundedHeight,
+                    Width = nativeDescription.Width,
+                    Height = nativeDescription.Height,
                     MipLevels = description.MipLevels,
-                    ArraySize = arraySize,
+                    ArraySize = nativeDescription.ArraySize,
                     Format = TypelessDxgiFormat,
-                    BindFlags = (uint)bindFlags,
-                    CPUAccessFlags = (uint)cpuFlags,
-                    Usage = resourceUsage,
+                    BindFlags = (uint)nativeDescription.BindFlags,
+                    CPUAccessFlags = (uint)nativeDescription.CpuAccessFlags,
+                    Usage = nativeDescription.ResourceUsage,
                     SampleDesc = new SampleDesc
                     {
                         Count = FormatHelpers.GetSampleCountUInt32(SampleCount),
                         Quality = 0,
                     },
-                    MiscFlags = (uint)optionFlags,
+                    MiscFlags = (uint)nativeDescription.MiscFlags,
                 };
 
                 ID3D11Texture2D* texture = null;
@@ -146,15 +98,15 @@ internal unsafe class D3D11Texture : Texture
                 Debug.Assert(Type == TextureType.Texture3D);
                 Texture3DDesc desc3D = new Texture3DDesc
                 {
-                    Width = (uint)roundedWidth,
-                    Height = (uint)roundedHeight,
+                    Width = nativeDescription.Width,
+                    Height = nativeDescription.Height,
                     Depth = description.Depth,
                     MipLevels = description.MipLevels,
                     Format = TypelessDxgiFormat,
-                    BindFlags = (uint)bindFlags,
-                    CPUAccessFlags = (uint)cpuFlags,
-                    Usage = resourceUsage,
-                    MiscFlags = (uint)optionFlags,
+                    BindFlags = (uint)nativeDescription.BindFlags,
+                    CPUAccessFlags = (uint)nativeDescription.CpuAccessFlags,
+                    Usage = nativeDescription.ResourceUsage,
+                    MiscFlags = (uint)nativeDescription.MiscFlags,
                 };
 
                 ID3D11Texture3D* texture = null;
@@ -178,15 +130,58 @@ internal unsafe class D3D11Texture : Texture
         }
     }
 
-    public D3D11Texture(ID3D11Texture2D* existingTexture, TextureType type, PixelFormat format)
+    public D3D11Texture(
+        ID3D11Device* device,
+        ID3D11Texture2D* existingTexture,
+        ref TextureDescription description)
     {
+        NativeTextureDescription expected =
+            NativeTextureDescription.Create(description);
         Texture2DDesc desc;
         existingTexture->GetDesc(&desc);
+        ValidateNativeTextureDescription(
+            device,
+            existingTexture,
+            in description,
+            in expected,
+            in desc);
+
+        _device = device;
+        Width = description.Width;
+        Height = description.Height;
+        Depth = description.Depth;
+        MipLevels = description.MipLevels;
+        ArrayLayers = description.ArrayLayers;
+        Format = description.Format;
+        SampleCount = description.SampleCount;
+        Type = TextureType.Texture2D;
+        Usage = description.Usage;
+        DxgiFormat = expected.ViewFormat;
+        TypelessDxgiFormat = expected.ResourceFormat;
+
+        // Acquire the wrapper's native ownership only after every potentially
+        // throwing metadata conversion has completed.
+        existingTexture->AddRef();
+        _deviceTexture = default;
+        _deviceTexture.Handle = (ID3D11Resource*)existingTexture;
+    }
+
+    // Swapchain buffers have runtime-owned descriptors which cannot be
+    // reconstructed from a public TextureDescription. This constructor is
+    // intentionally separate from ResourceFactory's strict native-import path.
+    public D3D11Texture(
+        ID3D11Texture2D* swapchainTexture,
+        TextureType type,
+        PixelFormat format)
+    {
+        Debug.Assert(type == TextureType.Texture2D);
+        Texture2DDesc desc;
+        swapchainTexture->GetDesc(&desc);
 
         ID3D11Device* device = null;
         try
         {
-            ((ID3D11DeviceChild*)existingTexture)->GetDevice(&device);
+            ((ID3D11DeviceChild*)swapchainTexture)->GetDevice(&device);
             _device = device;
         }
         finally
@@ -205,22 +200,161 @@ internal unsafe class D3D11Texture : Texture
         ArrayLayers = desc.ArraySize;
         Format = format;
         SampleCount = FormatHelpers.GetSampleCount(desc.SampleDesc.Count);
-        Type = type;
+        Type = TextureType.Texture2D;
         Usage = D3D11Formats.GetVdUsage(
             (BindFlag)desc.BindFlags,
             (CpuAccessFlag)desc.CPUAccessFlags,
             (ResourceMiscFlag)desc.MiscFlags);
-
         DxgiFormat = D3D11Formats.ToDxgiFormat(
             format,
-            (Usage & TextureUsage.DepthStencil) == TextureUsage.DepthStencil);
+            (Usage & TextureUsage.DepthStencil) != 0);
         TypelessDxgiFormat = D3D11Formats.GetTypelessFormat(DxgiFormat);
 
-        // Acquire the wrapper's native ownership only after every potentially
-        // throwing metadata conversion has completed.
-        existingTexture->AddRef();
+        swapchainTexture->AddRef();
         _deviceTexture = default;
-        _deviceTexture.Handle = (ID3D11Resource*)existingTexture;
+        _deviceTexture.Handle = (ID3D11Resource*)swapchainTexture;
+    }
+
+    private static void ValidateNativeTextureDescription(
+        ID3D11Device* expectedDevice,
+        ID3D11Texture2D* existingTexture,
+        in TextureDescription publicDescription,
+        in NativeTextureDescription expected,
+        in Texture2DDesc actual)
+    {
+        ID3D11Device* actualDevice = null;
+        try
+        {
+            ((ID3D11DeviceChild*)existingTexture)->GetDevice(&actualDevice);
+            if (actualDevice != expectedDevice)
+            {
+                throw new ArgumentException(
+                    "The native D3D11 texture belongs to a different graphics device.",
+                    "nativeTexture");
+            }
+        }
+        finally
+        {
+            if (actualDevice != null)
+            {
+                actualDevice->Release();
+            }
+        }
+
+        uint expectedSampleCount =
+            FormatHelpers.GetSampleCountUInt32(publicDescription.SampleCount);
+        if (actual.Width != expected.Width
+            || actual.Height != expected.Height
+            || actual.MipLevels != publicDescription.MipLevels
+            || actual.ArraySize != expected.ArraySize
+            || actual.Format != expected.ResourceFormat
+            || actual.SampleDesc.Count != expectedSampleCount
+            || actual.SampleDesc.Quality != 0
+            || actual.Usage != expected.ResourceUsage
+            || actual.BindFlags != (uint)expected.BindFlags
+            || actual.CPUAccessFlags != (uint)expected.CpuAccessFlags
+            || actual.MiscFlags != (uint)expected.MiscFlags)
+        {
+            throw new ArgumentException(
+                "The native D3D11 texture descriptor does not exactly match the supplied NeoVeldrid texture description.",
+                "description");
+        }
+    }
+
+    private readonly struct NativeTextureDescription
+    {
+        internal readonly uint Width;
+        internal readonly uint Height;
+        internal readonly uint ArraySize;
+        internal readonly Format ViewFormat;
+        internal readonly Format ResourceFormat;
+        internal readonly BindFlag BindFlags;
+        internal readonly CpuAccessFlag CpuAccessFlags;
+        internal readonly Silk.NET.Direct3D11.Usage ResourceUsage;
+        internal readonly ResourceMiscFlag MiscFlags;
+
+        private NativeTextureDescription(
+            uint width,
+            uint height,
+            uint arraySize,
+            Format viewFormat,
+            Format resourceFormat,
+            BindFlag bindFlags,
+            CpuAccessFlag cpuAccessFlags,
+            Silk.NET.Direct3D11.Usage resourceUsage,
+            ResourceMiscFlag miscFlags)
+        {
+            Width = width;
+            Height = height;
+            ArraySize = arraySize;
+            ViewFormat = viewFormat;
+            ResourceFormat = resourceFormat;
+            BindFlags = bindFlags;
+            CpuAccessFlags = cpuAccessFlags;
+            ResourceUsage = resourceUsage;
+            MiscFlags = miscFlags;
+        }
+
+        internal static NativeTextureDescription Create(
+            in TextureDescription description)
+        {
+            bool isDepthStencil =
+                (description.Usage & TextureUsage.DepthStencil) != 0;
+            Format viewFormat = D3D11Formats.ToDxgiFormat(
+                description.Format,
+                isDepthStencil);
+            Format resourceFormat = D3D11Formats.GetTypelessFormat(viewFormat);
+            CpuAccessFlag cpuAccessFlags = CpuAccessFlag.None;
+            Silk.NET.Direct3D11.Usage resourceUsage =
+                Silk.NET.Direct3D11.Usage.Default;
+            BindFlag bindFlags = BindFlag.None;
+            ResourceMiscFlag miscFlags = ResourceMiscFlag.None;
+
+            if ((description.Usage & TextureUsage.RenderTarget) != 0)
+                bindFlags |= BindFlag.RenderTarget;
+            if (isDepthStencil)
+                bindFlags |= BindFlag.DepthStencil;
+            if ((description.Usage & TextureUsage.Sampled) != 0)
+                bindFlags |= BindFlag.ShaderResource;
+            if ((description.Usage & TextureUsage.Storage) != 0)
+                bindFlags |= BindFlag.UnorderedAccess;
+            if ((description.Usage & TextureUsage.Staging) != 0)
+            {
+                cpuAccessFlags = CpuAccessFlag.Read | CpuAccessFlag.Write;
+                resourceUsage = Silk.NET.Direct3D11.Usage.Staging;
+            }
+            if ((description.Usage & TextureUsage.GenerateMipmaps) != 0)
+            {
+                bindFlags |= BindFlag.RenderTarget | BindFlag.ShaderResource;
+                miscFlags |= ResourceMiscFlag.GenerateMips;
+            }
+
+            uint arraySize = description.ArrayLayers;
+            if ((description.Usage & TextureUsage.Cubemap) != 0)
+            {
+                arraySize = checked(arraySize * 6u);
+                miscFlags |= ResourceMiscFlag.Texturecube;
+            }
+
+            uint width = description.Width;
+            uint height = description.Height;
+            if (FormatHelpers.IsCompressedFormat(description.Format))
+            {
+                width = checked(((width + 3u) / 4u) * 4u);
+                height = checked(((height + 3u) / 4u) * 4u);
+            }
+
+            return new NativeTextureDescription(
+                width,
+                height,
+                arraySize,
+                viewFormat,
+                resourceFormat,
+                bindFlags,
+                cpuAccessFlags,
+                resourceUsage,
+                miscFlags);
+        }
     }
 
     private protected override TextureView CreateFullTextureView(GraphicsDevice gd)
