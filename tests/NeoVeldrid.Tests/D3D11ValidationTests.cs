@@ -3,9 +3,63 @@ using Silk.NET.Core.Native;
 using Silk.NET.Direct3D11;
 using System;
 using System.Collections.Generic;
+using System.Threading.Tasks;
 using Xunit;
 
 namespace NeoVeldrid.Tests;
+
+[Trait("Backend", "D3D11")]
+public sealed class D3D11DeviceCreationOptionTests
+{
+    [Fact]
+    public void NonDebugRequestDoesNotCreateDebugDeviceInDebugBuild()
+    {
+        using GraphicsDevice device = GraphicsDevice.CreateD3D11(
+            new GraphicsDeviceOptions(debug: false));
+
+        Assert.False(device.IsDebugRequested);
+        Assert.True(device.GetD3D11Info(out BackendInfoD3D11 info));
+        Assert.False(info.DebugLayerWasProbed);
+        Assert.False(info.DebugDeviceWasCreated);
+        Assert.False(info.ValidationInfoQueueWasActivated);
+    }
+
+    [Fact]
+    public void ConcurrentCommandListDisposalReleasesItsContextOnce()
+    {
+        using GraphicsDevice device = GraphicsDevice.CreateD3D11(
+            new GraphicsDeviceOptions(debug: false));
+        CommandList commandList = device.ResourceFactory.CreateCommandList();
+
+        Parallel.For(0, 16, _ => commandList.Dispose());
+
+        Assert.True(commandList.IsDisposed);
+    }
+}
+
+[Trait("Backend", "D3D11")]
+public sealed class D3D11CommandListDisposalTests
+    : GraphicsDeviceTestBase<D3D11DeviceCreatorWithMainSwapchain>
+{
+    [Fact]
+    public void DisposeWhileRecordingReleasesSwapchainAndStagingOwnership()
+    {
+        using DeviceBuffer destination = RF.CreateBuffer(new BufferDescription(
+            512,
+            BufferUsage.UniformBuffer));
+        CommandList commandList = RF.CreateCommandList();
+
+        commandList.Begin();
+        commandList.SetFramebuffer(GD.MainSwapchain.Framebuffer);
+        commandList.UpdateBuffer(destination, 16, 0x1234ABCDu);
+        commandList.Dispose();
+
+        GD.MainSwapchain.Resize(128, 128);
+
+        Assert.True(commandList.IsDisposed);
+        GD.CheckValidation("disposed in-progress D3D11 command list");
+    }
+}
 
 [Trait("Backend", "D3D11")]
 public unsafe class D3D11ValidationTests : GraphicsDeviceTestBase<D3D11DeviceCreator>
