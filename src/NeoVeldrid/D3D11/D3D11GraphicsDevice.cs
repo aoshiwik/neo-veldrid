@@ -103,9 +103,6 @@ internal unsafe class D3D11GraphicsDevice : GraphicsDevice
                 : Silk.NET.Direct3D11.D3D11.GetApi(DXSwapchainProvider.Sdl2);
 #pragma warning restore CS0618
 
-#if DEBUG
-            flags |= CreateDeviceFlag.Debug;
-#endif
             // If debug flag set but SDK layers aren't available we can't enable debug.
             if ((flags & CreateDeviceFlag.Debug) != 0)
             {

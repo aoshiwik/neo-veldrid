@@ -19,7 +19,7 @@ internal unsafe class D3D11CommandList : CommandList
     private ComPtr<ID3D11DeviceContext1> _context1;
     private ComPtr<ID3DUserDefinedAnnotation> _uda;
     private bool _begun;
-    private bool _disposed;
+    private int _disposeState;
     private ComPtr<ID3D11CommandList> _commandList;
 
     private D3D11Viewport[] _viewports = new D3D11Viewport[0];
@@ -139,7 +139,7 @@ internal unsafe class D3D11CommandList : CommandList
 
     private D3D11Framebuffer D3D11Framebuffer => Util.AssertSubtype<Framebuffer, D3D11Framebuffer>(_framebuffer);
 
-    public override bool IsDisposed => _disposed;
+    public override bool IsDisposed => Volatile.Read(ref _disposeState) != 0;
 
     private protected override void BeginCore()
     {
@@ -1113,8 +1113,17 @@ internal unsafe class D3D11CommandList : CommandList
     {
         _cbOut[0] = range.Buffer.Buffer;
         _firstConstRef[0] = (int)range.Offset / 16;
-        uint roundedSize = range.Size < 256 ? 256u : range.Size;
+        uint roundedSize = CalculateConstantBufferRangeBindingSize(range.Size);
         _numConstsRef[0] = (int)roundedSize / 16;
+    }
+
+    internal static uint CalculateConstantBufferRangeBindingSize(uint size)
+    {
+        const uint d3d11RangeAlignment = 256u;
+        size = Math.Max(1u, size);
+        return checked(
+            ((size + d3d11RangeAlignment - 1u) / d3d11RangeAlignment) *
+            d3d11RangeAlignment);
     }
 
     private void BindUnorderedAccessView(
@@ -1520,8 +1529,8 @@ internal unsafe class D3D11CommandList : CommandList
     private void ReleaseDeviceCommandList()
     {
         Debug.Assert(_commandList.Handle != null);
-        _commandList.Dispose();
-        _commandList = default;
+        ID3D11CommandList* commandList = _commandList.Detach();
+        commandList->Release();
         ReleaseObservedTextureUploadRetentions();
     }
 
@@ -1690,37 +1699,43 @@ internal unsafe class D3D11CommandList : CommandList
 
     public override void Dispose()
     {
-        if (!_disposed)
+        // A command list owns three interfaces on the same deferred-context
+        // COM object. Claim that ownership before releasing any of them so a
+        // concurrent or re-entrant Dispose cannot release the context twice.
+        if (Interlocked.Exchange(ref _disposeState, 1) != 0)
         {
-            if (_uda.Handle != null) _uda.Dispose();
-            if (_commandList.Handle != null)
-            {
-                ReleaseDeviceCommandList();
-            }
-            else
-            {
-                AbandonObservedTextureUploadDestinations();
-            }
-            if (_context1.Handle != null) _context1.Dispose();
-            _context.Dispose();
-
-            foreach (BoundResourceSetInfo boundGraphicsSet in _graphicsResourceSets)
-            {
-                boundGraphicsSet.Offsets.Dispose();
-            }
-            foreach (BoundResourceSetInfo boundComputeSet in _computeResourceSets)
-            {
-                boundComputeSet.Offsets.Dispose();
-            }
-
-            foreach (D3D11Buffer buffer in _availableStagingBuffers)
-            {
-                buffer.Dispose();
-            }
-            _availableStagingBuffers.Clear();
-
-            _disposed = true;
+            return;
         }
+
+        ID3DUserDefinedAnnotation* annotation = _uda.Detach();
+        if (annotation != null) annotation->Release();
+        if (_commandList.Handle != null)
+        {
+            ReleaseDeviceCommandList();
+        }
+        else
+        {
+            AbandonObservedTextureUploadDestinations();
+        }
+        ID3D11DeviceContext1* context1 = _context1.Detach();
+        if (context1 != null) context1->Release();
+        ID3D11DeviceContext* context = _context.Detach();
+        if (context != null) context->Release();
+
+        foreach (BoundResourceSetInfo boundGraphicsSet in _graphicsResourceSets)
+        {
+            boundGraphicsSet.Offsets.Dispose();
+        }
+        foreach (BoundResourceSetInfo boundComputeSet in _computeResourceSets)
+        {
+            boundComputeSet.Offsets.Dispose();
+        }
+
+        foreach (D3D11Buffer buffer in _availableStagingBuffers)
+        {
+            buffer.Dispose();
+        }
+        _availableStagingBuffers.Clear();
     }
 
     private struct BoundTextureInfo
