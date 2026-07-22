@@ -35,8 +35,10 @@ public sealed class D3D11CommandListBufferRangeTests
 public sealed class D3D11CommandListBufferRangeIntegrationTests
     : GraphicsDeviceTestBase<D3D11DeviceCreator>
 {
-    private const string ReadUniformRangeShader = @"
-#version 450
+    // Keep the GLSL directive on the string's opening source line. The C#
+    // preprocessor still recognizes start-of-line '#' tokens while skipping
+    // this file's inactive TEST_D3D11 region on non-Windows platforms.
+    private const string ReadUniformRangeShader = @"#version 450
 layout(set = 0, binding = 0) uniform Parameters
 {
     uvec4 Prefix[16];
