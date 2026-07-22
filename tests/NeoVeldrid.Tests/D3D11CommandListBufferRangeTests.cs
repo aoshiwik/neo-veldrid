@@ -18,7 +18,9 @@ public sealed class D3D11CommandListBufferRangeTests
     [InlineData(512u, 512u)]
     [InlineData(656u, 768u)]
     [InlineData(65536u, 65536u)]
-    public void ConstantBufferRangeBindingSizeUsesD3D11RequiredAlignment(
+    [InlineData(65537u, 65536u)]
+    [InlineData(uint.MaxValue, 65536u)]
+    public void ConstantBufferRangeBindingSizeUsesD3D11RequiredLimits(
         uint requestedSize,
         uint expectedBindingSize)
     {
@@ -50,9 +52,13 @@ void main()
     Result = Tail.x;
 }";
 
-    [Fact]
+    [SkippableFact]
     public void BindsTwoHundredSeventyTwoByteConstantBufferRange()
     {
+        Skip.IfNot(
+            GD.Features.BufferRangeBinding,
+            "NV-SKIP-D3D11-BUFFER-RANGES: Buffer range binding is unavailable.");
+
         const uint rangeOffset = 256u;
         const uint rangeSize = 272u;
         const uint tailOffsetInRange = 256u;

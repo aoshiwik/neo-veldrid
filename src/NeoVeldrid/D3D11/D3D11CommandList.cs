@@ -14,6 +14,9 @@ namespace NeoVeldrid.D3D11;
 
 internal unsafe class D3D11CommandList : CommandList
 {
+    private const uint ConstantBufferRangeAlignmentInBytes = 256u;
+    private const uint MaxConstantBufferRangeBindingSizeInBytes = 65_536u;
+
     private readonly D3D11GraphicsDevice _gd;
     private ComPtr<ID3D11DeviceContext> _context;
     private ComPtr<ID3D11DeviceContext1> _context1;
@@ -1119,11 +1122,12 @@ internal unsafe class D3D11CommandList : CommandList
 
     internal static uint CalculateConstantBufferRangeBindingSize(uint size)
     {
-        const uint d3d11RangeAlignment = 256u;
-        size = Math.Max(1u, size);
-        return checked(
-            ((size + d3d11RangeAlignment - 1u) / d3d11RangeAlignment) *
-            d3d11RangeAlignment);
+        uint clampedSize = Math.Min(
+            MaxConstantBufferRangeBindingSizeInBytes,
+            Math.Max(1u, size));
+        return ((clampedSize + ConstantBufferRangeAlignmentInBytes - 1u) /
+            ConstantBufferRangeAlignmentInBytes) *
+            ConstantBufferRangeAlignmentInBytes;
     }
 
     private void BindUnorderedAccessView(
@@ -1658,12 +1662,7 @@ internal unsafe class D3D11CommandList : CommandList
     internal void OnCompleted()
     {
         ReleaseDeviceCommandList();
-
-        foreach (D3D11Swapchain sc in _referencedSwapchains)
-        {
-            sc.RemoveCommandListReference(this);
-        }
-        _referencedSwapchains.Clear();
+        ReleaseReferencedSwapchains();
 
         foreach (D3D11Buffer buffer in _submittedStagingBuffers)
         {
@@ -1671,6 +1670,39 @@ internal unsafe class D3D11CommandList : CommandList
         }
 
         _submittedStagingBuffers.Clear();
+    }
+
+    private void ReleaseReferencedSwapchains()
+    {
+        foreach (D3D11Swapchain swapchain in _referencedSwapchains)
+        {
+            swapchain.RemoveCommandListReference(this);
+        }
+        _referencedSwapchains.Clear();
+    }
+
+    private void AbandonPendingRecording()
+    {
+        if (_commandList.Handle != null)
+        {
+            ReleaseDeviceCommandList();
+        }
+        else
+        {
+            AbandonObservedTextureUploadDestinations();
+        }
+
+        ResetManagedState();
+        _begun = false;
+    }
+
+    private static void DisposeStagingBuffers(List<D3D11Buffer> stagingBuffers)
+    {
+        foreach (D3D11Buffer buffer in stagingBuffers)
+        {
+            buffer.Dispose();
+        }
+        stagingBuffers.Clear();
     }
 
     private protected override void PushDebugGroupCore(string name)
@@ -1707,35 +1739,18 @@ internal unsafe class D3D11CommandList : CommandList
             return;
         }
 
+        AbandonPendingRecording();
+        ReleaseReferencedSwapchains();
+
         ID3DUserDefinedAnnotation* annotation = _uda.Detach();
         if (annotation != null) annotation->Release();
-        if (_commandList.Handle != null)
-        {
-            ReleaseDeviceCommandList();
-        }
-        else
-        {
-            AbandonObservedTextureUploadDestinations();
-        }
         ID3D11DeviceContext1* context1 = _context1.Detach();
         if (context1 != null) context1->Release();
         ID3D11DeviceContext* context = _context.Detach();
         if (context != null) context->Release();
 
-        foreach (BoundResourceSetInfo boundGraphicsSet in _graphicsResourceSets)
-        {
-            boundGraphicsSet.Offsets.Dispose();
-        }
-        foreach (BoundResourceSetInfo boundComputeSet in _computeResourceSets)
-        {
-            boundComputeSet.Offsets.Dispose();
-        }
-
-        foreach (D3D11Buffer buffer in _availableStagingBuffers)
-        {
-            buffer.Dispose();
-        }
-        _availableStagingBuffers.Clear();
+        DisposeStagingBuffers(_availableStagingBuffers);
+        DisposeStagingBuffers(_submittedStagingBuffers);
     }
 
     private struct BoundTextureInfo

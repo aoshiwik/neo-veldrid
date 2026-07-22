@@ -38,6 +38,30 @@ public sealed class D3D11DeviceCreationOptionTests
 }
 
 [Trait("Backend", "D3D11")]
+public sealed class D3D11CommandListDisposalTests
+    : GraphicsDeviceTestBase<D3D11DeviceCreatorWithMainSwapchain>
+{
+    [Fact]
+    public void DisposeWhileRecordingReleasesSwapchainAndStagingOwnership()
+    {
+        using DeviceBuffer destination = RF.CreateBuffer(new BufferDescription(
+            512,
+            BufferUsage.UniformBuffer));
+        CommandList commandList = RF.CreateCommandList();
+
+        commandList.Begin();
+        commandList.SetFramebuffer(GD.MainSwapchain.Framebuffer);
+        commandList.UpdateBuffer(destination, 16, 0x1234ABCDu);
+        commandList.Dispose();
+
+        GD.MainSwapchain.Resize(128, 128);
+
+        Assert.True(commandList.IsDisposed);
+        GD.CheckValidation("disposed in-progress D3D11 command list");
+    }
+}
+
+[Trait("Backend", "D3D11")]
 public unsafe class D3D11ValidationTests : GraphicsDeviceTestBase<D3D11DeviceCreator>
 {
     [Fact]

@@ -23,8 +23,8 @@
       "name": "D3D11",
       "expectedDiscovered": {
         "algorithm": "sha256-trx-test-name-nul-v1",
-        "count": 509,
-        "sha256": "de09610b6ce71d3f9af6848e690bddc8e02aa8b192d10a3574590a18b4424731"
+        "count": 523,
+        "sha256": "a76a998ac26daf7e979720b3c124ae41e3d15a785efca1ad516e539b22776251"
       },
       "skipRules": [
         {
