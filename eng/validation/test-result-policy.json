@@ -14,8 +14,8 @@
       "name": "NonGPU",
       "expectedDiscovered": {
         "algorithm": "sha256-trx-test-name-nul-v1",
-        "count": 147,
-        "sha256": "269d5c6b38e2382be0b1a723186a1432d42eb4faf61b08b32b93c814e9658795"
+        "count": 152,
+        "sha256": "49e27e002cc66c590cec9e3264e987fa48530e03c69e744ffe7ca57fe2f4a47d"
       },
       "skipRules": []
     },
