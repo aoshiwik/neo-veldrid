@@ -18,6 +18,7 @@ public unsafe class Sdl2Window
     private static readonly Sdl _sdl = Sdl.GetApi();
 
     private readonly List<Event> _events = new List<Event>();
+    private readonly Sdl2WindowCloseCoordinator _closeCoordinator = new();
     private Silk.NET.SDL.Window* _window;
     internal uint WindowID { get; private set; }
     private bool _exists;
@@ -45,7 +46,9 @@ public unsafe class Sdl2Window
     private string _cachedWindowTitle;
     private bool _newWindowTitleReceived;
     private bool _firstMouseEvent = true;
-    private Func<bool> _closeRequestedHandler;
+#nullable enable
+    private Func<bool>? _closeRequestedHandler;
+#nullable disable
 
     // Cursor state
     private bool _cursorRelativeMode;
@@ -306,10 +309,12 @@ public unsafe class Sdl2Window
 
     public Vector2 MouseDelta => _currentMouseDelta;
 
-    public void SetCloseRequestedHandler(Func<bool> handler)
+#nullable enable
+    public void SetCloseRequestedHandler(Func<bool>? handler)
     {
         _closeRequestedHandler = handler;
     }
+#nullable disable
 
     public void Close()
     {
@@ -330,19 +335,31 @@ public unsafe class Sdl2Window
 
     private bool CloseCore()
     {
-        if (_closeRequestedHandler?.Invoke() ?? false)
+        Sdl2WindowCloseResult result = _closeCoordinator.TryClose(
+            _closeRequestedHandler,
+            () => Sdl2WindowRegistry.RemoveWindow(this),
+            () => Closing,
+            DestroyNativeWindow,
+            () => Closed);
+        if (result == Sdl2WindowCloseResult.Vetoed)
         {
             _shouldClose = false;
-            return false;
         }
 
-        Sdl2WindowRegistry.RemoveWindow(this);
-        Closing?.Invoke();
-        _sdl.DestroyWindow(_window);
-        _exists = false;
-        Closed?.Invoke();
+        return result == Sdl2WindowCloseResult.Closed;
+    }
 
-        return true;
+    private void DestroyNativeWindow()
+    {
+        try
+        {
+            _sdl.DestroyWindow(_window);
+        }
+        finally
+        {
+            _window = null;
+            _exists = false;
+        }
     }
 
     private void WindowOwnerRoutine(object state)

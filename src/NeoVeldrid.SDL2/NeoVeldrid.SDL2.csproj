@@ -11,4 +11,8 @@
         <PackageReference Include="Silk.NET.SDL" />
     </ItemGroup>
 
+    <ItemGroup>
+        <InternalsVisibleTo Include="NeoVeldrid.Tests" />
+    </ItemGroup>
+
 </Project>
