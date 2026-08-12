@@ -7,10 +7,73 @@ using VkBufferHandle = Silk.NET.Vulkan.Buffer;
 
 namespace NeoVeldrid.Vk;
 
+internal static class VkDeviceMemoryChunkPolicy
+{
+    private const ulong Mebibyte = 1024 * 1024;
+
+    internal const ulong PersistentMappedBaselineChunkSize = 16 * Mebibyte;
+    internal const ulong UnmappedBaselineChunkSize = 64 * Mebibyte;
+    internal const ulong PersistentMappedDedicatedAllocationThreshold = 64 * Mebibyte;
+    internal const ulong UnmappedDedicatedAllocationThreshold = 256 * Mebibyte;
+
+    internal static ulong GetDedicatedAllocationThreshold(bool persistentMapped) =>
+        persistentMapped
+            ? PersistentMappedDedicatedAllocationThreshold
+            : UnmappedDedicatedAllocationThreshold;
+
+    internal static ulong GetChunkSize(
+        bool persistentMapped,
+        ulong allocationSize,
+        ulong alignment)
+    {
+        if (alignment == 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(alignment));
+        }
+
+        ulong baselineSize = persistentMapped
+            ? PersistentMappedBaselineChunkSize
+            : UnmappedBaselineChunkSize;
+        ulong maximumSize = GetDedicatedAllocationThreshold(persistentMapped);
+        ulong alignedDemand = AlignUpToCeiling(
+            Math.Max(allocationSize, baselineSize),
+            alignment,
+            maximumSize);
+
+        ulong chunkSize = baselineSize;
+        while (chunkSize < alignedDemand)
+        {
+            chunkSize = Math.Min(chunkSize * 2, maximumSize);
+        }
+
+        return chunkSize;
+    }
+
+    private static ulong AlignUpToCeiling(
+        ulong value,
+        ulong alignment,
+        ulong ceiling)
+    {
+        if (value >= ceiling)
+        {
+            return ceiling;
+        }
+
+        ulong remainder = value % alignment;
+        if (remainder == 0)
+        {
+            return value;
+        }
+
+        ulong correction = alignment - remainder;
+        return correction > ceiling - value
+            ? ceiling
+            : value + correction;
+    }
+}
+
 internal unsafe class VkDeviceMemoryManager : IDisposable
 {
-    private const ulong MinDedicatedAllocationSizeDynamic = 1024 * 1024 * 64;
-    private const ulong MinDedicatedAllocationSizeNonDynamic = 1024 * 1024 * 256;
     private readonly Device _device;
     private readonly PhysicalDevice _physicalDevice;
     private readonly ulong _bufferImageGranularity;
@@ -113,9 +176,9 @@ internal unsafe class VkDeviceMemoryManager : IDisposable
                 throw new NeoVeldridException("No suitable memory type.");
             }
 
-            ulong minDedicatedAllocationSize = persistentMapped
-                ? MinDedicatedAllocationSizeDynamic
-                : MinDedicatedAllocationSizeNonDynamic;
+            ulong minDedicatedAllocationSize =
+                VkDeviceMemoryChunkPolicy.GetDedicatedAllocationThreshold(
+                    persistentMapped);
 
             if (dedicated || size >= minDedicatedAllocationSize)
             {
@@ -247,7 +310,11 @@ internal unsafe class VkDeviceMemoryManager : IDisposable
                 _vk,
                 _device,
                 _memoryTypeIndex,
-                _persistentMapped);
+                _persistentMapped,
+                VkDeviceMemoryChunkPolicy.GetChunkSize(
+                    _persistentMapped,
+                    size,
+                    alignment));
             try
             {
                 _allocators.Add(newAllocator);
@@ -285,12 +352,9 @@ internal unsafe class VkDeviceMemoryManager : IDisposable
 
     private class ChunkAllocator : IDisposable
     {
-        private const ulong PersistentMappedChunkSize = 1024 * 1024 * 64;
-        private const ulong UnmappedChunkSize = 1024 * 1024 * 256;
         private readonly Silk.NET.Vulkan.Vk _vk;
         private readonly Device _device;
         private readonly uint _memoryTypeIndex;
-        private readonly bool _persistentMapped;
         private readonly List<VkMemoryBlock> _freeBlocks = new List<VkMemoryBlock>();
         private readonly DeviceMemory _memory;
         private readonly void* _mappedPtr;
@@ -300,13 +364,17 @@ internal unsafe class VkDeviceMemoryManager : IDisposable
 
         public DeviceMemory Memory => _memory;
 
-        public ChunkAllocator(Silk.NET.Vulkan.Vk vk, Device device, uint memoryTypeIndex, bool persistentMapped)
+        public ChunkAllocator(
+            Silk.NET.Vulkan.Vk vk,
+            Device device,
+            uint memoryTypeIndex,
+            bool persistentMapped,
+            ulong totalMemorySize)
         {
             _vk = vk;
             _device = device;
             _memoryTypeIndex = memoryTypeIndex;
-            _persistentMapped = persistentMapped;
-            _totalMemorySize = persistentMapped ? PersistentMappedChunkSize : UnmappedChunkSize;
+            _totalMemorySize = totalMemorySize;
 
             MemoryAllocateInfo memoryAI = new MemoryAllocateInfo
             {

@@ -25,6 +25,7 @@ internal unsafe class D3D11Pipeline : Pipeline
     public ID3D11ComputeShader* ComputeShader { get; }
     public new D3D11ResourceLayout[] ResourceLayouts { get; }
     public int[] VertexStrides { get; }
+    public bool HasInstancedVertexInput { get; }
 
     public override bool IsComputePipeline { get; }
 
@@ -104,10 +105,15 @@ internal unsafe class D3D11Pipeline : Pipeline
             InputLayout = inputLayout;
             int numVertexBuffers = description.ShaderSet.VertexLayouts.Length;
             VertexStrides = new int[numVertexBuffers];
+            bool hasInstancedVertexInput = false;
             for (int i = 0; i < numVertexBuffers; i++)
             {
-                VertexStrides[i] = (int)description.ShaderSet.VertexLayouts[i].Stride;
+                VertexLayoutDescription layout =
+                    description.ShaderSet.VertexLayouts[i];
+                VertexStrides[i] = (int)layout.Stride;
+                hasInstancedVertexInput |= layout.InstanceStepRate != 0;
             }
+            HasInstancedVertexInput = hasInstancedVertexInput;
         }
         else
         {

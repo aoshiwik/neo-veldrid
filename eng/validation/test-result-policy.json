@@ -23,8 +23,8 @@
       "name": "D3D11",
       "expectedDiscovered": {
         "algorithm": "sha256-trx-test-name-nul-v1",
-        "count": 523,
-        "sha256": "a76a998ac26daf7e979720b3c124ae41e3d15a785efca1ad516e539b22776251"
+        "count": 524,
+        "sha256": "320a1abe480f58da41a6f5f76278baa2e888cf6c94c5d8394fbb9e76caeb79dc"
       },
       "skipRules": [
         {
@@ -60,8 +60,8 @@
       "name": "Vulkan",
       "expectedDiscovered": {
         "algorithm": "sha256-trx-test-name-nul-v1",
-        "count": 612,
-        "sha256": "3aeda585254d78209f488e50c3c975124e07c9a7707cb2df9086d4dd89eecf94"
+        "count": 630,
+        "sha256": "62c1c4ce0f503f170ba9812b0d9aaa5311a1aad0673db3b05d67a13404f2512f"
       },
       "skipRules": [
         {

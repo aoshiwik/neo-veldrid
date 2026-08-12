@@ -632,7 +632,10 @@ internal unsafe class D3D11CommandList : CommandList
     {
         PreDrawCommand();
 
-        if (instanceCount == 1 && instanceStart == 0)
+        if (!RequiresNativeInstancedDraw(
+                _graphicsPipeline.HasInstancedVertexInput,
+                instanceCount,
+                instanceStart))
         {
             Ctx->Draw(vertexCount, vertexStart);
         }
@@ -647,7 +650,10 @@ internal unsafe class D3D11CommandList : CommandList
         PreDrawCommand();
 
         Debug.Assert(_ib != null);
-        if (instanceCount == 1 && instanceStart == 0)
+        if (!RequiresNativeInstancedDraw(
+                _graphicsPipeline.HasInstancedVertexInput,
+                instanceCount,
+                instanceStart))
         {
             Ctx->DrawIndexed(indexCount, indexStart, vertexOffset);
         }
@@ -656,6 +662,14 @@ internal unsafe class D3D11CommandList : CommandList
             Ctx->DrawIndexedInstanced(indexCount, instanceCount, indexStart, vertexOffset, instanceStart);
         }
     }
+
+    internal static bool RequiresNativeInstancedDraw(
+        bool hasInstancedVertexInput,
+        uint instanceCount,
+        uint instanceStart)
+        => hasInstancedVertexInput ||
+           instanceCount != 1u ||
+           instanceStart != 0u;
 
     private protected override void DrawIndirectCore(DeviceBuffer indirectBuffer, uint offset, uint drawCount, uint stride)
     {

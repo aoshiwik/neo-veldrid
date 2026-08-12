@@ -66,6 +66,7 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
     private readonly object _graphicsCommandPoolLock = new object();
     private Queue _graphicsQueue;
     private readonly object _graphicsQueueLock = new object();
+    private readonly object _presentQueueLock = new object();
     private DebugUtilsMessengerEXT _debugMessengerHandle;
     private PfnDebugUtilsMessengerCallbackEXT _debugMessengerCallback;
     private GCHandle _validationCallbackTarget;
@@ -746,28 +747,61 @@ internal unsafe class VkGraphicsDevice : GraphicsDevice
     private protected override void SwapBuffersCore(Swapchain swapchain)
     {
         VkSwapchain vkSC = Util.AssertSubtype<Swapchain, VkSwapchain>(swapchain);
-        SwapchainKHR deviceSwapchain = vkSC.DeviceSwapchain;
-        PresentInfoKHR presentInfo = new PresentInfoKHR(sType: StructureType.PresentInfoKhr);
-        presentInfo.SwapchainCount = 1;
-        presentInfo.PSwapchains = &deviceSwapchain;
-        uint imageIndex = vkSC.ImageIndex;
-        presentInfo.PImageIndices = &imageIndex;
-
-        object presentLock = vkSC.PresentQueueIndex == _graphicsQueueIndex ? _graphicsQueueLock : vkSC;
-        lock (presentLock)
+        lock (vkSC)
         {
-            Result presentResult = _khrSwapchain.QueuePresent(vkSC.PresentQueue, &presentInfo);
+            VkSwapchainPresentationFrame frame = vkSC.GetPresentationFrame();
+            VkSemaphore renderFinishedSemaphore = frame.RenderFinishedSemaphore;
+            Result presentResult;
+
+            // Make the frame boundary indivisible relative to every graphics
+            // submitter. The empty submit is ordered after all prior rendering
+            // and supplies the binary semaphore that presentation must wait on,
+            // including when graphics and presentation use different queues.
+            lock (_graphicsQueueLock)
+            {
+                SubmitInfo renderFinishedSubmit = new SubmitInfo(
+                    sType: StructureType.SubmitInfo);
+                renderFinishedSubmit.SignalSemaphoreCount = 1;
+                renderFinishedSubmit.PSignalSemaphores = &renderFinishedSemaphore;
+                CheckResult(_vk.QueueSubmit(
+                    _graphicsQueue,
+                    1,
+                    &renderFinishedSubmit,
+                    default));
+
+                SwapchainKHR deviceSwapchain = frame.Swapchain;
+                uint imageIndex = frame.ImageIndex;
+                PresentInfoKHR presentInfo = new PresentInfoKHR(
+                    sType: StructureType.PresentInfoKhr);
+                presentInfo.WaitSemaphoreCount = 1;
+                presentInfo.PWaitSemaphores = &renderFinishedSemaphore;
+                presentInfo.SwapchainCount = 1;
+                presentInfo.PSwapchains = &deviceSwapchain;
+                presentInfo.PImageIndices = &imageIndex;
+
+                if (vkSC.PresentQueueIndex == _graphicsQueueIndex)
+                {
+                    presentResult = _khrSwapchain.QueuePresent(
+                        vkSC.PresentQueue,
+                        &presentInfo);
+                }
+                else
+                {
+                    lock (_presentQueueLock)
+                    {
+                        presentResult = _khrSwapchain.QueuePresent(
+                            vkSC.PresentQueue,
+                            &presentInfo);
+                    }
+                }
+            }
+
             if (presentResult != Result.SuboptimalKhr && presentResult != Result.ErrorOutOfDateKhr)
             {
                 CheckResult(presentResult);
             }
 
-            if (vkSC.AcquireNextImage(_device, default(VkSemaphore), vkSC.ImageAvailableFence))
-            {
-                VkFenceHandle fence = vkSC.ImageAvailableFence;
-                CheckResult(_vk.WaitForFences(_device, 1, &fence, true, ulong.MaxValue));
-                CheckResult(_vk.ResetFences(_device, 1, &fence));
-            }
+            vkSC.CompletePresentationAndAcquireNext(presentResult);
         }
     }
 
