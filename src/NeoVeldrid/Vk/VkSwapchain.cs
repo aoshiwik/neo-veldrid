@@ -10,8 +10,122 @@ using VkQueue = Silk.NET.Vulkan.Queue;
 
 namespace NeoVeldrid.Vk;
 
+internal enum VkSwapchainAcquireDisposition
+{
+    Acquired,
+    AcquiredSuboptimal,
+    RecreateRequired
+}
+
+internal sealed class VkSwapchainPresentationState
+{
+    private bool _hasAcquiredImage;
+    private uint _imageIndex;
+    private bool _recreateAfterPresent;
+
+    internal bool HasAcquiredImage => _hasAcquiredImage;
+    internal bool RecreateAfterPresent => _recreateAfterPresent;
+
+    internal static VkSwapchainAcquireDisposition ClassifyAcquireResult(Result result)
+        => result switch
+        {
+            Result.Success => VkSwapchainAcquireDisposition.Acquired,
+            Result.SuboptimalKhr => VkSwapchainAcquireDisposition.AcquiredSuboptimal,
+            Result.ErrorOutOfDateKhr => VkSwapchainAcquireDisposition.RecreateRequired,
+            _ => throw new NeoVeldridException(
+                $"Could not acquire the next Vulkan swapchain image: {result}.")
+        };
+
+    internal void CommitAcquiredImage(
+        uint imageIndex,
+        uint imageCount,
+        bool recreateAfterPresent)
+    {
+        if (_hasAcquiredImage)
+        {
+            throw new NeoVeldridException(
+                "A Vulkan swapchain image cannot be acquired while another image is still acquired.");
+        }
+        if (imageIndex >= imageCount)
+        {
+            throw new NeoVeldridException(
+                $"Vulkan acquired swapchain image {imageIndex}, but the swapchain exposes only {imageCount} images.");
+        }
+
+        _imageIndex = imageIndex;
+        _recreateAfterPresent = recreateAfterPresent;
+        _hasAcquiredImage = true;
+    }
+
+    internal uint RequireAcquiredImageIndex(uint imageCount)
+    {
+        if (!_hasAcquiredImage)
+        {
+            throw new NeoVeldridException(
+                "The Vulkan swapchain has no acquired image available for presentation.");
+        }
+        if (_imageIndex >= imageCount)
+        {
+            throw new NeoVeldridException(
+                $"The acquired Vulkan swapchain image {_imageIndex} is outside the current {imageCount}-image swapchain.");
+        }
+
+        return _imageIndex;
+    }
+
+    internal bool CompletePresentation(Result result)
+    {
+        if (!_hasAcquiredImage)
+        {
+            throw new NeoVeldridException(
+                "A Vulkan presentation cannot complete without an acquired swapchain image.");
+        }
+        if (result != Result.Success
+            && result != Result.SuboptimalKhr
+            && result != Result.ErrorOutOfDateKhr)
+        {
+            throw new NeoVeldridException(
+                $"Unexpected Vulkan presentation result: {result}.");
+        }
+
+        bool recreate = _recreateAfterPresent
+            || result == Result.SuboptimalKhr
+            || result == Result.ErrorOutOfDateKhr;
+        _hasAcquiredImage = false;
+        _imageIndex = 0;
+        _recreateAfterPresent = false;
+        return recreate;
+    }
+
+    internal void ReplaceSwapchain()
+    {
+        _hasAcquiredImage = false;
+        _imageIndex = 0;
+        _recreateAfterPresent = false;
+    }
+}
+
+internal readonly struct VkSwapchainPresentationFrame
+{
+    internal SwapchainKHR Swapchain { get; }
+    internal uint ImageIndex { get; }
+    internal VkSemaphore RenderFinishedSemaphore { get; }
+
+    internal VkSwapchainPresentationFrame(
+        SwapchainKHR swapchain,
+        uint imageIndex,
+        VkSemaphore renderFinishedSemaphore)
+    {
+        Swapchain = swapchain;
+        ImageIndex = imageIndex;
+        RenderFinishedSemaphore = renderFinishedSemaphore;
+    }
+}
+
 internal unsafe class VkSwapchain : Swapchain
 {
+    private const int MaxOutOfDateAcquireRetries = 3;
+
     private readonly VkGraphicsDevice _gd;
     private readonly SurfaceKHR _surface;
     private SwapchainKHR _deviceSwapchain;
@@ -24,7 +138,9 @@ internal unsafe class VkSwapchain : Swapchain
     private readonly bool _colorSrgb;
     private readonly PixelFormat? _depthFormat;
     private bool? _newSyncToVBlank;
-    private uint _currentImageIndex;
+    private readonly VkSwapchainPresentationState _presentationState =
+        new VkSwapchainPresentationState();
+    private VkSemaphore[] _renderFinishedSemaphores = Array.Empty<VkSemaphore>();
     private string _name;
     private bool _disposed;
     private bool _surfaceDestroyed;
@@ -47,8 +163,6 @@ internal unsafe class VkSwapchain : Swapchain
     public override bool IsDisposed => _disposed;
 
     public SwapchainKHR DeviceSwapchain => _deviceSwapchain;
-    public uint ImageIndex => _currentImageIndex;
-    public VkFenceHandle ImageAvailableFence => _imageAvailableFence;
     public SurfaceKHR Surface => _surface;
     public VkQueue PresentQueue => _presentQueue;
     public uint PresentQueueIndex => _presentQueueIndex;
@@ -92,8 +206,6 @@ internal unsafe class VkSwapchain : Swapchain
                 description.Height,
                 _depthFormat);
 
-            CreateSwapchain(description.Width, description.Height);
-
             FenceCreateInfo fenceCI = new FenceCreateInfo
             {
                 SType = StructureType.FenceCreateInfo,
@@ -108,19 +220,12 @@ internal unsafe class VkSwapchain : Swapchain
             CheckResult(fenceResult);
             _imageAvailableFence = createdImageAvailableFence;
 
-            if (!AcquireNextImage(_gd.Device, default, _imageAvailableFence))
+            if (!CreateSwapchain(description.Width, description.Height))
             {
                 throw new NeoVeldridException(
-                    "The initial Vulkan swapchain image could not be acquired.");
+                    "The initial Vulkan swapchain could not be created because its surface has no drawable extent.");
             }
-            VkFenceHandle iaf = _imageAvailableFence;
-            CheckResult(_gd.Vk.WaitForFences(
-                _gd.Device,
-                1,
-                &iaf,
-                true,
-                ulong.MaxValue));
-            CheckResult(_gd.Vk.ResetFences(_gd.Device, 1, &iaf));
+            AcquireNextImageWithOutOfDateRecovery();
 
             RefCount = new ResourceRefCount(DisposeCore);
         }
@@ -187,9 +292,21 @@ internal unsafe class VkSwapchain : Swapchain
                 _deviceSwapchain = default;
             });
         }
+        bool currentSemaphoresReleased =
+            AreSemaphoresDestroyed(_renderFinishedSemaphores);
+        if (deviceIdle
+            && currentDeviceSwapchainReleased
+            && !currentSemaphoresReleased)
+        {
+            currentSemaphoresReleased = DestroySemaphores(
+                _gd,
+                _renderFinishedSemaphores,
+                cleanup);
+        }
 
         bool allDeviceSwapchainsReleased =
             currentDeviceSwapchainReleased
+            && currentSemaphoresReleased
             && _retiredSwapchains.Count == 0;
 
         if (ownsSurfaceOnFailure
@@ -221,52 +338,112 @@ internal unsafe class VkSwapchain : Swapchain
         RecreateAndReacquire(width, height);
     }
 
-    public bool AcquireNextImage(Device device, VkSemaphore semaphore, VkFenceHandle fence)
+    internal VkSwapchainPresentationFrame GetPresentationFrame()
     {
-        if (_newSyncToVBlank != null)
+        uint imageCount = checked((uint)_renderFinishedSemaphores.Length);
+        uint imageIndex = _presentationState.RequireAcquiredImageIndex(imageCount);
+        return new VkSwapchainPresentationFrame(
+            _deviceSwapchain,
+            imageIndex,
+            _renderFinishedSemaphores[imageIndex]);
+    }
+
+    internal void CompletePresentationAndAcquireNext(Result presentResult)
+    {
+        bool recreate = _presentationState.CompletePresentation(presentResult)
+            || _newSyncToVBlank != null;
+        if (recreate
+            && !CreateSwapchain(_framebuffer.Width, _framebuffer.Height))
         {
-            RecreateAndReacquire(_framebuffer.Width, _framebuffer.Height);
-            return false;
+            throw new NeoVeldridException(
+                "The Vulkan swapchain needs replacement, but its surface has no drawable extent.");
+        }
+
+        AcquireNextImageWithOutOfDateRecovery();
+    }
+
+    private VkSwapchainAcquireDisposition AcquireNextImage()
+    {
+        if (_presentationState.HasAcquiredImage)
+        {
+            throw new NeoVeldridException(
+                "The Vulkan swapchain cannot acquire a second image before presenting the current image.");
         }
 
         uint imageIndex = 0;
         Result result = _gd.KhrSwapchain.AcquireNextImage(
-            device,
+            _gd.Device,
             _deviceSwapchain,
             ulong.MaxValue,
-            semaphore,
-            fence,
+            default,
+            _imageAvailableFence,
             &imageIndex);
-        if (result == Result.ErrorOutOfDateKhr || result == Result.SuboptimalKhr)
+
+        VkSwapchainAcquireDisposition disposition =
+            VkSwapchainPresentationState.ClassifyAcquireResult(result);
+        if (disposition == VkSwapchainAcquireDisposition.RecreateRequired)
         {
-            CreateSwapchain(_framebuffer.Width, _framebuffer.Height);
-            return false;
-        }
-        else if (result != Result.Success)
-        {
-            throw new NeoVeldridException("Could not acquire next image from the Vulkan swapchain.");
+            // OUT_OF_DATE does not acquire an image and therefore does not
+            // associate or signal the supplied fence. It must not be waited
+            // or reset before the replacement acquisition.
+            return disposition;
         }
 
-        _currentImageIndex = imageIndex;
-        _framebuffer.SetImageIndex(_currentImageIndex);
-        return true;
+        // SUCCESS and SUBOPTIMAL both acquire the returned image and schedule
+        // the fence signal. Consume that operation before the fence is reset
+        // or the swapchain is considered for replacement.
+        VkFenceHandle imageAvailableFence = _imageAvailableFence;
+        CheckResult(_gd.Vk.WaitForFences(
+            _gd.Device,
+            1,
+            &imageAvailableFence,
+            true,
+            ulong.MaxValue));
+        CheckResult(_gd.Vk.ResetFences(
+            _gd.Device,
+            1,
+            &imageAvailableFence));
+
+        _presentationState.CommitAcquiredImage(
+            imageIndex,
+            checked((uint)_renderFinishedSemaphores.Length),
+            disposition == VkSwapchainAcquireDisposition.AcquiredSuboptimal);
+        _framebuffer.SetImageIndex(imageIndex);
+        return disposition;
+    }
+
+    private void AcquireNextImageWithOutOfDateRecovery()
+    {
+        for (int replacementCount = 0;
+            replacementCount <= MaxOutOfDateAcquireRetries;
+            replacementCount++)
+        {
+            if (AcquireNextImage() != VkSwapchainAcquireDisposition.RecreateRequired)
+            {
+                return;
+            }
+
+            if (replacementCount == MaxOutOfDateAcquireRetries)
+            {
+                break;
+            }
+
+            if (!CreateSwapchain(_framebuffer.Width, _framebuffer.Height))
+            {
+                throw new NeoVeldridException(
+                    "The out-of-date Vulkan swapchain could not be replaced because its surface has no drawable extent.");
+            }
+        }
+
+        throw new NeoVeldridException(
+            $"The Vulkan swapchain remained out of date after {MaxOutOfDateAcquireRetries} replacement attempts.");
     }
 
     private void RecreateAndReacquire(uint width, uint height)
     {
         if (CreateSwapchain(width, height))
         {
-            if (AcquireNextImage(_gd.Device, default, _imageAvailableFence))
-            {
-                VkFenceHandle iaf2 = _imageAvailableFence;
-                CheckResult(_gd.Vk.WaitForFences(
-                    _gd.Device,
-                    1,
-                    &iaf2,
-                    true,
-                    ulong.MaxValue));
-                CheckResult(_gd.Vk.ResetFences(_gd.Device, 1, &iaf2));
-            }
+            AcquireNextImageWithOutOfDateRecovery();
         }
     }
 
@@ -407,9 +584,11 @@ internal unsafe class VkSwapchain : Swapchain
         swapchainCI.Clipped = true;
 
         SwapchainKHR oldSwapchain = _deviceSwapchain;
+        VkSemaphore[] oldRenderFinishedSemaphores = _renderFinishedSemaphores;
         swapchainCI.OldSwapchain = oldSwapchain;
 
         SwapchainKHR replacementSwapchain = default;
+        VkSemaphore[] replacementRenderFinishedSemaphores = Array.Empty<VkSemaphore>();
         VkSwapchainFramebuffer replacementFramebuffer = null;
         VkSwapchainFramebuffer failedOldFramebuffer = null;
         bool nativeReplacementAttempted = false;
@@ -455,6 +634,8 @@ internal unsafe class VkSwapchain : Swapchain
                 height,
                 surfaceFormat,
                 swapchainCI.ImageExtent);
+            replacementRenderFinishedSemaphores =
+                CreateRenderFinishedSemaphores(replacementSwapchain);
 
             // All validation is performed before the exchange. The existing
             // wrapper identity remains stable for callers that cache
@@ -462,8 +643,9 @@ internal unsafe class VkSwapchain : Swapchain
             _framebuffer.SwapStateWith(replacementFramebuffer);
             replacementCommitted = true;
             _deviceSwapchain = replacementSwapchain;
-            _currentImageIndex = 0;
-            _framebuffer.SetImageIndex(0);
+            _renderFinishedSemaphores = replacementRenderFinishedSemaphores;
+            replacementRenderFinishedSemaphores = Array.Empty<VkSemaphore>();
+            _presentationState.ReplaceSwapchain();
             _syncToVBlank = requestedSyncToVBlank;
             _newSyncToVBlank = null;
         }
@@ -485,11 +667,12 @@ internal unsafe class VkSwapchain : Swapchain
             {
                 _framebuffer.SwapStateWith(failedOldFramebuffer);
                 _deviceSwapchain = default;
-                _currentImageIndex = 0;
-                _framebuffer.SetImageIndex(0);
+                _renderFinishedSemaphores = Array.Empty<VkSemaphore>();
+                _presentationState.ReplaceSwapchain();
                 _retiredSwapchains.Add(new RetiredSwapchainResources(
                     failedOldFramebuffer,
-                    oldSwapchain));
+                    oldSwapchain,
+                    oldRenderFinishedSemaphores));
                 failedOldFramebuffer = null;
             }
 
@@ -497,8 +680,10 @@ internal unsafe class VkSwapchain : Swapchain
             {
                 _retiredSwapchains.Add(new RetiredSwapchainResources(
                     replacementFramebuffer,
-                    replacementSwapchain));
+                    replacementSwapchain,
+                    replacementRenderFinishedSemaphores));
                 replacementFramebuffer = null;
+                replacementRenderFinishedSemaphores = Array.Empty<VkSemaphore>();
             }
 
             if (replacementFramebuffer != null)
@@ -509,6 +694,7 @@ internal unsafe class VkSwapchain : Swapchain
             {
                 cleanup.Attempt(failedOldFramebuffer.Dispose);
             }
+            DestroySemaphores(_gd, replacementRenderFinishedSemaphores, cleanup);
 
             // Preparing replacement framebuffer textures may submit work.
             // A failed native create does not, and the old graph was already
@@ -536,7 +722,8 @@ internal unsafe class VkSwapchain : Swapchain
         {
             _retiredSwapchains.Add(new RetiredSwapchainResources(
                 replacementFramebuffer,
-                oldSwapchain));
+                oldSwapchain,
+                oldRenderFinishedSemaphores));
             RetirePendingSwapchains(retirement);
         }
         else if (!retirement.Attempt(replacementFramebuffer.Dispose)
@@ -548,6 +735,91 @@ internal unsafe class VkSwapchain : Swapchain
 
         retirement.ThrowIfAny(
             "The Vulkan swapchain replacement committed, but retiring its previous native graph failed.");
+        return true;
+    }
+
+    private VkSemaphore[] CreateRenderFinishedSemaphores(SwapchainKHR swapchain)
+    {
+        uint imageCount = 0;
+        Result result = _gd.KhrSwapchain.GetSwapchainImages(
+            _gd.Device,
+            swapchain,
+            ref imageCount,
+            null);
+        CheckResult(result);
+        if (imageCount == 0)
+        {
+            throw new NeoVeldridException(
+                "The Vulkan swapchain did not expose any presentable images.");
+        }
+
+        VkSemaphore[] semaphores = new VkSemaphore[imageCount];
+        SemaphoreCreateInfo createInfo = new SemaphoreCreateInfo(
+            sType: StructureType.SemaphoreCreateInfo);
+        try
+        {
+            for (int i = 0; i < semaphores.Length; i++)
+            {
+                VkSemaphore semaphore;
+                result = _gd.Vk.CreateSemaphore(
+                    _gd.Device,
+                    &createInfo,
+                    null,
+                    out semaphore);
+                CheckResult(result);
+                semaphores[i] = semaphore;
+            }
+
+            return semaphores;
+        }
+        catch (Exception initializationError)
+        {
+            VulkanCleanupCollector cleanup = new VulkanCleanupCollector();
+            DestroySemaphores(_gd, semaphores, cleanup);
+            cleanup.ThrowWithPrimary(
+                initializationError,
+                "Vulkan render-finished semaphore initialization and cleanup both failed.");
+        }
+
+        throw new System.Diagnostics.UnreachableException();
+    }
+
+    private static bool DestroySemaphores(
+        VkGraphicsDevice gd,
+        VkSemaphore[] semaphores,
+        VulkanCleanupCollector cleanup)
+    {
+        bool allDestroyed = true;
+        for (int i = 0; i < semaphores.Length; i++)
+        {
+            VkSemaphore semaphore = semaphores[i];
+            if (semaphore.Handle == 0)
+            {
+                continue;
+            }
+
+            bool destroyed = cleanup.Attempt(() =>
+                gd.Vk.DestroySemaphore(gd.Device, semaphore, null));
+            allDestroyed &= destroyed;
+            if (destroyed)
+            {
+                semaphores[i] = default;
+            }
+        }
+
+        return allDestroyed;
+    }
+
+    private static bool AreSemaphoresDestroyed(VkSemaphore[] semaphores)
+    {
+        for (int i = 0; i < semaphores.Length; i++)
+        {
+            if (semaphores[i].Handle != 0)
+            {
+                return false;
+            }
+        }
+
         return true;
     }
 
@@ -590,7 +862,9 @@ internal unsafe class VkSwapchain : Swapchain
     private void DisposeCore()
     {
         VulkanCleanupCollector cleanup = new VulkanCleanupCollector();
-        if (_imageAvailableFence.Handle != 0)
+        bool deviceIdle = _gd.Device.Handle == 0
+            || cleanup.Attempt(_gd.WaitForDeviceIdleAndReclaimSubmissions);
+        if (deviceIdle && _imageAvailableFence.Handle != 0)
         {
             cleanup.Attempt(() =>
             {
@@ -599,10 +873,15 @@ internal unsafe class VkSwapchain : Swapchain
             });
         }
 
-        RetirePendingSwapchains(cleanup);
+        if (deviceIdle)
+        {
+            RetirePendingSwapchains(cleanup);
+        }
 
         bool framebufferReleased = _framebuffer.IsDisposed;
-        if (!framebufferReleased && !_framebufferReleaseRequested)
+        if (deviceIdle
+            && !framebufferReleased
+            && !_framebufferReleaseRequested)
         {
             bool releaseRequested = cleanup.Attempt(_framebuffer.Dispose);
             _framebufferReleaseRequested = releaseRequested;
@@ -615,7 +894,7 @@ internal unsafe class VkSwapchain : Swapchain
         }
 
         bool deviceSwapchainReleased = _deviceSwapchain.Handle == 0;
-        if (framebufferReleased && !deviceSwapchainReleased)
+        if (deviceIdle && framebufferReleased && !deviceSwapchainReleased)
         {
             deviceSwapchainReleased = cleanup.Attempt(() =>
             {
@@ -626,7 +905,17 @@ internal unsafe class VkSwapchain : Swapchain
                 _deviceSwapchain = default;
             });
         }
+        bool semaphoresReleased = AreSemaphoresDestroyed(
+            _renderFinishedSemaphores);
+        if (deviceIdle && deviceSwapchainReleased && !semaphoresReleased)
+        {
+            semaphoresReleased = DestroySemaphores(
+                _gd,
+                _renderFinishedSemaphores,
+                cleanup);
+        }
         if (deviceSwapchainReleased
+            && semaphoresReleased
             && _retiredSwapchains.Count == 0
             && !_surfaceDestroyed
             && _surface.Handle != 0)
@@ -644,6 +933,7 @@ internal unsafe class VkSwapchain : Swapchain
         _disposed = _imageAvailableFence.Handle == 0
             && framebufferReleased
             && deviceSwapchainReleased
+            && semaphoresReleased
             && _retiredSwapchains.Count == 0
             && (_surface.Handle == 0 || _surfaceDestroyed);
         cleanup.ThrowIfAny("Vulkan swapchain cleanup encountered multiple failures.");
@@ -651,6 +941,7 @@ internal unsafe class VkSwapchain : Swapchain
 
     private bool HasAbandonedResources =>
         _imageAvailableFence.Handle != 0
+        || !AreSemaphoresDestroyed(_renderFinishedSemaphores)
         || (_framebuffer != null && !_framebuffer.IsDisposed)
         || _deviceSwapchain.Handle != 0
         || _retiredSwapchains.Count != 0
@@ -696,17 +987,31 @@ internal unsafe class VkSwapchain : Swapchain
                 _deviceSwapchain = default;
             });
         }
+        bool semaphoresReleased = AreSemaphoresDestroyed(
+            _renderFinishedSemaphores);
+        if (framebufferReleased
+            && _retiredSwapchains.Count == 0
+            && _deviceSwapchain.Handle == 0
+            && !semaphoresReleased)
+        {
+            semaphoresReleased = DestroySemaphores(
+                _gd,
+                _renderFinishedSemaphores,
+                cleanup);
+        }
 
         return _imageAvailableFence.Handle == 0
             && framebufferReleased
             && _retiredSwapchains.Count == 0
-            && _deviceSwapchain.Handle == 0;
+            && _deviceSwapchain.Handle == 0
+            && semaphoresReleased;
     }
 
     internal bool TryReleaseAbandonedInstanceResources(
         VulkanCleanupCollector cleanup)
     {
         if (_imageAvailableFence.Handle != 0
+            || !AreSemaphoresDestroyed(_renderFinishedSemaphores)
             || (_framebuffer != null && !_framebuffer.IsDisposed)
             || _retiredSwapchains.Count != 0
             || _deviceSwapchain.Handle != 0)
@@ -740,16 +1045,19 @@ internal unsafe class VkSwapchain : Swapchain
     private sealed class RetiredSwapchainResources
     {
         private readonly VkSwapchainFramebuffer _framebuffer;
+        private readonly VkSemaphore[] _renderFinishedSemaphores;
         private SwapchainKHR _swapchain;
         private bool _framebufferReleaseRequested;
 
         internal RetiredSwapchainResources(
             VkSwapchainFramebuffer framebuffer,
             SwapchainKHR swapchain,
+            VkSemaphore[] renderFinishedSemaphores,
             bool framebufferReleaseRequested = false)
         {
             _framebuffer = framebuffer;
             _swapchain = swapchain;
+            _renderFinishedSemaphores = renderFinishedSemaphores;
             _framebufferReleaseRequested = framebufferReleaseRequested;
         }
 
@@ -788,7 +1096,10 @@ internal unsafe class VkSwapchain : Swapchain
                 return false;
             }
 
-            return true;
+            return DestroySemaphores(
+                gd,
+                _renderFinishedSemaphores,
+                cleanup);
         }
     }
 }

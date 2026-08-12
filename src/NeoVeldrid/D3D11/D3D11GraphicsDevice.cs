@@ -535,6 +535,14 @@ internal unsafe class D3D11GraphicsDevice : GraphicsDevice
         lock (_immediateContextLock)
         {
             D3D11Swapchain d3d11SC = Util.AssertSubtype<Swapchain, D3D11Swapchain>(swapchain);
+            // ExecuteCommandList may leave the final deferred frame buffered
+            // in the immediate context. Do not make legacy DXGI Present the
+            // implicit queue-progress mechanism: on some drivers that can
+            // sleep inside Present before the queued frame has begun making
+            // progress. Flush once at the presentation boundary. This submits
+            // pending work without waiting for GPU completion and preserves
+            // batching across all submissions made for the frame.
+            _immediateContext.Handle->Flush();
             SilkMarshal.ThrowHResult(
                 d3d11SC.DxgiSwapChain->Present((uint)d3d11SC.SyncInterval, 0));
         }

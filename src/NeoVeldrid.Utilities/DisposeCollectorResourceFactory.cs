@@ -17,6 +17,16 @@ public class DisposeCollectorResourceFactory : ResourceFactory
         DisposeCollector = disposeCollector;
     }
 
+    /// <summary>
+    /// Creates a buffer whose lifetime is owned by the caller instead of this
+    /// factory's collector. Use this for resources whose physical storage can
+    /// be replaced: the logical owner can move retired buffers to the graphics
+    /// device's idle-disposal queue without leaving stale collector entries.
+    /// </summary>
+    public DeviceBuffer CreateOwnerManagedBuffer(
+        BufferDescription description) =>
+        Factory.CreateBuffer(description);
+
     public override GraphicsBackend BackendType => Factory.BackendType;
 
     public override CommandList CreateCommandList(ref CommandListDescription description)
