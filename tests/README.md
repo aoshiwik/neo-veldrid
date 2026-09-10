@@ -83,6 +83,17 @@ Qualification skip identities and reason codes are exact in
 capability skips, such as a missing Vulkan validation layer, but the result
 validator intentionally rejects those runs as qualification evidence.
 
+### D3D11 staging retirement
+
+`D3D11StagingBufferRetirementTests` checks that submitting a CPU-write staging
+buffer does not make it immediately reusable. Both command-list and immediate
+partial uniform updates retain storage until a GPU completion marker retires it.
+Forty ordered copies verify every payload across bounded submission reuse;
+abandoned, unsubmitted recordings reuse storage without a GPU wait. Submission
+depth bounds buffering, with explicit flush/wait backpressure when it is full.
+These are ownership and data-integrity tests, not scheduling-sensitive timing
+thresholds. Run them with the D3D11 buffer-range, buffer and disposal tests.
+
 ### Vulkan allocation contracts
 
 The Vulkan suite includes focused allocation regression tests for recording and bounded-submission hot paths. Run them after a Release build so debugger and first-build noise do not affect the measurement:

@@ -37,7 +37,16 @@ internal unsafe class D3D11GraphicsDevice : GraphicsDevice
         = new Dictionary<MappedResourceCacheKey, MappedResourceInfo>();
 
     private readonly object _stagingResourcesLock = new object();
-    private readonly List<D3D11Buffer> _availableStagingBuffers = new List<D3D11Buffer>();
+    private D3D11StagingBufferPool _immediateStagingUploads;
+
+    internal D3D11StagingBufferPoolDiagnostics ImmediateStagingUploadDiagnostics
+    {
+        get
+        {
+            lock (_stagingResourcesLock)
+                return _immediateStagingUploads?.CaptureDiagnostics() ?? default;
+        }
+    }
 
     private readonly Silk.NET.Direct3D11.D3D11 _d3d11Api;
 
@@ -517,7 +526,7 @@ internal unsafe class D3D11GraphicsDevice : GraphicsDevice
                 // completion marker has been committed.
                 if (executedCommandList)
                 {
-                    d3d11CL.OnCompleted();
+                    d3d11CL.OnSubmitted(context);
                 }
             }
             finally
@@ -528,6 +537,14 @@ internal unsafe class D3D11GraphicsDevice : GraphicsDevice
                 }
             }
         }
+    }
+
+    internal void WaitForStagingRetirement(D3D11Fence fence)
+    {
+        // A command-only client may not present. Explicit bounded-pool
+        // backpressure must submit the pending EVENT before waiting for it.
+        lock (_immediateContextLock) _immediateContext.Handle->Flush();
+        WaitForFence(fence);
     }
 
     private protected override void SwapBuffersCore(Swapchain swapchain)
@@ -1089,50 +1106,27 @@ internal unsafe class D3D11GraphicsDevice : GraphicsDevice
         }
         else
         {
-            D3D11Buffer staging = GetFreeStagingBuffer(sizeInBytes);
-            UpdateBuffer(staging, 0, source, sizeInBytes);
-            Box sourceRegion = new Box
-            {
-                Left = 0,
-                Top = 0,
-                Front = 0,
-                Right = sizeInBytes,
-                Bottom = 1,
-                Back = 1,
-            };
-            lock (_immediateContextLock)
-            {
-                ((ID3D11DeviceContext*)_immediateContext)->CopySubresourceRegion(
-                    (ID3D11Resource*)d3dBuffer.Buffer, 0, bufferOffsetInBytes, 0, 0,
-                    (ID3D11Resource*)staging.Buffer, 0,
-                    &sourceRegion);
-            }
-
             lock (_stagingResourcesLock)
             {
-                _availableStagingBuffers.Add(staging);
-            }
-        }
-    }
-
-    private D3D11Buffer GetFreeStagingBuffer(uint sizeInBytes)
-    {
-        lock (_stagingResourcesLock)
-        {
-            foreach (D3D11Buffer buffer in _availableStagingBuffers)
-            {
-                if (buffer.SizeInBytes >= sizeInBytes)
+                var uploads = _immediateStagingUploads ??= new D3D11StagingBufferPool(this, 0);
+                D3D11Buffer staging = uploads.Rent(sizeInBytes);
+                try { UpdateBuffer(staging, 0, source, sizeInBytes); }
+                catch { uploads.AbandonRecording(); throw; }
+                Box sourceRegion = new Box
                 {
-                    _availableStagingBuffers.Remove(buffer);
-                    return buffer;
+                    Left = 0, Top = 0, Front = 0,
+                    Right = sizeInBytes, Bottom = 1, Back = 1,
+                };
+                lock (_immediateContextLock)
+                {
+                    var context = _immediateContext.Handle;
+                    context->CopySubresourceRegion(
+                        (ID3D11Resource*)d3dBuffer.Buffer, 0, bufferOffsetInBytes, 0, 0,
+                        (ID3D11Resource*)staging.Buffer, 0, &sourceRegion);
+                    uploads.Submitted(context);
                 }
             }
         }
-
-        DeviceBuffer staging = ResourceFactory.CreateBuffer(
-            new BufferDescription(sizeInBytes, BufferUsage.Staging));
-
-        return Util.AssertSubtype<DeviceBuffer, D3D11Buffer>(staging);
     }
 
     private protected override void UpdateTextureCore(
@@ -1455,11 +1449,9 @@ internal unsafe class D3D11GraphicsDevice : GraphicsDevice
     {
         List<Exception> failures = null;
 
-        foreach (DeviceBuffer buffer in _availableStagingBuffers)
-        {
-            AttemptPlatformCleanup(buffer.Dispose, ref failures);
-        }
-        _availableStagingBuffers.Clear();
+        if (_immediateStagingUploads != null)
+            AttemptPlatformCleanup(_immediateStagingUploads.Dispose, ref failures);
+        _immediateStagingUploads = null;
 
         AttemptPlatformCleanup(() => _d3d11ResourceFactory?.Dispose(), ref failures);
         AttemptPlatformCleanup(() => _mainSwapchain?.Dispose(), ref failures);

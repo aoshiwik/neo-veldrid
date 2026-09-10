@@ -85,8 +85,9 @@ internal unsafe class D3D11CommandList : CommandList
     private readonly List<(DeviceBuffer, int)> _boundComputeUAVBuffers = new List<(DeviceBuffer, int)>(MaxUAVs);
     private readonly List<(DeviceBuffer, int)> _boundOMUAVBuffers = new List<(DeviceBuffer, int)>(MaxUAVs);
 
-    private readonly List<D3D11Buffer> _availableStagingBuffers = new List<D3D11Buffer>();
-    private readonly List<D3D11Buffer> _submittedStagingBuffers = new List<D3D11Buffer>();
+    private readonly D3D11StagingBufferPool _stagingUploads;
+
+    internal D3D11StagingBufferPoolDiagnostics StagingUploadDiagnostics => _stagingUploads.CaptureDiagnostics();
 
     private readonly List<D3D11Swapchain> _referencedSwapchains = new List<D3D11Swapchain>();
 
@@ -111,6 +112,7 @@ internal unsafe class D3D11CommandList : CommandList
         : base(ref description, gd, gd.Features, gd.UniformBufferMinOffsetAlignment, gd.StructuredBufferMinOffsetAlignment)
     {
         _gd = gd;
+        _stagingUploads = new D3D11StagingBufferPool(gd, description.MaximumInFlightSubmissionCount);
 
         ID3D11DeviceContext* pDeferredContext;
         SilkMarshal.ThrowHResult(gd.Device->CreateDeferredContext(0, &pDeferredContext));
@@ -150,6 +152,7 @@ internal unsafe class D3D11CommandList : CommandList
         {
             ReleaseDeviceCommandList();
         }
+        _stagingUploads.AbandonRecording();
         ClearState();
         _begun = true;
     }
@@ -1412,10 +1415,9 @@ internal unsafe class D3D11CommandList : CommandList
         }
         else
         {
-            D3D11Buffer staging = GetFreeStagingBuffer(sizeInBytes);
+            D3D11Buffer staging = _stagingUploads.Rent(sizeInBytes);
             _gd.UpdateBuffer(staging, 0, source, sizeInBytes);
             CopyBuffer(staging, 0, buffer, bufferOffsetInBytes, sizeInBytes);
-            _submittedStagingBuffers.Add(staging);
         }
     }
 
@@ -1571,23 +1573,6 @@ internal unsafe class D3D11CommandList : CommandList
     }
 
 
-    private D3D11Buffer GetFreeStagingBuffer(uint sizeInBytes)
-    {
-        foreach (D3D11Buffer buffer in _availableStagingBuffers)
-        {
-            if (buffer.SizeInBytes >= sizeInBytes)
-            {
-                _availableStagingBuffers.Remove(buffer);
-                return buffer;
-            }
-        }
-
-        DeviceBuffer staging = _gd.ResourceFactory.CreateBuffer(
-            new BufferDescription(sizeInBytes, BufferUsage.Staging));
-
-        return Util.AssertSubtype<DeviceBuffer, D3D11Buffer>(staging);
-    }
-
     private protected override void CopyBufferCore(DeviceBuffer source, uint sourceOffset, DeviceBuffer destination, uint destinationOffset, uint sizeInBytes)
     {
         D3D11Buffer srcD3D11Buffer = Util.AssertSubtype<DeviceBuffer, D3D11Buffer>(source);
@@ -1673,17 +1658,11 @@ internal unsafe class D3D11CommandList : CommandList
         }
     }
 
-    internal void OnCompleted()
+    internal void OnSubmitted(ID3D11DeviceContext* context)
     {
+        _stagingUploads.Submitted(context);
         ReleaseDeviceCommandList();
         ReleaseReferencedSwapchains();
-
-        foreach (D3D11Buffer buffer in _submittedStagingBuffers)
-        {
-            _availableStagingBuffers.Add(buffer);
-        }
-
-        _submittedStagingBuffers.Clear();
     }
 
     private void ReleaseReferencedSwapchains()
@@ -1708,15 +1687,6 @@ internal unsafe class D3D11CommandList : CommandList
 
         ResetManagedState();
         _begun = false;
-    }
-
-    private static void DisposeStagingBuffers(List<D3D11Buffer> stagingBuffers)
-    {
-        foreach (D3D11Buffer buffer in stagingBuffers)
-        {
-            buffer.Dispose();
-        }
-        stagingBuffers.Clear();
     }
 
     private protected override void PushDebugGroupCore(string name)
@@ -1763,8 +1733,7 @@ internal unsafe class D3D11CommandList : CommandList
         ID3D11DeviceContext* context = _context.Detach();
         if (context != null) context->Release();
 
-        DisposeStagingBuffers(_availableStagingBuffers);
-        DisposeStagingBuffers(_submittedStagingBuffers);
+        _stagingUploads.Dispose();
     }
 
     private struct BoundTextureInfo
