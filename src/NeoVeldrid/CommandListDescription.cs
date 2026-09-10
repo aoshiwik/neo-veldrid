@@ -9,8 +9,9 @@ public struct CommandListDescription : IEquatable<CommandListDescription>
 {
     /// <summary>
     /// Gets or sets the maximum number of submissions from this command list
-    /// that a backend may retain concurrently. Zero selects adaptive backend
-    /// behavior without an explicit bound.
+    /// that a backend may retain concurrently. Zero selects backend policy
+    /// (adaptive Vulkan submissions; three D3D11 staging generations), without
+    /// a caller-specified bound.
     /// </summary>
     public uint MaximumInFlightSubmissionCount { readonly get; set; }
 
