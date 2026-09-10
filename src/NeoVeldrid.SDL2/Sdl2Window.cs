@@ -474,9 +474,11 @@ public unsafe class Sdl2Window
 
     private void ProcessEvents(SDLEventHandler eventHandler)
     {
+        using var windowEvents = Sdl2EventPumpTrace.Log.Measure("SDL.WindowEvents");
         CheckNewWindowTitle();
 
         Sdl2Events.ProcessEvents();
+        using var dispatch = Sdl2EventPumpTrace.Log.Measure("SDL.WindowDispatch");
         for (int i = 0; i < _events.Count; i++)
         {
             Event ev = _events[i];

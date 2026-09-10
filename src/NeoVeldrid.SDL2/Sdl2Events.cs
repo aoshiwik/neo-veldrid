@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Threading;
 using Silk.NET.SDL;
 
 namespace NeoVeldrid.Sdl2;
@@ -30,16 +31,29 @@ public static class Sdl2Events
     /// </summary>
     public static unsafe void ProcessEvents()
     {
-        lock (s_lock)
+        bool lockTaken = false;
+        try
         {
-            Event ev;
-            while (_sdl.PollEvent(&ev) == 1)
+            using (Sdl2EventPumpTrace.Log.Measure("SDL.PumpLock"))
+                Monitor.Enter(s_lock, ref lockTaken);
+            while (true)
             {
-                foreach (SDLEventHandler processor in s_processors)
+                Event ev;
+                int result = -1;
+                var poll = Sdl2EventPumpTrace.Log.Measure("SDL.PollEvent");
+                try { result = _sdl.PollEvent(&ev); }
+                finally { poll.Complete(result); }
+                if (result != 1) break;
+                using (Sdl2EventPumpTrace.Log.Measure("SDL.DispatchEvent"))
                 {
-                    processor(ref ev);
+                    foreach (SDLEventHandler processor in s_processors)
+                        processor(ref ev);
                 }
             }
+        }
+        finally
+        {
+            if (lockTaken) Monitor.Exit(s_lock);
         }
     }
 }
